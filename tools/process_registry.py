@@ -62,6 +62,11 @@ CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
+# How many durable terminal records recover_from_checkpoint() rehydrates into
+# _finished. The store retains far more (a week); anything beyond this stays
+# answerable by id through poll()'s durable fallback rather than occupying a
+# slot in a dict that MAX_PROCESSES already bounds.
+MAX_RESTORED_TERMINAL_RECORDS = 32
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
 # Watch pattern rate limiting — PER SESSION.
@@ -1542,6 +1547,15 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+        # Durable terminal record. _write_checkpoint() above deliberately only
+        # persists RUNNING sessions, so without this a session killed during
+        # shutdown (kill_all -> kill_process -> here, all in one call) leaves no
+        # trace on disk: if the gateway process then dies, the next boot's
+        # recover_from_checkpoint() has nothing and poll() answers "not_found"
+        # instead of the real exit_code/completion_reason. Best-effort and
+        # single-row; see process_terminal_store.record_terminal_state for the
+        # cost rationale on the hot kill_all() path.
+        self._record_terminal_state(session)
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1796,6 +1810,13 @@ class ProcessRegistry:
 
         session = self.get(session_id)
         if session is None:
+            # Nothing in memory — but a previous process may have recorded a
+            # real terminal outcome for this session before it died (the
+            # shutdown-kill case). Answering "not_found" there erases the
+            # outcome of a job that genuinely ran and was killed.
+            restored = self._poll_from_terminal_store(session_id)
+            if restored is not None:
+                return restored
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         # Reconcile against real child state before reading session.exited.
@@ -2425,6 +2446,124 @@ class ProcessRegistry:
         if stale_polls:
             self._poll_observed -= stale_polls
 
+    # ----- Durable terminal state (survives process death) -----
+
+    def _record_terminal_state(self, session: ProcessSession) -> None:
+        """Persist one session's terminal outcome so it survives a restart.
+
+        Deliberately called with NO registry lock held (``_move_to_finished``
+        has already released ``self._lock``) — the write must never serialize
+        behind, or extend the hold time of, the registry lock.
+        """
+        try:
+            from tools.process_terminal_store import record_terminal_state
+            record_terminal_state(session)
+        except Exception as e:
+            logger.debug("Terminal-state persistence failed for %s: %s", session.id, e)
+
+    @staticmethod
+    def _session_from_terminal_record(record: Dict[str, Any]) -> ProcessSession:
+        """Rebuild a finished ProcessSession from a durable terminal record."""
+        session = ProcessSession(
+            id=record["session_id"],
+            command=record.get("command", "") or "unknown",
+            task_id=record.get("task_id", ""),
+            session_key=record.get("session_key", ""),
+            pid=record.get("pid"),
+            pid_scope=record.get("pid_scope", "host"),
+            started_at=record.get("started_at") or time.time(),
+            exited=True,
+            exit_code=record.get("exit_code"),
+            completion_reason=record.get("completion_reason", "exited"),
+            termination_source=record.get("termination_source", ""),
+            # The output buffer died with the process that ran it; mark the
+            # session detached so poll()/read_log() say so instead of implying
+            # the process produced no output.
+            detached=True,
+        )
+        session._completion_event.set()
+        return session
+
+    def _restore_terminal_states(self) -> set:
+        """Rehydrate terminal records left behind by a dead process.
+
+        Returns the set of session ids restored, so checkpoint recovery can
+        skip re-adopting a session we already know reached a terminal state.
+
+        These sessions are placed directly into ``_finished`` rather than
+        through ``_move_to_finished()``: they are historical records, and
+        routing them through the completion path would enqueue notifications
+        for work that finished in a previous process. Notification delivery is
+        explicitly out of scope here — this is about what ``poll()`` reports.
+
+        Only the most recent ``MAX_RESTORED_TERMINAL_RECORDS`` are pulled into
+        memory: the durable store retains a week, but ``_finished`` is bounded
+        by ``MAX_PROCESSES``, so hydrating the whole window would just churn
+        through ``_prune_if_needed``. Older records stay answerable by id via
+        ``_poll_from_terminal_store()``.
+        """
+        try:
+            from tools.process_terminal_store import recover_terminal_states
+            records = recover_terminal_states(limit=MAX_RESTORED_TERMINAL_RECORDS)
+        except Exception as e:
+            logger.debug("Could not restore durable terminal states: %s", e, exc_info=True)
+            return set()
+
+        restored: set = set()
+        for record in records:
+            session_id = record.get("session_id")
+            if not session_id:
+                continue
+            with self._lock:
+                if session_id in self._running or session_id in self._finished:
+                    # Live in-memory state always wins over a disk record.
+                    continue
+                self._finished[session_id] = self._session_from_terminal_record(record)
+            restored.add(session_id)
+
+        if restored:
+            logger.info(
+                "Restored %d terminal process record(s) from durable store",
+                len(restored),
+            )
+        return restored
+
+    def _poll_from_terminal_store(self, session_id: str) -> Optional[dict]:
+        """poll() result built from the durable store, or None if unknown.
+
+        Covers the window where the in-memory record is gone — a fresh process
+        that has not run recovery yet, or a restored record already evicted by
+        ``_prune_if_needed``'s TTL (which keys off ``started_at``, so a
+        long-running job can be pruned the moment it is restored).
+        """
+        try:
+            from tools.process_terminal_store import get_terminal_state
+            record = get_terminal_state(session_id)
+        except Exception as e:
+            logger.debug("Terminal-state lookup failed for %s: %s", session_id, e)
+            return None
+        if not record:
+            return None
+        started_at = record.get("started_at") or 0.0
+        exited_at = record.get("exited_at") or started_at
+        return {
+            "session_id": record["session_id"],
+            "command": record.get("command", ""),
+            "status": "exited",
+            "pid": record.get("pid"),
+            "uptime_seconds": max(0, int(exited_at - started_at)),
+            "output_preview": "",
+            "exit_code": record.get("exit_code"),
+            "completion_reason": record.get("completion_reason", "exited"),
+            "termination_source": record.get("termination_source", ""),
+            "detached": True,
+            "restored": True,
+            "note": (
+                "Terminal state recovered from durable store after restart -- "
+                "output history unavailable"
+            ),
+        }
+
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(
@@ -2490,6 +2629,12 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
+        # Terminal records first: a session whose outcome a previous process
+        # already recorded must never be re-adopted as "running" from a stale
+        # checkpoint entry, and must be pollable even when the checkpoint file
+        # is missing entirely (the shutdown-kill case never reaches it).
+        terminal_ids = self._restore_terminal_states()
+
         if not CHECKPOINT_PATH.exists():
             return 0
 
@@ -2501,6 +2646,14 @@ class ProcessRegistry:
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
+            if entry.get("session_id") in terminal_ids:
+                logger.info(
+                    "Skipping checkpoint recovery for %s: a terminal record "
+                    "already exists for it (exit recorded before shutdown)",
+                    entry.get("session_id"),
+                )
+                continue
+
             pid = entry.get("pid")
             if not pid:
                 continue

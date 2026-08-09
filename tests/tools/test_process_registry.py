@@ -2102,3 +2102,303 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+
+# =========================================================================
+# Durable terminal state (BUG: killed-at-shutdown sessions vanished on restart)
+# =========================================================================
+
+
+def _reaped_pid() -> int:
+    """A PID that is definitively not a live process.
+
+    Spawn a trivial child and reap it: after ``wait()`` the PID is gone from
+    the process table (not even a zombie), so ``_pid_exists`` reports False.
+    This is a real dead owner, not a mocked one — it exercises the same
+    PID-liveness code path a restarted gateway runs against the PID of the
+    gateway that died.
+    """
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    return p.pid
+
+
+def _set_owner_pid(session_id: str, pid: int) -> None:
+    """Rewrite a stored record's owner PID to simulate 'the process that
+    recorded this outcome is gone' — i.e. an actual gateway restart."""
+    import sqlite3 as _sqlite3
+
+    from tools.process_terminal_store import _db_path
+
+    conn = _sqlite3.connect(_db_path())
+    try:
+        with conn:
+            conn.execute(
+                "UPDATE process_terminal_states SET owner_pid=? WHERE session_id=?",
+                (pid, session_id),
+            )
+    finally:
+        conn.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_terminal_store():
+    """HERMES_HOME is a fresh tempdir per test, but the store caches which DB
+    file it has already initialized in-process — clear it so the cache can't
+    leak a previous test's path."""
+    from tools.process_terminal_store import _reset_for_tests
+
+    _reset_for_tests()
+    yield
+    _reset_for_tests()
+
+
+class TestDurableTerminalState:
+    """The reported bug: ``kill_process()`` sets ``exited=True`` before
+    ``_move_to_finished()``, and ``_write_checkpoint()`` only persists
+    ``_running`` entries where ``not s.exited`` — so a session killed during
+    shutdown was excluded from the very next checkpoint write. When the
+    gateway process then died, the outcome was gone and ``poll()`` on the next
+    boot returned ``{"status": "not_found"}`` instead of the real terminal
+    record.
+    """
+
+    def _spawn_tracked(self, registry, sid="proc_killed_at_shutdown"):
+        proc = _spawn_python_sleep(60)
+        session = ProcessSession(
+            id=sid,
+            command="sleep 60",
+            task_id="t1",
+            session_key="sess-a",
+            pid=proc.pid,
+            process=proc,
+            started_at=time.time(),
+            host_start_time=ProcessRegistry._safe_host_start_time(proc.pid),
+        )
+        registry._running[session.id] = session
+        return session, proc
+
+    def test_killed_session_is_pollable_after_simulated_restart(self, registry):
+        """THE regression test for the original bug."""
+        session, proc = self._spawn_tracked(registry)
+        try:
+            result = registry.kill_process(session.id, source="kill_all")
+            assert result["status"] == "killed"
+
+            # --- simulate a gateway restart -------------------------------
+            # A brand-new registry instance: no _running/_finished entries are
+            # shared with the instance that did the kill, exactly as after the
+            # gateway process is SIGTERM'd by systemd and respawned.
+            restarted = ProcessRegistry()
+            assert session.id not in restarted._running
+            assert session.id not in restarted._finished
+
+            polled = restarted.poll(session.id)
+        finally:
+            proc.kill()
+            proc.wait()
+
+        assert polled["status"] != "not_found"
+        assert polled["status"] == "exited"
+        assert polled["exit_code"] == -15
+        assert polled["completion_reason"] == "killed"
+        assert polled["termination_source"] == "kill_all"
+        assert polled["session_id"] == session.id
+
+    def test_recover_from_checkpoint_rehydrates_record_of_a_dead_owner(
+        self, registry, tmp_path
+    ):
+        """The restart path proper: a fresh registry running
+        ``recover_from_checkpoint()`` must land the terminal record in
+        ``_finished`` so every reader (poll, get, list_sessions) sees it."""
+        session, proc = self._spawn_tracked(registry, sid="proc_dead_owner")
+        try:
+            assert registry.kill_process(session.id, source="kill_all")["status"] == "killed"
+            _set_owner_pid(session.id, _reaped_pid())
+
+            restarted = ProcessRegistry()
+            empty_checkpoint = tmp_path / "procs.json"
+            empty_checkpoint.write_text("[]")
+            with patch("tools.process_registry.CHECKPOINT_PATH", empty_checkpoint):
+                restarted.recover_from_checkpoint()
+        finally:
+            proc.kill()
+            proc.wait()
+
+        assert session.id in restarted._finished
+        rehydrated = restarted._finished[session.id]
+        assert rehydrated.exited is True
+        assert rehydrated.exit_code == -15
+        assert rehydrated.completion_reason == "killed"
+        # No output buffer survives the dead process — say so rather than
+        # implying the job printed nothing.
+        assert rehydrated.detached is True
+
+        polled = restarted.poll(session.id)
+        assert polled["exit_code"] == -15
+        assert polled["completion_reason"] == "killed"
+
+    def test_records_owned_by_a_live_process_are_not_adopted(self, registry, tmp_path):
+        """A concurrently-running sibling process still owns its own finished
+        sessions in memory; a second process must not slurp them into its
+        registry. ``recover_terminal_states`` filters on owner liveness (the
+        same PID-identity guard ``async_delegation.recover_abandoned_delegations``
+        uses)."""
+        session, proc = self._spawn_tracked(registry, sid="proc_live_owner")
+        try:
+            assert registry.kill_process(session.id, source="kill_all")["status"] == "killed"
+            # owner_pid is left as this (very much alive) process.
+            restarted = ProcessRegistry()
+            empty_checkpoint = tmp_path / "procs.json"
+            empty_checkpoint.write_text("[]")
+            with patch("tools.process_registry.CHECKPOINT_PATH", empty_checkpoint):
+                restarted.recover_from_checkpoint()
+        finally:
+            proc.kill()
+            proc.wait()
+
+        assert session.id not in restarted._finished
+        # ...but a direct poll for that id still answers truthfully, because
+        # whoever holds the id wants its outcome regardless of who ran it.
+        assert restarted.poll(session.id)["exit_code"] == -15
+
+    def test_terminal_record_beats_stale_checkpoint_entry(self, registry, tmp_path):
+        """A stale checkpoint entry must never resurrect a session we already
+        know reached a terminal state — otherwise poll() would report
+        "running" for a process that was killed."""
+        session, proc = self._spawn_tracked(registry, sid="proc_stale_ckpt")
+        try:
+            assert registry.kill_process(session.id, source="kill_all")["status"] == "killed"
+            _set_owner_pid(session.id, _reaped_pid())
+
+            checkpoint = tmp_path / "procs.json"
+            checkpoint.write_text(json.dumps([{
+                "session_id": session.id,
+                "command": "sleep 60",
+                # A live PID: without the terminal-record check this entry
+                # would be adopted as a running detached session.
+                "pid": os.getpid(),
+                "pid_scope": "host",
+                "task_id": "t1",
+            }]))
+
+            restarted = ProcessRegistry()
+            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+                recovered = restarted.recover_from_checkpoint()
+        finally:
+            proc.kill()
+            proc.wait()
+
+        assert recovered == 0
+        assert session.id not in restarted._running
+        assert restarted.poll(session.id)["status"] == "exited"
+
+    def test_poll_still_reports_not_found_for_an_unknown_id(self, registry):
+        assert registry.poll("proc_never_existed")["status"] == "not_found"
+
+    def test_kill_all_persists_every_killed_session(self, registry):
+        sessions = []
+        procs = []
+        try:
+            for i in range(3):
+                s, p = self._spawn_tracked(registry, sid=f"proc_bulk_{i}")
+                sessions.append(s)
+                procs.append(p)
+
+            assert registry.kill_all() == 3
+
+            restarted = ProcessRegistry()
+            for s in sessions:
+                polled = restarted.poll(s.id)
+                assert polled["exit_code"] == -15, s.id
+                assert polled["completion_reason"] == "killed", s.id
+        finally:
+            for p in procs:
+                p.kill()
+                p.wait()
+
+    def test_kill_all_with_nothing_running_writes_nothing(self, registry):
+        """Cost guard for the hot per-turn ``kill_all()`` call site: with no
+        running sessions there are no targets, so the persistence write is
+        never reached and the database file is not even created."""
+        from tools.process_terminal_store import _db_path
+
+        assert registry.kill_all() == 0
+        assert not _db_path().exists()
+
+    def test_persistence_failure_never_breaks_the_kill_path(self, registry):
+        """Best-effort, exactly like ``_write_checkpoint``: a disk error during
+        shutdown must not abort teardown."""
+        session, proc = self._spawn_tracked(registry, sid="proc_store_broken")
+        try:
+            with patch(
+                "tools.process_terminal_store.record_terminal_state",
+                side_effect=OSError("disk full"),
+            ):
+                result = registry.kill_process(session.id, source="kill_all")
+        finally:
+            proc.kill()
+            proc.wait()
+
+        assert result["status"] == "killed"
+        assert session.id in registry._finished
+
+    def test_normal_exit_is_persisted_too(self, registry):
+        """The store is fed from ``_move_to_finished``, so an ordinary exit is
+        recoverable after a restart as well — not just a kill."""
+        s = _make_session(sid="proc_normal_exit", exited=True, exit_code=0)
+        s.completion_reason = "exited"
+        registry._running[s.id] = s
+        registry._move_to_finished(s)
+
+        restarted = ProcessRegistry()
+        polled = restarted.poll(s.id)
+        assert polled["status"] == "exited"
+        assert polled["exit_code"] == 0
+        assert polled["completion_reason"] == "exited"
+
+    def test_persisted_command_is_redacted(self, registry):
+        """Same disk-exposure concern the checkpoint file already handles
+        (#77484) — this store holds the command string too."""
+        s = _make_session(
+            sid="proc_secret",
+            command="curl -H 'Authorization: Bearer sk-ant-api03-SUPERSECRETVALUE' https://x",
+            exited=True,
+            exit_code=0,
+        )
+        registry._running[s.id] = s
+        registry._move_to_finished(s)
+
+        polled = ProcessRegistry().poll(s.id)
+        assert "SUPERSECRETVALUE" not in polled["command"]
+
+    def test_restored_record_survives_in_memory_ttl_pruning(self, registry, tmp_path):
+        """``_prune_if_needed`` expires finished sessions by ``started_at``, so
+        a long-running job restored after a restart can be evicted from memory
+        immediately. ``poll()`` must still answer from the durable store."""
+        s = _make_session(
+            sid="proc_old_and_pruned",
+            exited=True,
+            exit_code=-15,
+            started_at=time.time() - (FINISHED_TTL_SECONDS + 600),
+        )
+        s.completion_reason = "killed"
+        registry._running[s.id] = s
+        registry._move_to_finished(s)
+
+        restarted = ProcessRegistry()
+        empty_checkpoint = tmp_path / "procs.json"
+        empty_checkpoint.write_text("[]")
+        _set_owner_pid(s.id, _reaped_pid())
+        with patch("tools.process_registry.CHECKPOINT_PATH", empty_checkpoint):
+            restarted.recover_from_checkpoint()
+        assert s.id in restarted._finished
+
+        with restarted._lock:
+            restarted._prune_if_needed()
+        assert s.id not in restarted._finished  # evicted by TTL
+
+        polled = restarted.poll(s.id)
+        assert polled["status"] == "exited"
+        assert polled["exit_code"] == -15
+        assert polled["completion_reason"] == "killed"
