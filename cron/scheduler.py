@@ -4475,6 +4475,31 @@ def run_job(
             _teardown_cron_agent(agent, job_id)
 
 
+def _extract_cron_task_status(final_response: str) -> Optional[str]:
+    """Read an opt-in ``CRON_TASK_STATUS:`` marker out of a job's final response.
+
+    Process-completion status (``last_status="ok"``) only reflects whether the
+    agent turn finished without crashing — not whether the job's stated task
+    actually succeeded. A job whose prompt is "check X, report OK or FAILED"
+    can conclude FAILED in a perfectly well-formed response and still be
+    recorded as "ok" today. This helper lets such a job declare its own
+    outcome, which ``run_one_job`` treats as authoritative when present
+    (one-directional: can only turn "ok" → error).
+
+    The marker must stand on its OWN LINE (``^...$`` under MULTILINE) so a
+    response that merely mentions the syntax in prose — "it never emits a
+    CRON_TASK_STATUS: FAILED line" — does not false-trigger. Returns the
+    upper-cased value (``OK`` / ``FAILED`` / ``FINDING``), or None when no
+    marker line is present; None means "leave everything untouched".
+    """
+    pattern = re.compile(
+        r"^CRON_TASK_STATUS:\s*(OK|FAILED|FINDING)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    m = pattern.search(final_response or "")
+    return m.group(1).upper() if m else None
+
+
 def _teardown_cron_agent(agent, job_id: str) -> None:
     """Release an ephemeral cron agent's async resources.
 
@@ -4685,6 +4710,26 @@ def run_one_job(
         if success and not final_response.strip():
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+
+        # Opt-in task-outcome marker: a `CRON_TASK_STATUS: FAILED` line in the
+        # final response overrides an otherwise-successful completion, because
+        # the job's own declared outcome is more authoritative than "the agent
+        # turn didn't crash". Unlike the interruption, empty-response, and
+        # blocked-config overrides above, this one is driven by the agent's TEXT.
+        #
+        # STRICTLY ONE-DIRECTIONAL (ok → error). The `success is True` guard is
+        # explicit and load-bearing, not an artifact of where this sits: once
+        # any earlier override has already failed the run, a marker must not be
+        # read at all — in particular a `CRON_TASK_STATUS: OK` quoted inside a
+        # failure explanation must never flip a real failure back to success.
+        # Anything other than FAILED (OK, FINDING, or no marker at all) is a
+        # true no-op: success, error, and the already-delivered content are all
+        # left exactly as they were.
+        if success is True:
+            _task_status = _extract_cron_task_status(final_response)
+            if _task_status == "FAILED":
+                success = False
+                error = "Job reported CRON_TASK_STATUS: FAILED"
 
         if not _consume_interrupted_flag(job["id"]):
             if blocked_config:

@@ -28,11 +28,17 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         return f"/tmp/{jid}.txt"
 
     def fake_deliver(job, content, adapters=None, loop=None):
-        calls.append(("deliver", job["id"]))
+        # Record the delivered CONTENT, not just the job id: the no-op test has
+        # to prove the marker feature leaves what the user actually receives
+        # byte-identical, which an id-only record cannot show.
+        calls.append(("deliver", job["id"], content))
         return None
 
     def fake_mark(jid, ok, err=None, delivery_error=None, **_kw):
-        calls.append(("mark", jid, ok))
+        # Record the error too: `ok` alone cannot distinguish "failed by the
+        # framework" from "failed by the CRON_TASK_STATUS override", which is
+        # exactly the misattribution the one-directional guard prevents.
+        calls.append(("mark", jid, ok, err))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
     monkeypatch.setattr(s, "save_job_output", fake_save)
@@ -51,7 +57,7 @@ def test_tick_process_job_sequence(monkeypatch):
     s.tick(verbose=False, sync=True)
 
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
-    assert calls[-1] == ("mark", "j1", True)
+    assert calls[-1] == ("mark", "j1", True, None)
 
 
 def test_run_one_job_success_sequence(monkeypatch):
@@ -63,7 +69,7 @@ def test_run_one_job_success_sequence(monkeypatch):
 
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
-    assert calls[-1] == ("mark", "j2", True)
+    assert calls[-1] == ("mark", "j2", True, None)
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
@@ -107,5 +113,151 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
+
+
+# ---------------------------------------------------------------------------
+# CRON_TASK_STATUS marker tests
+#
+# `last_status: "ok"` only means the agent turn finished without crashing. The
+# opt-in `CRON_TASK_STATUS:` marker lets a job's own final response declare the
+# outcome of the task it was asked to do, one-directionally (ok → error).
+# ---------------------------------------------------------------------------
+
+def test_cron_task_status_failed_overrides_success(monkeypatch):
+    """CRON_TASK_STATUS: FAILED in the final response forces the run to be
+    marked as failed even though the agent turn completed successfully."""
+    final = "Some report output.\nCRON_TASK_STATUS: FAILED\nMore text."
+    calls = _patch_pipeline(monkeypatch, success=True, final=final)
+
+    s.run_one_job({"id": "jcs1", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs1", False, "Job reported CRON_TASK_STATUS: FAILED")
+
+
+def test_cron_task_status_ok_leaves_success_unchanged(monkeypatch):
+    """CRON_TASK_STATUS: OK does not change an already-successful run."""
+    final = "All good.\nCRON_TASK_STATUS: OK"
+    calls = _patch_pipeline(monkeypatch, success=True, final=final)
+
+    s.run_one_job({"id": "jcs2", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs2", True, None)
+
+
+def test_cron_task_status_absent_leaves_behavior_unchanged(monkeypatch):
+    """When no CRON_TASK_STATUS marker is present the run behaves exactly as
+    it did before the marker feature was added: success, error, AND the
+    delivered content are all untouched.
+
+    All three are asserted here rather than argued from where the check sits in
+    the function — a marker-absent response is the overwhelmingly common case,
+    so "true no-op" is the property that has to hold under test.
+    """
+    final = "Normal response, no marker."
+    calls = _patch_pipeline(monkeypatch, success=True, final=final)
+
+    s.run_one_job({"id": "jcs3", "name": "t"})
+
+    # success unchanged (True) and error still None — not merely "not failed".
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs3", True, None)
+
+    # Delivered content is byte-identical to the final response.
+    deliver = [c for c in calls if c[0] == "deliver"][0]
+    assert deliver[2] == final
+
+
+def test_cron_task_status_failed_does_not_override_existing_framework_failure(monkeypatch):
+    """A CRON_TASK_STATUS: FAILED marker must NOT fire when success is already
+    False from a real framework-level failure — the override is one-directional
+    (false-ok → error only) and must never touch an already-failed run."""
+    final = "Crash report.\nCRON_TASK_STATUS: FAILED"
+    calls = _patch_pipeline(monkeypatch, success=False, final=final, error="framework error")
+
+    s.run_one_job({"id": "jcs4", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    # Still False — and, critically, the RECORDED ERROR is still the original
+    # framework failure. Asserting only `success is False` would pass even with
+    # the one-directional guard deleted (the marker would just overwrite the
+    # error), so the error assertion is what actually pins the guard down:
+    # a real crash must not be re-reported as a self-declared task failure.
+    assert mark == ("mark", "jcs4", False, "framework error")
+    assert "CRON_TASK_STATUS" not in mark[3]
+
+
+def test_cron_task_status_ok_cannot_rescue_a_framework_failure(monkeypatch):
+    """The guard is one-directional in BOTH senses: a CRON_TASK_STATUS: OK line
+    quoted inside a failure explanation must never flip a real failure back to
+    success."""
+    final = "The run died. Reporting anyway:\nCRON_TASK_STATUS: OK"
+    calls = _patch_pipeline(monkeypatch, success=False, final=final, error="framework error")
+
+    s.run_one_job({"id": "jcs5", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs5", False, "framework error")
+
+
+def test_cron_task_status_mentioned_in_prose_does_not_trigger(monkeypatch):
+    """The marker is anchored to its own line, so a response that merely
+    DISCUSSES the syntax must not be read as declaring failure.
+
+    Every line below contains the literal `CRON_TASK_STATUS: FAILED` but none of
+    them IS a marker line — there is text before it, text after it, or trailing
+    punctuation. A substring check would fail this test; the ^...$ MULTILINE
+    anchoring is what makes it pass.
+    """
+    final = (
+        "I checked whether the job emits a CRON_TASK_STATUS: FAILED line but it "
+        "never does.\n"
+        "`CRON_TASK_STATUS: FAILED` is the marker format we use.\n"
+        "The convention is CRON_TASK_STATUS: FAILED.\n"
+        "Note: CRON_TASK_STATUS: FAILED (only when the check actually fails)\n"
+    )
+    calls = _patch_pipeline(monkeypatch, success=True, final=final)
+
+    s.run_one_job({"id": "jcs6", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs6", True, None)
+
+
+def test_cron_task_status_standalone_line_still_fires_amid_prose(monkeypatch):
+    """Companion to the prose test: the SAME response gains one standalone
+    marker line, and that alone is enough to fail the run — proving the
+    negative case above is anchoring, not an inert regex."""
+    final = (
+        "I checked whether the job emits a CRON_TASK_STATUS: FAILED line.\n"
+        "It does, so I am declaring the task failed:\n"
+        "CRON_TASK_STATUS: FAILED\n"
+        "End of report.\n"
+    )
+    calls = _patch_pipeline(monkeypatch, success=True, final=final)
+
+    s.run_one_job({"id": "jcs7", "name": "t"})
+
+    mark = [c for c in calls if c[0] == "mark"][0]
+    assert mark == ("mark", "jcs7", False, "Job reported CRON_TASK_STATUS: FAILED")
+
+
+def test_extract_cron_task_status_unit():
+    """Direct unit coverage of the extractor's contract: standalone marker lines
+    (any case, surrounding whitespace tolerated) yield the upper-cased value;
+    everything else — including in-prose mentions — yields None."""
+    assert s._extract_cron_task_status("CRON_TASK_STATUS: FAILED") == "FAILED"
+    assert s._extract_cron_task_status("a\ncron_task_status:ok\nb") == "OK"
+    assert s._extract_cron_task_status("CRON_TASK_STATUS:   FINDING   ") == "FINDING"
+    # No marker at all → None (true no-op signal).
+    assert s._extract_cron_task_status("") is None
+    assert s._extract_cron_task_status("nothing to declare here") is None
+    # Not on its own line → None.
+    assert s._extract_cron_task_status("see CRON_TASK_STATUS: FAILED here") is None
+    assert s._extract_cron_task_status("CRON_TASK_STATUS: FAILED.") is None
+    assert s._extract_cron_task_status("CRON_TASK_STATUS: FAILED (maybe)") is None
+    # Unknown value → None rather than a spurious status.
+    assert s._extract_cron_task_status("CRON_TASK_STATUS: MAYBE") is None
 
 
