@@ -3427,7 +3427,42 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "completion" and evt.get("restored"):
+        # A completion replayed from the durable store after a restart: its
+        # per-process watcher (which formats fresh completions itself, from
+        # live session state) died with the previous gateway, so the persisted
+        # payload is all that is left to render.  Fresh completions still
+        # return None here — they are owned by _run_process_watcher and must
+        # not be delivered twice.
+        from tools.process_registry import format_process_notification
+        return format_process_notification(evt)
+
     return None
+
+
+def _ack_process_completion(session_id: str) -> None:
+    """Acknowledge a durable background-completion row as delivered.
+
+    Called at the points where a completion notification is CONFIRMED to have
+    reached the user (adapter acceptance) or is otherwise resolved (the agent
+    already consumed the output inline) — never on bare dequeue. After this the
+    event can never be replayed by a later boot.
+
+    Talks to the durable store directly rather than through the registry, for
+    the same reason ``_deliver_completion_notification`` talks to
+    ``async_delegation`` directly: the row is the store's, and the ack must
+    land regardless of which registry instance a caller happens to hold.
+    Best-effort — a failed ack costs at most one replayed notification, so it
+    must never break the delivery path.
+    """
+    if not session_id:
+        return
+    try:
+        from tools.process_completion_store import mark_completion_delivered
+
+        mark_completion_delivered(session_id)
+    except Exception:
+        logger.debug("Could not ack durable completion %s", session_id, exc_info=True)
 
 
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
@@ -3451,6 +3486,13 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
         elif evt_type == "async_delegation":
+            requeue.append(evt)
+        elif evt_type == "completion" and evt.get("restored"):
+            # Replayed from the durable store after a restart. Owned by
+            # ``_restored_completion_watcher``, exactly as async-delegation
+            # events are owned by their watcher — so requeue instead of
+            # dropping, or a post-turn drain that happens to run first would
+            # silently eat the very notification the replay exists to deliver.
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -11168,6 +11210,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
+        # Replay completion notifications a previous process enqueued but died
+        # before delivering.  completion_queue is in-memory, so a gateway that
+        # exits between the enqueue and the adapter injection silently loses
+        # the "[IMPORTANT: your job finished]" message the user was owed.  The
+        # durable store only hands back rows whose owner process is gone and
+        # that no consumer ever acknowledged, so an event already delivered is
+        # never re-sent.  _restored_completion_watcher (started below) is what
+        # actually drains these off the queue.
+        try:
+            from tools.process_registry import process_registry
+            replayed = process_registry.restore_pending_completions()
+            if replayed:
+                logger.info(
+                    "Replayed %s undelivered background completion notification(s)",
+                    replayed,
+                )
+        except Exception as e:
+            logger.warning("Pending completion replay: %s", e)
+
         # Recover sessions that were active when the gateway last exited.
         # Exact durable turn markers cover long-running work; the 120-second
         # recency heuristic remains as an upgrade fallback for turns started by
@@ -11715,6 +11776,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # result back into its originating session as a new turn, covering the
         # idle case where the subagent finishes with no agent turn running.
         self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
+
+        # Start the restored-completion watcher — delivers background process
+        # completions replayed from the durable store at startup.  Their
+        # original per-process watcher task died with the previous gateway, so
+        # without this consumer a replayed event would sit on the queue and be
+        # discarded by the post-turn drain (which owns watch events only).
+        self._spawn_supervised(
+            self._restored_completion_watcher, "restored_completion_watcher"
+        )
 
         # Start the scale-to-zero idle watcher ONLY when this instance is opted
         # in (the NAS "Labs" HERMES_SCALE_TO_ZERO stamp), messaging is
@@ -22732,6 +22802,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
 
+    async def _restored_completion_watcher(self, interval: float = 2.0) -> None:
+        """Deliver background completions replayed from the durable store.
+
+        A fresh completion is delivered by the per-process watcher task that
+        was spawned when the process started.  After a restart those tasks are
+        gone, so a completion replayed by ``restore_pending_completions()`` has
+        no owner: nothing else on this gateway would ever turn it into the
+        ``[IMPORTANT: ...]`` message the user was owed.  This watcher is that
+        owner.
+
+        Runs only while replayed events are outstanding, then exits — steady
+        state costs nothing.  Non-restored events are requeued untouched
+        (async-delegation completions in particular belong to
+        ``_async_delegation_watcher``; a fresh process completion belongs to
+        its own ``_run_process_watcher``).
+        """
+        try:
+            from tools.process_completion_store import restored_session_ids
+            outstanding = restored_session_ids()
+        except Exception as e:
+            logger.debug("Restored-completion watcher could not start: %s", e)
+            return
+        if not outstanding:
+            return
+
+        await asyncio.sleep(3)  # let platforms finish connecting
+        from tools.process_registry import process_registry as _pr
+        logger.info(
+            "Delivering %d replayed background completion notification(s)",
+            len(outstanding),
+        )
+        # A replay whose adapter injection keeps failing must not retry for the
+        # lifetime of the gateway. After this many passes it is abandoned HERE
+        # (dropped from the queue so the healthcheck's depth stays honest) with
+        # its durable row still pending — the next boot picks it up again, and
+        # the store's own replay cap bounds that.
+        MAX_DELIVERY_PASSES = 10
+        attempts: dict[str, int] = {}
+        while self._running and outstanding:
+            try:
+                requeue = []
+                mine = []
+                while not _pr.completion_queue.empty():
+                    try:
+                        evt = _pr.completion_queue.get_nowait()
+                    except Exception:
+                        break
+                    if (
+                        evt.get("type") == "completion"
+                        and evt.get("restored")
+                        and str(evt.get("session_id") or "") in outstanding
+                    ):
+                        mine.append(evt)
+                    else:
+                        requeue.append(evt)
+                for evt in requeue:
+                    _pr.completion_queue.put(evt)
+                for evt in mine:
+                    session_id = str(evt.get("session_id") or "")
+                    attempts[session_id] = attempts.get(session_id, 0) + 1
+                    exhausted = attempts[session_id] >= MAX_DELIVERY_PASSES
+                    # The persisted payload carries only session_key; the
+                    # platform/chat routing the adapter needs is derived from
+                    # it, the same way async-delegation completions are routed.
+                    self._enrich_async_delegation_routing(evt)
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        outstanding.discard(session_id)
+                        continue
+                    try:
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, evt,
+                        )
+                    except Exception as e:
+                        logger.error("Restored completion injection error: %s", e)
+                        delivered = False
+                    if delivered is False:
+                        # Adapter injection failed — retry on the next pass
+                        # rather than dropping a notification we know is owed.
+                        if exhausted:
+                            outstanding.discard(session_id)
+                            logger.warning(
+                                "Giving up on replayed completion %s after %d "
+                                "delivery attempts; it stays pending for the "
+                                "next restart",
+                                session_id, MAX_DELIVERY_PASSES,
+                            )
+                            continue
+                        _pr.completion_queue.put(evt)
+                        continue
+                    outstanding.discard(session_id)
+                    if delivered is True:
+                        # Confirmed adapter acceptance: acknowledge durably so
+                        # no later boot replays it.  ``None`` deliberately does
+                        # NOT ack — it means this event has no gateway route,
+                        # and an unroutable event that is never acknowledged
+                        # stays replayable (bounded by the store's replay cap)
+                        # instead of being silently written off as delivered.
+                        _ack_process_completion(session_id)
+            except Exception as e:
+                logger.debug("Restored completion watcher error: %s", e)
+            await asyncio.sleep(interval)
+
     async def _run_process_watcher(self, watcher: dict) -> None:
         """
         Periodically check a background process and push updates to the user.
@@ -22838,6 +23011,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue
+                    if delivered is True:
+                        # Adapter acceptance is the real delivery confirmation
+                        # for this path, so acknowledge the durable row here —
+                        # not at dequeue. Until this line runs, the completion
+                        # stays replayable across a restart; after it, it can
+                        # never be delivered a second time. ``None`` (another
+                        # caller owns it, or no route) is left unacknowledged
+                        # so its owner's ack, or a later replay, still decides.
+                        _ack_process_completion(session_id)
                     break
 
                 # --- Normal text-only notification ---
@@ -22857,6 +23039,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "via wait/log — skipping raw notification (#65379)",
                         session_id,
                     )
+                    # Resolved, not lost: the agent read the output inline, so
+                    # a replay after a restart would be a duplicate report of a
+                    # result the agent already acted on.
+                    _ack_process_completion(session_id)
                     break
                 # Decide whether to notify based on mode
                 should_notify = (
@@ -22887,6 +23073,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 message_text,
                                 metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                             )
+                            # A session promoted to notify_on_complete after
+                            # this watcher was spawned (the watch-pattern strike
+                            # promotion) has a durable row but arrives here
+                            # rather than in the agent_notify branch above. The
+                            # send succeeded, so acknowledge it; for a session
+                            # that never had a durable row this is a no-op.
+                            _ack_process_completion(session_id)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
                 break

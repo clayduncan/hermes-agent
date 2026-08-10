@@ -1563,7 +1563,7 @@ class ProcessRegistry:
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            completion_evt = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -1576,7 +1576,16 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            # Durable FIRST, then enqueue.  completion_queue is an in-memory
+            # queue.Queue: if this process dies between the two — the gateway
+            # shutdown sequence drops the platform adapter ~10ms before the
+            # kill, so the window is routinely hit — the event vanishes and the
+            # user never learns their job finished.  Persisting first means the
+            # worst case is a replay on the next boot (deduplicated by the
+            # delivery ack) rather than silent loss.
+            self._record_pending_completion(completion_evt)
+            self.completion_queue.put(completion_evt)
 
     # ----- Query Methods -----
 
@@ -1715,11 +1724,23 @@ class ProcessRegistry:
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
+                # The agent already has this result in hand (wait/log/poll), so
+                # the completion is resolved — not lost.  Ack it, or the next
+                # boot would replay a notification for output the agent already
+                # consumed and acted on.
+                self.mark_completion_delivered(_evt_sid)
                 continue
 
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
+                # Consumed for good: the event is off the queue and folded into
+                # this turn's text.  Same "at-least-once until this point,
+                # never after it" tradeoff async_delegation's
+                # mark_completion_delivered() makes — there is no confirmation
+                # signal further down the CLI/TUI path to wait for.
+                if evt.get("type") == "completion":
+                    self.mark_completion_delivered(_evt_sid)
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -2460,6 +2481,66 @@ class ProcessRegistry:
             record_terminal_state(session)
         except Exception as e:
             logger.debug("Terminal-state persistence failed for %s: %s", session.id, e)
+
+    # ----- Durable completion notifications (survive process death) -----
+
+    def _record_pending_completion(self, evt: Dict[str, Any]) -> None:
+        """Persist one completion event before it goes on ``completion_queue``.
+
+        Called with NO registry lock held (``_move_to_finished`` has already
+        released ``self._lock``), for the same reason as
+        ``_record_terminal_state``: a SQLite write must never extend the hold
+        time of the registry lock.
+
+        Scoped deliberately narrowly — only the ``notify_on_complete``
+        completion event produced right here.  Watch-match/watch-disabled
+        events are transient by design, and ``async_delegation`` events (which
+        ride this same queue) already own their own durable table; persisting
+        them here would give them two competing replay ledgers.
+        """
+        try:
+            from tools.process_completion_store import record_pending_completion
+            record_pending_completion(evt)
+        except Exception as e:
+            logger.debug(
+                "Durable completion persistence failed for %s: %s",
+                evt.get("session_id", "?"), e,
+            )
+
+    def mark_completion_delivered(self, session_id: str) -> None:
+        """Acknowledge that a completion notification reached its consumer.
+
+        After this the event is never replayed, no matter how many restarts
+        follow.  Consumers call this at the point delivery is CONFIRMED (the
+        gateway watcher after adapter acceptance) or at the point the event is
+        irreversibly consumed (a CLI/TUI drain that formatted it into the
+        turn), never merely on dequeue.
+        """
+        if not session_id:
+            return
+        try:
+            from tools.process_completion_store import mark_completion_delivered
+            mark_completion_delivered(session_id)
+        except Exception as e:
+            logger.debug("Could not ack completion delivery for %s: %s", session_id, e)
+
+    def restore_pending_completions(self) -> int:
+        """Re-enqueue completions a dead process never managed to deliver.
+
+        Returns how many were replayed.  Safe to call more than once: the
+        durable store makes repeat calls within one process a no-op, so a
+        retried startup path cannot double-inject.  Deliberately NOT called
+        from ``__init__`` — every CLI invocation constructs a registry, and a
+        one-shot ``hermes`` command has no business adopting a dead gateway's
+        pending user notifications.  The owning driver (the gateway, at
+        startup, next to ``recover_from_checkpoint()``) makes the call.
+        """
+        try:
+            from tools.process_completion_store import restore_pending_completions
+            return restore_pending_completions(self.completion_queue)
+        except Exception as e:
+            logger.warning("Could not restore pending process completions: %s", e)
+            return 0
 
     @staticmethod
     def _session_from_terminal_record(record: Dict[str, Any]) -> ProcessSession:
