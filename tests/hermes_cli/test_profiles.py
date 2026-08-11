@@ -11,9 +11,10 @@ import os
 import shutil
 import sys
 import tarfile
+import threading
 import types
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, call
 
 import pytest
 import yaml
@@ -44,6 +45,7 @@ from hermes_cli.profiles import (
     NO_BUNDLED_SKILLS_MARKER,
     backfill_profile_envs,
     profiles_to_serve,
+    _count_skills,
 )
 from hermes_cli.config import DEFAULT_CONFIG
 
@@ -919,5 +921,96 @@ class TestProfilesToServe:
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
 
+
+# ---------------------------------------------------------------------------
+# TestCountSkillsCache — verify _count_skills does NOT rglob on every call
+# ---------------------------------------------------------------------------
+
+class TestCountSkillsCache:
+    """_count_skills must not do a fresh rglob walk on every call.
+
+    This guards against the fd-exhaustion bug where bursty sidebar polling
+    triggered concurrent recursive walks, spiking open file descriptors past
+    the process limit.
+    """
+
+    def _make_skills_dir(self, tmp_path: Path, n: int = 3) -> Path:
+        """Create a minimal skills tree with *n* SKILL.md files."""
+        skills_dir = tmp_path / "skills"
+        for i in range(n):
+            skill = skills_dir / f"category{i}" / f"skill{i}"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(f"# Skill {i}")
+        return tmp_path
+
+    def test_second_call_hits_cache_not_rglob(self, tmp_path, monkeypatch):
+        """Two consecutive calls must only walk the filesystem once."""
+        profile_dir = self._make_skills_dir(tmp_path)
+
+        # Clear the module-level cache so the first call is a cold miss.
+        monkeypatch.setattr(profiles, "_SKILL_COUNT_CACHE", {})
+
+        rglob_call_count = []
+
+        original_rglob = Path.rglob
+
+        def counting_rglob(self, pattern):
+            if pattern == "SKILL.md":
+                rglob_call_count.append(1)
+            return original_rglob(self, pattern)
+
+        monkeypatch.setattr(Path, "rglob", counting_rglob)
+
+        count1 = _count_skills(profile_dir)
+        count2 = _count_skills(profile_dir)
+
+        assert count1 == 3
+        assert count2 == 3
+        assert len(rglob_call_count) == 1, (
+            f"rglob called {len(rglob_call_count)} times; expected exactly 1 "
+            "(second call should return cached count)"
+        )
+
+    def test_concurrent_calls_walk_only_once(self, tmp_path, monkeypatch):
+        """Simultaneous threads must not each trigger a separate rglob walk."""
+        profile_dir = self._make_skills_dir(tmp_path, n=2)
+
+        monkeypatch.setattr(profiles, "_SKILL_COUNT_CACHE", {})
+
+        rglob_call_count = []
+        original_rglob = Path.rglob
+        lock = threading.Lock()
+
+        def slow_counting_rglob(self, pattern):
+            if pattern == "SKILL.md":
+                with lock:
+                    rglob_call_count.append(1)
+            return original_rglob(self, pattern)
+
+        monkeypatch.setattr(Path, "rglob", slow_counting_rglob)
+
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                results.append(_count_skills(profile_dir))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors
+        assert all(r == 2 for r in results)
+        # All 8 concurrent calls should produce exactly 1 rglob walk (the rest
+        # wait for the lock and then hit the warm cache on re-check).
+        assert len(rglob_call_count) == 1, (
+            f"rglob called {len(rglob_call_count)} times across 8 concurrent "
+            "threads; expected exactly 1 (stampede not prevented)"
+        )
 
 

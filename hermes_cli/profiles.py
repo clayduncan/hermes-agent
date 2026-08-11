@@ -27,6 +27,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -743,6 +744,10 @@ def _check_gateway_running(profile_dir: Path) -> bool:
 # changes (catches skill add/remove) or after a short TTL (catches deep edits).
 _SKILL_COUNT_CACHE: dict[str, tuple[float, float, int]] = {}
 _SKILL_COUNT_TTL_SECONDS = 30.0
+# Prevents concurrent threads from all walking the skill tree on a cache miss.
+# FastAPI runs sync handlers in a threadpool, so burst requests can produce
+# simultaneous cache misses for the same skills dir and open fds together.
+_SKILL_COUNT_LOCK = threading.Lock()
 
 
 def _skills_dir_signature(skills_dir: Path) -> float:
@@ -781,6 +786,8 @@ def _count_skills(profile_dir: Path) -> int:
     key = str(skills_dir)
     signature = _skills_dir_signature(skills_dir)
     now = time.time()
+
+    # Fast path: no lock needed for a cache hit.
     cached = _SKILL_COUNT_CACHE.get(key)
     if (
         cached is not None
@@ -789,12 +796,26 @@ def _count_skills(profile_dir: Path) -> int:
     ):
         return cached[2]
 
-    count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
-    _SKILL_COUNT_CACHE[key] = (signature, now, count)
+    # Slow path: acquire the lock before walking so concurrent threads
+    # (FastAPI's sync threadpool) don't all start simultaneous rglob walks on
+    # the same cache miss — that's the stampede that exhausts file descriptors.
+    with _SKILL_COUNT_LOCK:
+        # Re-check under the lock; another thread may have walked while we waited.
+        now = time.time()
+        cached = _SKILL_COUNT_CACHE.get(key)
+        if (
+            cached is not None
+            and cached[0] == signature
+            and (now - cached[1]) < _SKILL_COUNT_TTL_SECONDS
+        ):
+            return cached[2]
+
+        count = 0
+        for md in skills_dir.rglob("SKILL.md"):
+            if is_excluded_skill_path(md):
+                continue
+            count += 1
+        _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 
 
