@@ -4176,6 +4176,26 @@ def generate_launchd_plist() -> str:
     <key>ExitTimeOut</key>
     <integer>25</integer>
 
+    <!-- macOS launchd assigns a default soft fd limit of 256 to every
+         process unless a service's own plist overrides it. A long-running
+         gateway that accumulates MCP connections, terminal sessions, and
+         file handles over hours/days eventually hits that ceiling and
+         starts failing silently across every subsystem that opens a file
+         or socket (cron reads, config reloads, auth.json, skills scans).
+         Raise it here so every regenerated plist carries the fix — see
+         devops/macos-fd-limit-hardening skill for the full diagnosis. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65536</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
