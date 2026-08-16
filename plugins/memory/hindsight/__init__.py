@@ -1518,12 +1518,30 @@ class HindsightMemoryProvider(MemoryProvider):
             _export_port_health_grace_timeout(self._config)
             available, reason = _check_local_runtime()
             if not available:
-                logger.warning(
-                    "Hindsight local mode disabled because its runtime could not be imported: %s",
-                    reason,
-                )
-                self._mode = "disabled"
-                return
+                # Attempt to self-heal by lazy-installing the local runtime
+                # stack. Mirrors _ensure_cloud_client_dependency() — same
+                # pattern, same exception handling shape.
+                try:
+                    from tools.lazy_deps import ensure as _lazy_ensure
+                    _lazy_ensure("memory.hindsight_local", prompt=False)
+                except ImportError:
+                    pass
+                except Exception as _heal_exc:
+                    logger.debug("Hindsight local self-heal install failed: %s", _heal_exc)
+                # Re-check after attempted install.
+                available, reason = _check_local_runtime()
+                if available:
+                    logger.info(
+                        "Hindsight local runtime self-heal succeeded; "
+                        "local_embedded mode is now available."
+                    )
+                else:
+                    logger.warning(
+                        "Hindsight local mode disabled because its runtime could not be imported: %s",
+                        reason,
+                    )
+                    self._mode = "disabled"
+                    return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)

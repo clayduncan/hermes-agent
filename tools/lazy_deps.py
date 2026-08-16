@@ -192,6 +192,24 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
     "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Local-embedded Hindsight stack (mode=local_embedded). Heavy runtime:
+    # sentence-transformers, torch, transformers, etc. Pinned to the exact
+    # versions verified working on 2026-08-16; keep in sync with the
+    # `hindsight-local` extra in pyproject.toml. Installed on demand by
+    # plugins/memory/hindsight/__init__.py when the packages are missing.
+    "memory.hindsight_local": (
+        "hindsight-all==0.9.1",
+        "hindsight-api-slim==0.9.1",
+        "hindsight-embed==0.9.1",
+        "sentence-transformers==5.7.0",
+        "torch==2.13.0",
+        "transformers==5.15.0",
+        "tokenizers==0.22.2",
+        "safetensors==0.8.0",
+        "scikit-learn==1.9.0",
+        "scipy==1.17.1",
+        "sentencepiece==0.2.2",
+    ),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
