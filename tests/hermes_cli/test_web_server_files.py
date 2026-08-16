@@ -90,6 +90,49 @@ def _seed_file(client, root, name="out/hello.txt"):
 
 
 
+def test_download_audio_served_inline(forced_files_client):
+    """Audio files must return Content-Disposition: inline so <audio> can seek."""
+    client, root = forced_files_client
+    mp3_path = root / "out" / "speech.mp3"
+    mp3_path.parent.mkdir(parents=True, exist_ok=True)
+    mp3_path.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * 100)  # minimal MP3 header
+
+    resp = client.get("/api/files/download", params={"path": str(mp3_path)})
+    assert resp.status_code == 200
+    cd = resp.headers.get("content-disposition", "")
+    assert cd.startswith("inline"), f"expected inline disposition for audio, got: {cd!r}"
+
+
+def test_download_video_served_inline(forced_files_client):
+    """Video files must return Content-Disposition: inline so <video> can seek."""
+    client, root = forced_files_client
+    mp4_path = root / "out" / "clip.mp4"
+    mp4_path.parent.mkdir(parents=True, exist_ok=True)
+    mp4_path.write_bytes(b"\x00\x00\x00\x20ftyp" + b"\x00" * 100)
+
+    resp = client.get("/api/files/download", params={"path": str(mp4_path)})
+    assert resp.status_code == 200
+    cd = resp.headers.get("content-disposition", "")
+    assert cd.startswith("inline"), f"expected inline disposition for video, got: {cd!r}"
+
+
+def test_download_non_media_served_as_attachment(forced_files_client):
+    """Non-media files (txt, pdf) must still return Content-Disposition: attachment."""
+    client, root = forced_files_client
+
+    for name, content in [("report.txt", b"hello"), ("doc.pdf", b"%PDF-1.4\n")]:
+        p = root / "out" / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+
+        resp = client.get("/api/files/download", params={"path": str(p)})
+        assert resp.status_code == 200
+        cd = resp.headers.get("content-disposition", "")
+        assert cd.startswith("attachment"), (
+            f"expected attachment disposition for {name}, got: {cd!r}"
+        )
+
+
 def test_download_authenticates_via_query_token(forced_files_client):
     client, root = forced_files_client
     file_path = _seed_file(client, root)

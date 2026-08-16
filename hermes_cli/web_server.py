@@ -2451,11 +2451,18 @@ async def download_managed_file(request: Request, path: str):
 
     mime_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
 
+    # Audio and video must be served inline so Chromium's <audio>/<video> elements
+    # can issue Range requests and read duration metadata. Content-Disposition:
+    # attachment causes Chromium to treat the response as a download, breaking
+    # seek and producing 0:00/0:00 duration — even when Content-Length and
+    # Accept-Ranges are correct.
+    disposition = "inline" if mime_type.startswith(("audio/", "video/")) else "attachment"
+
     return FileResponse(
         path=str(target),
         media_type=mime_type,
         filename=target.name,
-        content_disposition_type="attachment",
+        content_disposition_type=disposition,
     )
 
 
