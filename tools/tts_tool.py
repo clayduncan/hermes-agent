@@ -1426,12 +1426,17 @@ def _generate_elevenlabs(text: str, output_path: str, tts_config: Dict[str, Any]
 
     ElevenLabs = _import_elevenlabs()
     client = ElevenLabs(api_key=api_key, **_elevenlabs_environment_kwargs(el_config))
-    audio_generator = client.text_to_speech.convert(
-        text=text,
-        voice_id=voice_id,
-        model_id=model_id,
-        output_format=output_format,
-    )
+    convert_kwargs: Dict[str, Any] = {
+        "text": text,
+        "voice_id": voice_id,
+        "model_id": model_id,
+        "output_format": output_format,
+    }
+    voice_settings_dict = el_config.get("voice_settings")
+    if voice_settings_dict:
+        from elevenlabs.types.voice_settings import VoiceSettings
+        convert_kwargs["voice_settings"] = VoiceSettings(**voice_settings_dict)
+    audio_generator = client.text_to_speech.convert(**convert_kwargs)
 
     # audio_generator yields chunks -- write them all
     with open(output_path, "wb") as f:
