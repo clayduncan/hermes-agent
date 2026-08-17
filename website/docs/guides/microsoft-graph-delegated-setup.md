@@ -15,9 +15,9 @@ Delegated auth lets Hermes act **as a specific human user** — reading and writ
 
 1. Clay (or IT) registers an Azure app with **Delegated** permissions (`Calendars.ReadWrite`, `Mail.ReadWrite`, `offline_access`).
 2. Hermes generates an authorization URL containing a PKCE challenge.
-3. Clay opens the URL in a browser, approves the consent screen, and is redirected to a Microsoft URL with a `?code=...` query parameter.
-4. Clay copies that code (or the full URL) and pastes it back to the agent.
-5. Hermes exchanges the code for an access token + refresh token and stores them in `~/.hermes/msgraph_token_<account_key>.json`.
+3. Clay opens the URL in a browser and approves the consent screen.
+4. The browser is automatically redirected to `http://localhost:8765/callback` — a tiny HTTP listener running on the same machine as the terminal.  **No manual code-copy step.**
+5. Hermes captures the code from the callback, exchanges it for an access token + refresh token, and stores them in `~/.hermes/msgraph_token_<account_key>.json`.
 6. Future API calls auto-refresh silently using the stored refresh token.
 
 ---
@@ -30,9 +30,21 @@ Before running the setup commands, ensure:
   - `Calendars.ReadWrite`
   - `Mail.ReadWrite`
   - `offline_access` (lets the server issue a refresh token)
-- The redirect URI `https://login.microsoftonline.com/common/oauth2/nativeclient` is registered in the app's **Authentication** section.
+- The following redirect URIs are registered in the app's **Authentication → Mobile and desktop applications** platform (both can coexist):
+  - `https://login.microsoftonline.com/common/oauth2/nativeclient` *(existing, keep for fallback)*
+  - `http://localhost:8765/callback` *(new — required for the loopback listener flow)*
 - You have the **Application (client) ID** and **Directory (tenant) ID** from the app's Overview page.
 - The client secret has been placed in `~/.hermes/.env` under the correct key.
+
+### Adding the loopback redirect URI in Azure (one-time step)
+
+1. Go to [portal.azure.com](https://portal.azure.com) → Azure Active Directory → App registrations → your app.
+2. Click **Authentication** in the left sidebar.
+3. Under **Mobile and desktop applications**, click **Add URI**.
+4. Enter exactly: `http://localhost:8765/callback`
+5. Click **Save**.
+
+The nativeclient URI already there does **not** need to be removed.
 
 ---
 
@@ -126,43 +138,60 @@ Optional: override the default scopes (`Calendars.ReadWrite Mail.ReadWrite offli
 
 ---
 
-### Step 3: generate the authorization URL
+### Step 3: complete the OAuth consent flow
 
 ```bash
 python scripts/microsoft_graph_delegated_setup.py --auth-url --account clayduncan
 ```
 
-This prints a long authorization URL and saves a pending-session file.  Copy and send the URL to Clay.
+**This is a single blocking command** — it does everything in one step:
+
+1. A local HTTP listener starts on port 8765 (localhost only, invisible to the user).
+2. The script prints a long authorization URL — relay it to Clay.
+3. Clay opens the URL in their browser, logs in, and approves the consent screen.
+4. The browser automatically redirects to `http://localhost:8765/callback`.
+5. The script captures the code, exchanges it for tokens, saves them, and exits with `OK: Authenticated.`
 
 Tell Clay:
-> "Please open this URL in your browser. You'll see a Microsoft login and consent page.  After you approve, your browser will be redirected to a page that shows an error — that's normal.  Please copy the entire URL from your browser's address bar and paste it here."
+> "Please open this URL in your browser. You'll see a Microsoft login and consent page.  After you approve, your browser will briefly redirect — you don't need to do anything else.  Just let me know when it's done."
 
----
-
-### Step 4: exchange the authorization code
-
-When Clay pastes the URL (or just the `code=...` value), run:
-
-```bash
-python scripts/microsoft_graph_delegated_setup.py \
-  --auth-code "PASTE_CODE_OR_FULL_URL_HERE" \
-  --account clayduncan
-```
+The script will complete automatically once the browser callback arrives (up to 5 minutes).  **Clay does not need to copy or paste anything.**
 
 On success you'll see:
 ```
 OK: Authenticated. Token saved to ~/.hermes/msgraph_token_clayduncan.json
+  Account   : clayduncan
+  Tenant ID : d14d6257-4cf6-45a2-83fd-5d218bda8aee
+  Scopes    : Calendars.ReadWrite Mail.ReadWrite offline_access
 ```
 
 ---
 
-### Step 5: verify
+### Step 4: verify
 
 ```bash
 python scripts/microsoft_graph_delegated_setup.py --check --account clayduncan
 ```
 
 Should exit 0 with `AUTHENTICATED`.
+
+---
+
+## Manual fallback (--auth-code)
+
+If port 8765 is unavailable or the loopback flow fails, you can still complete auth manually:
+
+1. If `--auth-url` saved a pending session before failing, skip to step 3.
+2. Otherwise start fresh: run `--auth-url` (it will error on port bind, but will print a message).
+3. Ask Clay to copy the full URL from the browser address bar after consent and paste it.
+4. Run:
+   ```bash
+   python scripts/microsoft_graph_delegated_setup.py \
+     --auth-code "PASTE_CODE_OR_FULL_URL_HERE" \
+     --account clayduncan
+   ```
+
+This works because `--auth-url` always saves a pending session file before starting the listener.  The `--auth-code` path reads that pending file for the state/PKCE values it needs.
 
 ---
 
@@ -213,14 +242,18 @@ For organization-managed accounts (Princeton), the tenant admin can revoke via E
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `DelegatedGraphSetupNeeded` raised | No token file for this account | Run Steps 2–5 |
-| `DelegatedGraphReconsentNeeded` raised | Refresh token revoked or expired | Run `--revoke` then Steps 3–5 |
+| `DelegatedGraphSetupNeeded` raised | No token file for this account | Run Steps 2–4 |
+| `DelegatedGraphReconsentNeeded` raised | Refresh token revoked or expired | Run `--revoke` then Step 3 |
 | `--configure` fails with missing env var | Secret not in `.env` or gateway not restarted | Add `MSGRAPH_<KEY>_CLIENT_SECRET` to `~/.hermes/.env` and restart gateway |
 | `--auth-url` fails with "No configuration" | `--configure` was not run first | Run Step 2 |
-| `--auth-code` fails with "state mismatch" | Stale pending session | Run `--auth-url` again to get a fresh URL |
+| `--auth-url` fails with "Could not bind loopback listener on port 8765" | Port 8765 is in use | Find and stop whatever is using port 8765, or use the `--auth-code` manual fallback |
+| `--auth-url` times out after 5 minutes | Browser flow not completed | Pending session is kept — try `--auth-code` manually, or re-run `--auth-url` |
+| `--auth-code` fails with "state mismatch" | Stale pending session | Run `--auth-url` again to start a fresh session |
 | Token exchange returns "invalid_grant" | Code expired or already used | Run `--auth-url` again (codes are single-use, expire in ~10 min) |
 | `AADSTS700016: Application not found` | Wrong client_id or tenant_id | Verify values in Azure portal against Step 2 |
 | `AADSTS700082: Consent was not granted` | User denied the consent screen | Ask Clay to re-open the URL and approve all permissions |
+| `AADSTS9002326: Cross-origin token redemption` | Old nativeclient redirect + JS race | Confirm `http://localhost:8765/callback` is registered in Azure and re-run `--auth-url` |
+| Browser redirects to `/common/wrongplace` | nativeclient URI is being used (old flow) | Confirm `http://localhost:8765/callback` is in Azure and re-run `--auth-url` |
 
 ---
 
@@ -230,6 +263,7 @@ For organization-managed accounts (Princeton), the tenant admin can revoke via E
    - Tenant ID
    - Application (client) ID
    - Client secret value
+   - Confirm that `http://localhost:8765/callback` has been added as a redirect URI
 2. Add to `~/.hermes/.env`:
    ```
    MSGRAPH_PRINCETON_TENANT_ID=<tenant-id>
@@ -237,4 +271,4 @@ For organization-managed accounts (Princeton), the tenant admin can revoke via E
    MSGRAPH_PRINCETON_CLIENT_SECRET=<secret>
    ```
 3. Restart the gateway: `hermes gateway restart`
-4. Follow Steps 1–5 above with `--account princeton`.
+4. Follow Steps 1–4 above with `--account princeton`.

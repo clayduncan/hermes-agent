@@ -12,18 +12,25 @@ Commands:
   setup.py --auth-code "CODE_OR_FULL_REDIRECT_URL" --account KEY
   setup.py --revoke --account KEY
 
-Agent workflow:
+Agent workflow (new loopback flow):
   1. Run --check --account KEY.  Exit 0 = auth good, skip setup.
   2. Run --configure --account KEY --tenant-id TENANT_ID --client-id CLIENT_ID.
      The client secret must already be set in env as MSGRAPH_<KEY>_CLIENT_SECRET.
-  3. Run --auth-url --account KEY.  Send the printed URL to the user.
-  4. User opens URL in browser, approves consent.  The browser is redirected to
-     https://login.microsoftonline.com/common/oauth2/nativeclient?code=...
-     which shows an error page — that is expected.  The user copies either:
-       a. Just the 'code' query parameter value from the URL, OR
-       b. The entire redirect URL from the browser address bar.
-  5. User pastes that.  Agent runs --auth-code "CODE_OR_URL" --account KEY.
-  6. Run --check --account KEY to verify.  Done.
+  3. Run --auth-url --account KEY.  This is now a SINGLE BLOCKING OPERATION:
+     a. A local HTTP listener starts on port 8765 (loopback only).
+     b. The authorization URL is printed — relay it to the user.
+     c. The user opens the URL in their browser and approves the consent screen.
+     d. The browser is redirected to http://localhost:8765/callback automatically.
+     e. The script captures the code, exchanges it for tokens, and exits.
+     No manual code-paste step is required.
+  4. Run --check --account KEY to verify.  Done.
+
+Fallback (manual paste, for when port 8765 is unavailable):
+  3a. Run --auth-url ... (prints URL, exits immediately if port is blocked — not yet
+      implemented as a separate mode; if the loopback server cannot bind, the script
+      errors with a clear message).
+  3b. Use --auth-code "CODE_OR_URL" --account KEY to paste the code manually after
+      completing a separate --auth-url invocation that saved a pending session.
 
 Env var naming:
   MSGRAPH_<KEY>_TENANT_ID     — Azure Directory (tenant) ID
@@ -41,10 +48,12 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import http.server
 import json
 import os
 import secrets
 import sys
+import threading
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -57,6 +66,7 @@ if _REPO_ROOT not in sys.path:
 from tools.microsoft_graph_delegated_auth import (
     DEFAULT_GRAPH_AUTHORITY_URL,
     DEFAULT_REDIRECT_URI,
+    LOOPBACK_CALLBACK_PORT,
     DelegatedGraphReconsentNeeded,
     DelegatedGraphSetupNeeded,
     DelegatedTokenFile,
@@ -215,6 +225,139 @@ def _get_client_secret(account_key: str) -> str:
     return secret
 
 
+# ── Loopback HTTP listener ────────────────────────────────────────────────────
+
+
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler that captures the OAuth callback on /callback."""
+
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/callback":
+            self.send_response(404)
+            self.end_headers()
+            return
+        self.server.captured_params = urllib.parse.parse_qs(parsed.query)  # type: ignore[attr-defined]
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(
+            b"<html><body>"
+            b"<h2>Authorization complete.</h2>"
+            b"<p>You can close this tab and return to your terminal.</p>"
+            b"</body></html>"
+        )
+        self.server.captured_event.set()  # type: ignore[attr-defined]
+
+    def log_message(self, format: str, *args: object) -> None:
+        pass  # suppress default per-request logging
+
+
+def _start_loopback_server(port: int = LOOPBACK_CALLBACK_PORT) -> http.server.HTTPServer:
+    """Bind a loopback HTTP server on the given port and start serving in a daemon thread.
+
+    Returns the server object.  Attributes set on the server:
+      .captured_event  — threading.Event that fires when /callback is received
+      .captured_params — dict of parse_qs results from the callback query string
+
+    Raises OSError if the port is already in use (HTTPServer sets SO_REUSEADDR,
+    so TIME_WAIT sockets do not block rebinding).
+    """
+    server = http.server.HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    server.captured_params: dict = {}  # type: ignore[attr-defined]
+    server.captured_event = threading.Event()  # type: ignore[attr-defined]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server
+
+
+# ── Token exchange (shared by loopback and manual-paste paths) ────────────────
+
+
+def _do_token_exchange(account_key: str, code: str, pending: dict) -> None:
+    """Exchange an authorization code for tokens and save them to disk.
+
+    `pending` must contain: code_verifier, redirect_uri, tenant_id, client_id, scopes.
+    `code` is the already-extracted authorization code (not a full URL).
+    """
+    import time as _time
+
+    client_secret = _get_client_secret(account_key)
+    tenant_id: str = pending["tenant_id"]
+    client_id: str = pending["client_id"]
+    scopes: list[str] = pending.get("scopes") or DEFAULT_SCOPES
+
+    token_url = f"{DEFAULT_GRAPH_AUTHORITY_URL}/{tenant_id}/oauth2/v2.0/token"
+    post_data = urllib.parse.urlencode(
+        {
+            "grant_type": "authorization_code",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "redirect_uri": pending["redirect_uri"],
+            "code_verifier": pending["code_verifier"],
+            "scope": " ".join(scopes),
+        }
+    ).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            token_url,
+            data=post_data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8"))
+            detail = body.get("error_description") or body.get("error") or str(exc)
+        except Exception:
+            detail = str(exc)
+        print(f"ERROR: Token exchange failed: {detail}")
+        print("The code may have expired or already been used. Run --auth-url to get a fresh URL.")
+        sys.exit(1)
+    except Exception as exc:
+        print(f"ERROR: Token exchange failed: {exc}")
+        sys.exit(1)
+
+    access_token = str(payload.get("access_token") or "").strip()
+    refresh_token = str(payload.get("refresh_token") or "").strip()
+    expires_in = int(payload.get("expires_in") or 3600)
+    scope_str = str(payload.get("scope") or "").strip()
+    granted_scopes = scope_str.split() if scope_str else scopes
+
+    if not access_token:
+        print(f"ERROR: Token exchange succeeded but response has no access_token: {payload}")
+        sys.exit(1)
+    if not refresh_token:
+        print(
+            "WARNING: No refresh_token in response. "
+            "offline_access scope may have been denied or the token was issued without consent prompt."
+        )
+
+    token_file = DelegatedTokenFile(
+        account_key=account_key,
+        tenant_id=tenant_id,
+        client_id=client_id,
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=_time.time() + max(0, expires_in),
+        scopes=granted_scopes,
+    )
+
+    dest = _token_path(account_key)
+    token_file.save(dest)
+    _pending_path(account_key).unlink(missing_ok=True)
+
+    print(f"OK: Authenticated. Token saved to {dest}")
+    print(f"  Account   : {account_key}")
+    print(f"  Tenant ID : {tenant_id}")
+    print(f"  Scopes    : {', '.join(granted_scopes)}")
+    print(f"\nVerify with: python scripts/microsoft_graph_delegated_setup.py --check --account {account_key}")
+
+
 # ── Commands ──────────────────────────────────────────────────────────────────
 
 
@@ -287,8 +430,19 @@ def configure(
     print(f"\nNext step: run --auth-url --account {account_key}")
 
 
-def get_auth_url(account_key: str) -> None:
-    """Build and print the authorization URL.  The user visits this in a browser."""
+def get_auth_url(account_key: str, *, loopback_timeout: int = 300, _loopback_port: int = LOOPBACK_CALLBACK_PORT) -> None:
+    """Start a loopback listener, print the auth URL, and block until the browser completes consent.
+
+    This is a single blocking operation.  The process exits when:
+      - The user completes consent in their browser and tokens are saved (exit 0).
+      - No callback is received within loopback_timeout seconds (exit 1).
+        The pending session is kept on disk so --auth-code can still be used as fallback.
+      - An error occurs (exit 1).
+
+    The loopback listener binds on 127.0.0.1 (never accessible remotely).
+    The redirect URI in the authorize request is http://localhost:<port>/callback,
+    which must be registered in Azure as a "Mobile and desktop applications" platform URI.
+    """
     config = _load_config(account_key)
     if not config.get("tenant_id") or not config.get("client_id"):
         print(
@@ -304,13 +458,28 @@ def get_auth_url(account_key: str) -> None:
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(16)
 
-    authorize_url = (
-        f"{DEFAULT_GRAPH_AUTHORITY_URL}/{tenant_id}/oauth2/v2.0/authorize"
-    )
+    # Start the loopback server before building the URL so port availability is
+    # confirmed before we print anything to the agent.
+    try:
+        server = _start_loopback_server(_loopback_port)
+    except OSError as exc:
+        print(
+            f"ERROR: Could not bind loopback listener on port {_loopback_port}: {exc}\n"
+            f"Something else is using that port.  Free port {_loopback_port} or use the\n"
+            f"manual fallback: complete the browser flow then run\n"
+            f"  python scripts/microsoft_graph_delegated_setup.py "
+            f'--auth-code "PASTED_CODE_OR_URL" --account {account_key}'
+        )
+        sys.exit(1)
+
+    actual_port = server.server_address[1]
+    loopback_redirect_uri = f"http://localhost:{actual_port}/callback"
+
+    authorize_url = f"{DEFAULT_GRAPH_AUTHORITY_URL}/{tenant_id}/oauth2/v2.0/authorize"
     params = {
         "client_id": client_id,
         "response_type": "code",
-        "redirect_uri": DEFAULT_REDIRECT_URI,
+        "redirect_uri": loopback_redirect_uri,
         "scope": " ".join(scopes),
         "state": state,
         "code_challenge": code_challenge,
@@ -324,7 +493,7 @@ def get_auth_url(account_key: str) -> None:
         account_key,
         state=state,
         code_verifier=code_verifier,
-        redirect_uri=DEFAULT_REDIRECT_URI,
+        redirect_uri=loopback_redirect_uri,
         tenant_id=tenant_id,
         client_id=client_id,
         scopes=scopes,
@@ -332,18 +501,72 @@ def get_auth_url(account_key: str) -> None:
 
     print(full_url)
     print(
-        f"\n[Agent note] Send this URL to the user. After they approve consent, the browser "
-        f"will redirect to a page that shows an error — that is expected. Ask the user to "
-        f"copy the entire URL from their browser address bar (or just the 'code=...' value) "
-        f"and paste it back. Then run:\n"
-        f"  python scripts/microsoft_graph_delegated_setup.py "
-        f'--auth-code "PASTED_CODE_OR_URL" --account {account_key}',
+        f"\n[Agent note] Relay this URL to the user. After they approve consent in their "
+        f"browser, it will automatically redirect to the local listener on port {actual_port}. "
+        f"No code-paste step needed — this process will complete automatically once consent "
+        f"is granted (waiting up to {loopback_timeout // 60} minutes).",
         file=sys.stderr,
     )
 
+    received = server.captured_event.wait(timeout=loopback_timeout)
+    server.shutdown()
+    server.server_close()
+
+    if not received:
+        # Keep the pending session so --auth-code can still be used as a manual fallback.
+        print(
+            f"TIMEOUT: No browser callback received within {loopback_timeout // 60} minutes.\n"
+            "The pending session has been kept. If the user completed consent you can still\n"
+            "try manually pasting the code with:\n"
+            f"  python scripts/microsoft_graph_delegated_setup.py "
+            f'--auth-code "PASTED_CODE_OR_URL" --account {account_key}'
+        )
+        sys.exit(1)
+
+    params_received = server.captured_params
+    if "error" in params_received:
+        error = (params_received.get("error") or ["unknown"])[0]
+        desc = (params_received.get("error_description") or [""])[0]
+        _pending_path(account_key).unlink(missing_ok=True)
+        print(f"ERROR: Authorization server returned error '{error}': {desc}")
+        sys.exit(1)
+
+    if "code" not in params_received:
+        _pending_path(account_key).unlink(missing_ok=True)
+        print("ERROR: No 'code' parameter in callback URL.")
+        sys.exit(1)
+
+    code = params_received["code"][0]
+    returned_state = (params_received.get("state") or [None])[0]
+
+    if returned_state and returned_state != state:
+        _pending_path(account_key).unlink(missing_ok=True)
+        print(
+            "ERROR: OAuth state mismatch — possible CSRF or stale session. "
+            "Run --auth-url again to start a fresh session."
+        )
+        sys.exit(1)
+
+    # Use in-memory pending dict (already saved to disk above for crash recovery).
+    pending = {
+        "state": state,
+        "code_verifier": code_verifier,
+        "redirect_uri": loopback_redirect_uri,
+        "tenant_id": tenant_id,
+        "client_id": client_id,
+        "scopes": scopes,
+    }
+    _do_token_exchange(account_key, code, pending)
+
 
 def exchange_auth_code(account_key: str, code_or_url: str) -> None:
-    """Exchange the authorization code for tokens and save them."""
+    """Exchange the authorization code for tokens and save them.
+
+    This is the --auth-code manual-paste fallback path.  The primary path is
+    --auth-url which captures the code automatically via the loopback listener.
+
+    Loads the pending session written by a prior --auth-url invocation.
+    """
     pending = _load_pending_session(account_key)
     code, returned_state = _extract_code_and_state(code_or_url)
 
@@ -354,84 +577,7 @@ def exchange_auth_code(account_key: str, code_or_url: str) -> None:
         )
         sys.exit(1)
 
-    client_secret = _get_client_secret(account_key)
-    tenant_id: str = pending["tenant_id"]
-    client_id: str = pending["client_id"]
-    scopes: list[str] = pending.get("scopes") or DEFAULT_SCOPES
-
-    token_url = f"{DEFAULT_GRAPH_AUTHORITY_URL}/{tenant_id}/oauth2/v2.0/token"
-    post_data = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": pending["redirect_uri"],
-            "code_verifier": pending["code_verifier"],
-            "scope": " ".join(scopes),
-        }
-    ).encode("utf-8")
-
-    try:
-        req = urllib.request.Request(
-            token_url,
-            data=post_data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            body = json.loads(exc.read().decode("utf-8"))
-            detail = body.get("error_description") or body.get("error") or str(exc)
-        except Exception:
-            detail = str(exc)
-        print(f"ERROR: Token exchange failed: {detail}")
-        print("The code may have expired or already been used. Run --auth-url to get a fresh URL.")
-        sys.exit(1)
-    except Exception as exc:
-        print(f"ERROR: Token exchange failed: {exc}")
-        sys.exit(1)
-
-    import time as _time
-
-    access_token = str(payload.get("access_token") or "").strip()
-    refresh_token = str(payload.get("refresh_token") or "").strip()
-    expires_in = int(payload.get("expires_in") or 3600)
-    scope_str = str(payload.get("scope") or "").strip()
-    granted_scopes = scope_str.split() if scope_str else scopes
-
-    if not access_token:
-        print(f"ERROR: Token exchange succeeded but response has no access_token: {payload}")
-        sys.exit(1)
-    if not refresh_token:
-        print(
-            "WARNING: No refresh_token in response. "
-            "offline_access scope may have been denied or the token was issued without consent prompt."
-        )
-
-    token_file = DelegatedTokenFile(
-        account_key=account_key,
-        tenant_id=tenant_id,
-        client_id=client_id,
-        access_token=access_token,
-        refresh_token=refresh_token,
-        expires_at=_time.time() + max(0, expires_in),
-        scopes=granted_scopes,
-    )
-
-    dest = _token_path(account_key)
-    token_file.save(dest)
-
-    # Clean up the pending session
-    _pending_path(account_key).unlink(missing_ok=True)
-
-    print(f"OK: Authenticated. Token saved to {dest}")
-    print(f"  Account   : {account_key}")
-    print(f"  Tenant ID : {tenant_id}")
-    print(f"  Scopes    : {', '.join(granted_scopes)}")
-    print(f"\nVerify with: python scripts/microsoft_graph_delegated_setup.py --check --account {account_key}")
+    _do_token_exchange(account_key, code, pending)
 
 
 def revoke(account_key: str) -> None:
@@ -496,12 +642,18 @@ def main() -> None:
     mode_group.add_argument(
         "--auth-url",
         action="store_true",
-        help="Print the OAuth authorization URL for the user to visit",
+        help=(
+            "Start a loopback listener, print the OAuth authorization URL, "
+            "and block until the browser completes consent (up to 5 minutes)"
+        ),
     )
     mode_group.add_argument(
         "--auth-code",
         metavar="CODE_OR_URL",
-        help="Exchange the authorization code (or full redirect URL) for tokens",
+        help=(
+            "Fallback: exchange the authorization code (or full redirect URL) for tokens. "
+            "Requires a pending session from a prior --auth-url invocation."
+        ),
     )
     mode_group.add_argument(
         "--revoke",

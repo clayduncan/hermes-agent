@@ -439,13 +439,21 @@ class TestSetupScriptCLI:
             ),
             encoding="utf-8",
         )
-        setup_script.get_auth_url("test")
+        # get_auth_url now blocks for the loopback callback; use loopback_timeout=0
+        # and a dynamic port (port=0) to avoid binding the fixed production port.
+        # On timeout, it exits 1 but keeps the pending session on disk for --auth-code fallback.
+        with pytest.raises(SystemExit) as exc_info:
+            setup_script.get_auth_url("test", loopback_timeout=0, _loopback_port=0)
+        assert exc_info.value.code == 1
         pending = tmp_path / "msgraph_pending_test.json"
         assert pending.exists()
         data = json.loads(pending.read_text(encoding="utf-8"))
         assert data["state"]
         assert data["code_verifier"]
         assert data["tenant_id"] == "tenant-abc"
+        # Redirect URI must be the loopback one, not the old nativeclient URI
+        assert "localhost" in data["redirect_uri"]
+        assert "/callback" in data["redirect_uri"]
 
     def test_revoke_deletes_token_and_pending_files(self, tmp_path, setup_script, monkeypatch):
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)

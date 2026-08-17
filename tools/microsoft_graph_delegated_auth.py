@@ -11,6 +11,15 @@ Duck-typing compatibility with MicrosoftGraphClient:
   Pass a DelegatedTokenProvider directly as the MicrosoftGraphClient token_provider
   argument — no new REST client or wrapper needed.
 
+Auth flow (--auth-url):
+  The setup script starts a local HTTP listener on LOOPBACK_CALLBACK_PORT (8765),
+  prints the authorization URL for the agent to relay to the user, and blocks until
+  the browser redirects back to http://localhost:8765/callback with the auth code.
+  No manual copy-paste step required.
+
+  To use this flow, register http://localhost:8765/callback as a redirect URI in your
+  Azure app's "Mobile and desktop applications" platform alongside the nativeclient URI.
+
 Token file location: ~/.hermes/msgraph_token_<account_key>.json
 Env vars per account (uppercase account_key in prefix):
   MSGRAPH_<KEY>_TENANT_ID
@@ -38,9 +47,14 @@ from tools.microsoft_graph_auth import (
 )
 
 DEFAULT_GRAPH_AUTHORITY_URL = "https://login.microsoftonline.com"
-# The "native client" redirect URI — already configured in the Azure app registration.
-# Microsoft redirects here after consent; the user copies the code from the browser URL bar.
+# Legacy "native client" redirect URI — kept for backward compat and as a fallback constant.
+# New flows use the loopback listener (LOOPBACK_REDIRECT_URI) instead.
 DEFAULT_REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+# Loopback redirect URI for native/installed apps (Microsoft's current recommendation).
+# Register EXACTLY this string in your Azure app → Authentication → Mobile and desktop
+# applications platform.  Port 8765 is fixed so only one URI entry is needed.
+LOOPBACK_CALLBACK_PORT = 8765
+LOOPBACK_REDIRECT_URI = f"http://localhost:{LOOPBACK_CALLBACK_PORT}/callback"
 DEFAULT_TOKEN_SKEW_SECONDS = 120
 _OFFLINE_ACCESS = "offline_access"
 
