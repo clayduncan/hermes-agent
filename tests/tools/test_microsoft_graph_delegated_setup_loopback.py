@@ -435,9 +435,11 @@ class TestTokenExchangeClientSecretHandling:
         assert body["grant_type"] == ["authorization_code"]
 
     def test_confidential_client_post_body_includes_secret(self, tmp_path, setup_script, monkeypatch):
-        """Confidential-client exchange includes client_secret in the POST body."""
+        """Confidential-client exchange includes client_secret from ~/.hermes/.env in the POST body."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "confidential-secret-value")
+        (tmp_path / ".env").write_text(
+            "MSGRAPH_TEST_CLIENT_SECRET=confidential-secret-value\n", encoding="utf-8"
+        )
 
         captured: list = []
         monkeypatch.setattr(urllib.request, "urlopen", _make_success_urlopen(captured))

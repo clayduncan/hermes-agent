@@ -21,6 +21,7 @@ from tools.microsoft_graph_delegated_auth import (
     DelegatedGraphSetupNeeded,
     DelegatedTokenFile,
     DelegatedTokenProvider,
+    _parse_dotenv,
 )
 
 
@@ -458,7 +459,6 @@ class TestSetupScriptCLI:
 
     def test_configure_saves_config_file(self, tmp_path, setup_script, monkeypatch):
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy-secret")
         setup_script.configure(
             "test",
             tenant_id="tenant-aaa",
@@ -474,7 +474,6 @@ class TestSetupScriptCLI:
 
     def test_configure_adds_offline_access_if_missing(self, tmp_path, setup_script, monkeypatch):
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy-secret")
         setup_script.configure(
             "test",
             tenant_id="t",
@@ -567,9 +566,9 @@ class TestSetupScriptCLI:
         assert "public-client" in out
 
     def test_configure_reports_confidential_mode_with_secret(self, tmp_path, setup_script, monkeypatch, capsys):
-        """configure() prints 'confidential-client' when secret env var IS set."""
+        """configure() prints 'confidential-client' when secret IS present in ~/.hermes/.env."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "super-secret")
+        (tmp_path / ".env").write_text("MSGRAPH_TEST_CLIENT_SECRET=super-secret\n", encoding="utf-8")
         setup_script.configure("test", tenant_id="t", client_id="c")
         out = capsys.readouterr().out
         assert "confidential-client" in out
@@ -629,9 +628,11 @@ class TestDoTokenExchange:
         assert body["code"] == ["AUTH-CODE-XYZ"]
 
     def test_confidential_client_post_body_includes_client_secret(self, tmp_path, setup_script, monkeypatch):
-        """When MSGRAPH_*_CLIENT_SECRET is set, client_secret MUST appear in the POST body."""
+        """When MSGRAPH_*_CLIENT_SECRET is present in ~/.hermes/.env, it MUST appear in the POST body."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "super-secret-value")
+        (tmp_path / ".env").write_text(
+            "MSGRAPH_TEST_CLIENT_SECRET=super-secret-value\n", encoding="utf-8"
+        )
 
         captured: list = []
         monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_success(captured))
@@ -707,3 +708,154 @@ class TestFilePermissions:
         # it contains no secrets, so umask-default permissions are acceptable.
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode != 0o000
+
+
+# ── _parse_dotenv unit tests ──────────────────────────────────────────────────
+
+
+class TestParseDotenv:
+    """Unit tests for the minimal stdlib .env file parser."""
+
+    def test_parses_simple_key_value_pairs(self, tmp_path):
+        (tmp_path / ".env").write_text("FOO=bar\nBAZ=qux\n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result == {"FOO": "bar", "BAZ": "qux"}
+
+    def test_returns_empty_dict_when_file_missing(self, tmp_path):
+        result = _parse_dotenv(tmp_path / "nonexistent.env")
+        assert result == {}
+
+    def test_skips_blank_lines(self, tmp_path):
+        (tmp_path / ".env").write_text("\nFOO=bar\n\nBAZ=qux\n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result == {"FOO": "bar", "BAZ": "qux"}
+
+    def test_skips_comment_lines(self, tmp_path):
+        (tmp_path / ".env").write_text("# comment\nFOO=bar\n# another\n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result == {"FOO": "bar"}
+
+    def test_splits_on_first_equals_only(self, tmp_path):
+        (tmp_path / ".env").write_text("KEY=val=ue=with=equals\n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result["KEY"] == "val=ue=with=equals"
+
+    def test_strips_whitespace_from_key_and_value(self, tmp_path):
+        (tmp_path / ".env").write_text("  KEY  =  value  \n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result["KEY"] == "value"
+
+    def test_returns_empty_dict_on_unreadable_file(self, tmp_path):
+        path = tmp_path / ".env"
+        path.write_text("FOO=bar\n", encoding="utf-8")
+        path.chmod(0o000)
+        try:
+            result = _parse_dotenv(path)
+            assert result == {}
+        finally:
+            path.chmod(0o644)
+
+    def test_skips_lines_without_equals(self, tmp_path):
+        (tmp_path / ".env").write_text("NOEQUALS\nFOO=bar\n", encoding="utf-8")
+        result = _parse_dotenv(tmp_path / ".env")
+        assert result == {"FOO": "bar"}
+
+
+# ── Stale shell export vs .env file — incident regression tests ───────────────
+
+
+class TestFileBeatsStaleShellExport:
+    """Regression tests for the incident: stale shell-exported MSGRAPH_*_CLIENT_SECRET
+    was picked up by os.environ.get() even after the value was removed from .env,
+    causing AADSTS700025 (secret sent to a public-client Azure app).
+
+    After the fix, ~/.hermes/.env is the sole source of truth.  os.environ is never
+    consulted for MSGRAPH_*_CLIENT_SECRET regardless of what a prior shell session
+    may have exported.
+    """
+
+    # ── DelegatedTokenProvider (tools/microsoft_graph_delegated_auth.py) ─────
+
+    def test_stale_os_environ_ignored_when_key_absent_from_env_file(self, tmp_path, monkeypatch):
+        """Exact incident scenario: secret removed from .env but still exported in shell.
+
+        The stale os.environ value must be completely ignored.  The .env file
+        (which lacks the key) is authoritative → public-client mode (secret is None).
+        """
+        key = "MSGRAPH_TESTACCT_CLIENT_SECRET"
+        monkeypatch.setenv(key, "STALE-FROM-SHELL")
+        (tmp_path / ".env").write_text("SOME_OTHER_KEY=other_value\n", encoding="utf-8")
+
+        provider = DelegatedTokenProvider(account_key="testacct", hermes_home=tmp_path)
+        secret = provider._get_client_secret_optional()
+
+        assert secret is None, (
+            "Stale os.environ export must be ignored; .env file is authoritative. "
+            "This bug class caused AADSTS700025 in production."
+        )
+
+    def test_env_file_value_used_when_present(self, tmp_path, monkeypatch):
+        """Normal confidential-client case: secret in .env file is returned correctly."""
+        key = "MSGRAPH_TESTACCT_CLIENT_SECRET"
+        monkeypatch.delenv(key, raising=False)
+        (tmp_path / ".env").write_text(f"{key}=my-correct-secret\n", encoding="utf-8")
+
+        provider = DelegatedTokenProvider(account_key="testacct", hermes_home=tmp_path)
+        secret = provider._get_client_secret_optional()
+
+        assert secret == "my-correct-secret"
+
+    def test_missing_key_in_env_file_gives_public_client_mode(self, tmp_path, monkeypatch):
+        """Key absent from .env → None → public-client mode (no secret sent in requests)."""
+        key = "MSGRAPH_TESTACCT_CLIENT_SECRET"
+        monkeypatch.delenv(key, raising=False)
+        (tmp_path / ".env").write_text("UNRELATED_KEY=other\n", encoding="utf-8")
+
+        provider = DelegatedTokenProvider(account_key="testacct", hermes_home=tmp_path)
+        secret = provider._get_client_secret_optional()
+
+        assert secret is None
+
+    @pytest.mark.anyio
+    async def test_stale_env_not_sent_in_refresh_post_body(self, tmp_path, monkeypatch):
+        """End-to-end: stale os.environ value must not appear in the refresh token POST body."""
+        key = "MSGRAPH_TESTACCT_CLIENT_SECRET"
+        monkeypatch.setenv(key, "STALE-FROM-SHELL")
+        # .env file has no secret → public-client mode
+        (tmp_path / ".env").write_text("UNRELATED=x\n", encoding="utf-8")
+
+        expired = DelegatedTokenFile(
+            account_key="testacct",
+            tenant_id="tenant-t",
+            client_id="client-c",
+            access_token="old-token",
+            refresh_token="refresh-xyz",
+            expires_at=0.0,
+            scopes=["offline_access"],
+        )
+        expired.save(tmp_path / "msgraph_token_testacct.json")
+
+        captured_bodies: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_bodies.append(request.content.decode("utf-8"))
+            return httpx.Response(200, json={
+                "access_token": "new-tok",
+                "refresh_token": "new-ref",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            })
+
+        provider = DelegatedTokenProvider(
+            account_key="testacct",
+            hermes_home=tmp_path,
+            transport=httpx.MockTransport(handler),
+        )
+        await provider.get_access_token()
+
+        assert captured_bodies, "No HTTP request was made"
+        body = urllib.parse.parse_qs(captured_bodies[0])
+        assert "client_secret" not in body, (
+            "Stale os.environ secret must not appear in POST body — "
+            "this is the AADSTS700025 incident class."
+        )

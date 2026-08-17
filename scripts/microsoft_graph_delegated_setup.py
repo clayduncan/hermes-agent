@@ -15,7 +15,9 @@ Commands:
 Agent workflow (new loopback flow):
   1. Run --check --account KEY.  Exit 0 = auth good, skip setup.
   2. Run --configure --account KEY --tenant-id TENANT_ID --client-id CLIENT_ID.
-     The client secret must already be set in env as MSGRAPH_<KEY>_CLIENT_SECRET.
+     Set MSGRAPH_<KEY>_CLIENT_SECRET in ~/.hermes/.env for confidential-client mode,
+     or leave it absent for public-client mode (PKCE only).  Sourcing/exporting the
+     .env file is NOT required — the script reads it directly from disk.
   3. Run --auth-url --account KEY.  This is now a SINGLE BLOCKING OPERATION:
      a. A local HTTP listener starts on port 8765 (loopback only).
      b. The authorization URL is printed — relay it to the user.
@@ -32,22 +34,26 @@ Fallback (manual paste, for when port 8765 is unavailable):
   3b. Use --auth-code "CODE_OR_URL" --account KEY to paste the code manually after
       completing a separate --auth-url invocation that saved a pending session.
 
-Env var naming:
+~/.hermes/.env keys per account (uppercase account_key in prefix):
   MSGRAPH_<KEY>_TENANT_ID     — Azure Directory (tenant) ID
   MSGRAPH_<KEY>_CLIENT_ID     — Azure Application (client) ID
   MSGRAPH_<KEY>_CLIENT_SECRET — Client secret (OPTIONAL — only for confidential clients)
 
+  These are read directly from ~/.hermes/.env on each invocation.  Sourcing or
+  exporting the file into the shell environment is not required and has no effect.
+
 Public-client vs confidential-client mode:
-  If MSGRAPH_<KEY>_CLIENT_SECRET is NOT set, the account runs in public-client mode:
-    no client_secret is sent in token-exchange or refresh requests; the PKCE
-    code_verifier (or refresh_token) is the sole proof of possession.  This is
+  If MSGRAPH_<KEY>_CLIENT_SECRET is absent from ~/.hermes/.env, the account runs in
+    public-client mode: no client_secret is sent in token-exchange or refresh requests;
+    the PKCE code_verifier (or refresh_token) is the sole proof of possession.  This is
     required for apps whose Azure registration has a "Mobile and desktop applications"
     platform entry (loopback or nativeclient redirect URI) — Azure enforces public-client
     semantics for those redirect URIs and returns AADSTS700025 if a secret is sent.
 
-  If MSGRAPH_<KEY>_CLIENT_SECRET IS set, the account runs in confidential-client mode:
-    the secret is included in every /token POST.  Use this only if the Azure app
-    registration uses a "Web" platform redirect URI (not loopback / nativeclient).
+  If MSGRAPH_<KEY>_CLIENT_SECRET IS present in ~/.hermes/.env, the account runs in
+    confidential-client mode: the secret is included in every /token POST.  Use this
+    only if the Azure app registration uses a "Web" platform redirect URI (not loopback
+    / nativeclient).
 
 Example for the 'clayduncan' account (public client — no secret needed):
   MSGRAPH_CLAYDUNCAN_TENANT_ID=d14d6257-4cf6-45a2-83fd-5d218bda8aee
@@ -84,6 +90,7 @@ from tools.microsoft_graph_delegated_auth import (
     DelegatedTokenFile,
     DelegatedTokenProvider,
     _get_hermes_home,
+    _parse_dotenv,
 )
 
 # Default delegated scopes for new accounts.  offline_access is required to get
@@ -229,9 +236,16 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
 
 
 def _get_client_secret(account_key: str) -> str | None:
-    """Return the client secret from env, or None (public-client mode, no secret)."""
+    """Return the client secret from ~/.hermes/.env, or None (public-client mode).
+
+    Reads MSGRAPH_<KEY>_CLIENT_SECRET directly from the .env file on disk.  The
+    inherited shell environment (os.environ) is never consulted — only the current
+    on-disk file contents are authoritative.  This eliminates the class of bugs where
+    a stale shell-exported value from a prior session overrides a corrected .env file.
+    """
     key = f"MSGRAPH_{account_key.upper()}_CLIENT_SECRET"
-    return (os.environ.get(key) or "").strip() or None
+    dotenv = _parse_dotenv(_get_hermes_home() / ".env")
+    return dotenv.get(key, "").strip() or None
 
 
 # ── Loopback HTTP listener ────────────────────────────────────────────────────

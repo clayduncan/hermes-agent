@@ -21,10 +21,14 @@ Auth flow (--auth-url):
   Azure app's "Mobile and desktop applications" platform alongside the nativeclient URI.
 
 Token file location: ~/.hermes/msgraph_token_<account_key>.json
-Env vars per account (uppercase account_key in prefix):
+Config per account (uppercase account_key in prefix) in ~/.hermes/.env:
   MSGRAPH_<KEY>_TENANT_ID
   MSGRAPH_<KEY>_CLIENT_ID
   MSGRAPH_<KEY>_CLIENT_SECRET   (optional; omit for public-client / PKCE-only apps)
+
+  The client secret is read directly from ~/.hermes/.env at the time it is needed —
+  never from the inherited shell environment.  Sourcing or exporting the .env file
+  before running is not required and has no effect on secret lookup.
 
 Public-client vs. confidential-client mode:
   Azure AD treats an app as a public client when the redirect_uri used in the token
@@ -32,9 +36,9 @@ Public-client vs. confidential-client mode:
   http://localhost:<port>/callback loopback URI and the legacy nativeclient URI).
   Public clients authenticate via PKCE only — sending client_secret triggers AADSTS700025.
 
-  When MSGRAPH_<KEY>_CLIENT_SECRET is set: confidential-client mode (secret included in
-  every token and refresh request).  When it is unset: public-client mode (no secret
-  sent; code_verifier / refresh_token are the sole proof of possession).
+  When MSGRAPH_<KEY>_CLIENT_SECRET is set in ~/.hermes/.env: confidential-client mode
+  (secret included in every token and refresh request).  When it is absent: public-client
+  mode (no secret sent; code_verifier / refresh_token are the sole proof of possession).
 """
 
 from __future__ import annotations
@@ -96,11 +100,40 @@ def _get_hermes_home() -> Path:
         return Path(val) if val else Path.home() / ".hermes"
 
 
+def _parse_dotenv(path: Path) -> dict[str, str]:
+    """Parse a .env file at *path* into a plain dict without touching os.environ.
+
+    Minimal KEY=VALUE parser: blank lines and lines starting with '#' are skipped;
+    values are split on the FIRST '=' only; surrounding whitespace is stripped.
+    No shell-quoting semantics — Hermes .env files are simple KEY=VALUE, not shell
+    scripts.  Returns an empty dict if the file does not exist or cannot be read.
+
+    The file is read fresh from disk on every call.  Pass the .env path explicitly
+    so callers remain testable without patching module globals.
+    """
+    result: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return result
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key:
+            result[key] = value.strip()
+    return result
+
+
 @dataclass
 class DelegatedTokenFile:
     """Parsed contents of a per-account delegated token file.
 
-    The client_secret is NOT stored here — it lives only in the env.
+    The client_secret is NOT stored here — it is read fresh from ~/.hermes/.env on each use.
     """
 
     account_key: str
@@ -185,8 +218,13 @@ class DelegatedTokenProvider:
     the token_provider argument to MicrosoftGraphClient.
 
     Token files are stored at ~/.hermes/msgraph_token_<account_key>.json.
-    The client_secret is never written to disk; it is always read from the env
-    at the time a refresh is needed.
+    The client_secret is never written to disk; it is read fresh from
+    ~/.hermes/.env at the time a refresh is needed.  The inherited shell
+    environment (os.environ) is never consulted for the client secret — only
+    the on-disk .env file is authoritative.
+
+    The ``environ`` parameter is provided for test injection only.  When omitted
+    (the default), the secret is always read from ``hermes_home / ".env"``.
     """
 
     def __init__(
@@ -200,9 +238,9 @@ class DelegatedTokenProvider:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.account_key = account_key
-        self._environ: dict[str, str] | os._Environ = (  # type: ignore[type-arg]
-            environ if environ is not None else os.environ
-        )
+        # None means "read from ~/.hermes/.env on every secret lookup".
+        # An explicit dict (tests only) bypasses the file entirely.
+        self._environ: dict[str, str] | None = environ
         self.timeout = timeout
         self.skew_seconds = max(0, int(skew_seconds))
         self._transport = transport
@@ -215,8 +253,16 @@ class DelegatedTokenProvider:
         return self._hermes_home / f"msgraph_token_{self.account_key}.json"
 
     def _get_client_secret_optional(self) -> str | None:
-        """Return the client secret from env, or None for public-client mode (no secret)."""
+        """Return the client secret from ~/.hermes/.env, or None for public-client mode.
+
+        When self._environ is None (the default), reads MSGRAPH_<KEY>_CLIENT_SECRET
+        directly from hermes_home/.env on disk — never from os.environ.  When
+        self._environ is an explicit dict (test injection), uses that dict instead.
+        """
         key = f"MSGRAPH_{self.account_key.upper()}_CLIENT_SECRET"
+        if self._environ is None:
+            dotenv = _parse_dotenv(self._hermes_home / ".env")
+            return dotenv.get(key, "").strip() or None
         return (self._environ.get(key) or "").strip() or None
 
     def clear_cache(self) -> None:
