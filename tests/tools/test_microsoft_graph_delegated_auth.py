@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import stat
 import time
 import urllib.parse
 import urllib.request
@@ -655,3 +657,53 @@ class TestDoTokenExchange:
         saved = json.loads(token_path.read_text(encoding="utf-8"))
         assert saved["access_token"] == "tok-123"
         assert "client_secret" not in saved
+
+
+# ── File permission tests (0o600, umask-independent) ─────────────────────────
+
+
+class TestFilePermissions:
+    """Credential files must be 0o600 regardless of the process umask."""
+
+    def test_token_file_is_0o600_despite_permissive_umask(self, tmp_path):
+        old_umask = os.umask(0o022)
+        try:
+            token = _make_token_file()
+            path = tmp_path / "msgraph_token_permtest.json"
+            token.save(path)
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600, f"Expected 0o600, got 0o{mode:03o}"
+        finally:
+            os.umask(old_umask)
+
+    def test_pending_session_is_0o600_despite_permissive_umask(self, tmp_path, setup_script, monkeypatch):
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        old_umask = os.umask(0o022)
+        try:
+            setup_script._save_pending_session(
+                "permtest",
+                state="st",
+                code_verifier="cv",
+                redirect_uri="http://localhost:8765/callback",
+                tenant_id="tenant-t",
+                client_id="client-c",
+                scopes=["offline_access"],
+            )
+            path = tmp_path / "msgraph_pending_permtest.json"
+            assert path.exists()
+            mode = stat.S_IMODE(path.stat().st_mode)
+            assert mode == 0o600, f"Expected 0o600, got 0o{mode:03o}"
+        finally:
+            os.umask(old_umask)
+
+    def test_config_file_is_not_restricted(self, tmp_path, setup_script, monkeypatch):
+        """msgraph_config_*.json has no secrets; we intentionally leave it world-readable."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_PERMTEST_CLIENT_SECRET", raising=False)
+        setup_script.configure("permtest", tenant_id="t", client_id="c")
+        path = tmp_path / "msgraph_config_permtest.json"
+        assert path.exists()
+        # Config must be readable (not 0o000), but we make no stronger assertion —
+        # it contains no secrets, so umask-default permissions are acceptable.
+        mode = stat.S_IMODE(path.stat().st_mode)
+        assert mode != 0o000

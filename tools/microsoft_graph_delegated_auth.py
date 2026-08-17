@@ -134,10 +134,12 @@ class DelegatedTokenFile:
         tmp = path.with_suffix(path.suffix + ".tmp")
         try:
             tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+            os.chmod(tmp, 0o600)
             os.replace(tmp, path)
         except Exception:
             tmp.unlink(missing_ok=True)
             raise
+        os.chmod(path, 0o600)
 
     @classmethod
     def load(cls, path: Path) -> "DelegatedTokenFile":

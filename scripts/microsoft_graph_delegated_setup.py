@@ -183,6 +183,7 @@ def _save_pending_session(
         ),
         encoding="utf-8",
     )
+    os.chmod(path, 0o600)
 
 
 def _load_pending_session(account_key: str) -> dict:
