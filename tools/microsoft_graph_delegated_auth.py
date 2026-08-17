@@ -24,7 +24,17 @@ Token file location: ~/.hermes/msgraph_token_<account_key>.json
 Env vars per account (uppercase account_key in prefix):
   MSGRAPH_<KEY>_TENANT_ID
   MSGRAPH_<KEY>_CLIENT_ID
-  MSGRAPH_<KEY>_CLIENT_SECRET   (never written to disk)
+  MSGRAPH_<KEY>_CLIENT_SECRET   (optional; omit for public-client / PKCE-only apps)
+
+Public-client vs. confidential-client mode:
+  Azure AD treats an app as a public client when the redirect_uri used in the token
+  exchange matches a "Mobile and desktop applications" platform entry (including the
+  http://localhost:<port>/callback loopback URI and the legacy nativeclient URI).
+  Public clients authenticate via PKCE only — sending client_secret triggers AADSTS700025.
+
+  When MSGRAPH_<KEY>_CLIENT_SECRET is set: confidential-client mode (secret included in
+  every token and refresh request).  When it is unset: public-client mode (no secret
+  sent; code_verifier / refresh_token are the sole proof of possession).
 """
 
 from __future__ import annotations
@@ -202,15 +212,10 @@ class DelegatedTokenProvider:
     def token_path(self) -> Path:
         return self._hermes_home / f"msgraph_token_{self.account_key}.json"
 
-    def _get_client_secret(self) -> str:
+    def _get_client_secret_optional(self) -> str | None:
+        """Return the client secret from env, or None for public-client mode (no secret)."""
         key = f"MSGRAPH_{self.account_key.upper()}_CLIENT_SECRET"
-        secret = (self._environ.get(key) or "").strip()
-        if not secret:
-            raise MicrosoftGraphConfigError(
-                f"Missing {key} environment variable for account '{self.account_key}'. "
-                "Set it in ~/.hermes/.env."
-            )
-        return secret
+        return (self._environ.get(key) or "").strip() or None
 
     def clear_cache(self) -> None:
         self._cached_token = None
@@ -261,18 +266,19 @@ class DelegatedTokenProvider:
             return token_file.access_token
 
     async def _refresh_access_token(self, token_file: DelegatedTokenFile) -> DelegatedTokenFile:
-        client_secret = self._get_client_secret()
+        client_secret = self._get_client_secret_optional()
         token_url = (
             f"{DEFAULT_GRAPH_AUTHORITY_URL}/{token_file.tenant_id}/oauth2/v2.0/token"
         )
         scope_str = " ".join(token_file.scopes) if token_file.scopes else _OFFLINE_ACCESS
-        data = {
+        data: dict[str, str] = {
             "grant_type": "refresh_token",
             "client_id": token_file.client_id,
-            "client_secret": client_secret,
             "refresh_token": token_file.refresh_token,
             "scope": scope_str,
         }
+        if client_secret:
+            data["client_secret"] = client_secret
 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(self.timeout),

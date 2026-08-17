@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -47,13 +50,18 @@ def _make_provider(
     account_key: str,
     tmp_path: Path,
     *,
-    secret: str = "test-secret",
+    secret: str | None = "test-secret",
     **kwargs,
 ) -> DelegatedTokenProvider:
+    environ = (
+        {f"MSGRAPH_{account_key.upper()}_CLIENT_SECRET": secret}
+        if secret is not None
+        else {}
+    )
     return DelegatedTokenProvider(
         account_key=account_key,
         hermes_home=tmp_path,
-        environ={f"MSGRAPH_{account_key.upper()}_CLIENT_SECRET": secret},
+        environ=environ,
         **kwargs,
     )
 
@@ -248,20 +256,68 @@ class TestDelegatedTokenProviderGetAccessToken:
         with pytest.raises(MicrosoftGraphTokenError):
             await provider.get_access_token()
 
-    async def test_missing_client_secret_env_raises_config_error(self, tmp_path):
-        from tools.microsoft_graph_auth import MicrosoftGraphConfigError
-
-        expired = _make_token_file(account_key="acct", expires_in=-1)
+    async def test_public_client_refresh_without_secret_succeeds(self, tmp_path):
+        """Public-client mode: no MSGRAPH_*_CLIENT_SECRET → refresh succeeds without it."""
+        expired = _make_token_file(account_key="acct", expires_in=-100)
         expired.save(tmp_path / "msgraph_token_acct.json")
 
-        # No client secret in environ
-        provider = DelegatedTokenProvider(
-            account_key="acct",
-            hermes_home=tmp_path,
-            environ={},  # empty — no secret
-        )
-        with pytest.raises(MicrosoftGraphConfigError, match="MSGRAPH_ACCT_CLIENT_SECRET"):
-            await provider.get_access_token()
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={
+                    "access_token": "public-client-token",
+                    "refresh_token": "new-refresh",
+                    "expires_in": 3600,
+                    "token_type": "Bearer",
+                },
+            )
+
+        # secret=None → public-client mode: no client_secret env var at all
+        provider = _make_provider("acct", tmp_path, secret=None, transport=httpx.MockTransport(handler))
+        result = await provider.get_access_token()
+        assert result == "public-client-token"
+
+    async def test_refresh_post_body_excludes_client_secret_in_public_mode(self, tmp_path):
+        """Public-client refresh POST must NOT include client_secret (not even empty)."""
+        expired = _make_token_file(account_key="acct", expires_in=-100)
+        expired.save(tmp_path / "msgraph_token_acct.json")
+
+        captured_bodies: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_bodies.append(request.content.decode("utf-8"))
+            return httpx.Response(200, json={
+                "access_token": "tok", "refresh_token": "ref",
+                "expires_in": 3600, "token_type": "Bearer",
+            })
+
+        provider = _make_provider("acct", tmp_path, secret=None, transport=httpx.MockTransport(handler))
+        await provider.get_access_token()
+
+        assert captured_bodies, "No HTTP request was made"
+        body = urllib.parse.parse_qs(captured_bodies[0])
+        assert "client_secret" not in body, "client_secret key must be absent, not just empty"
+
+    async def test_refresh_post_body_includes_client_secret_in_confidential_mode(self, tmp_path):
+        """Confidential-client refresh POST MUST include the client_secret."""
+        expired = _make_token_file(account_key="acct", expires_in=-100)
+        expired.save(tmp_path / "msgraph_token_acct.json")
+
+        captured_bodies: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured_bodies.append(request.content.decode("utf-8"))
+            return httpx.Response(200, json={
+                "access_token": "tok", "refresh_token": "ref",
+                "expires_in": 3600, "token_type": "Bearer",
+            })
+
+        provider = _make_provider("acct", tmp_path, secret="my-secret", transport=httpx.MockTransport(handler))
+        await provider.get_access_token()
+
+        assert captured_bodies, "No HTTP request was made"
+        body = urllib.parse.parse_qs(captured_bodies[0])
+        assert body.get("client_secret") == ["my-secret"]
 
 
 # ── Multi-account isolation ───────────────────────────────────────────────────
@@ -486,3 +542,116 @@ class TestSetupScriptCLI:
         assert verifier != challenge
         assert len(verifier) > 20
         assert len(challenge) > 20
+
+    def test_configure_succeeds_without_client_secret(self, tmp_path, setup_script, monkeypatch):
+        """Public-client: configure works even when no MSGRAPH_*_CLIENT_SECRET is set."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_TEST_CLIENT_SECRET", raising=False)
+        setup_script.configure(
+            "test",
+            tenant_id="tenant-aaa",
+            client_id="client-bbb",
+            scopes=["Calendars.ReadWrite", "offline_access"],
+        )
+        data = json.loads((tmp_path / "msgraph_config_test.json").read_text(encoding="utf-8"))
+        assert data["tenant_id"] == "tenant-aaa"
+
+    def test_configure_reports_public_mode_without_secret(self, tmp_path, setup_script, monkeypatch, capsys):
+        """configure() prints 'public-client' when no secret env var is set."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_TEST_CLIENT_SECRET", raising=False)
+        setup_script.configure("test", tenant_id="t", client_id="c")
+        out = capsys.readouterr().out
+        assert "public-client" in out
+
+    def test_configure_reports_confidential_mode_with_secret(self, tmp_path, setup_script, monkeypatch, capsys):
+        """configure() prints 'confidential-client' when secret env var IS set."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "super-secret")
+        setup_script.configure("test", tenant_id="t", client_id="c")
+        out = capsys.readouterr().out
+        assert "confidential-client" in out
+
+
+# ── _do_token_exchange POST body (public vs confidential client) ───────────────
+
+
+def _fake_urlopen_success(captured_requests: list):
+    """Return a urllib.request.urlopen stub that records the Request and returns a token payload."""
+    payload = json.dumps({
+        "access_token": "tok-123",
+        "refresh_token": "ref-456",
+        "expires_in": 3600,
+        "scope": "Calendars.ReadWrite offline_access",
+        "token_type": "Bearer",
+    }).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):
+        captured_requests.append(req)
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = payload
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    return fake_urlopen
+
+
+class TestDoTokenExchange:
+    """Verify the exact POST body sent by _do_token_exchange for public vs confidential clients."""
+
+    def _make_pending(self) -> dict:
+        return {
+            "state": "STATE",
+            "code_verifier": "VERIFIER",
+            "redirect_uri": "http://localhost:8765/callback",
+            "tenant_id": "tenant-aaa",
+            "client_id": "client-bbb",
+            "scopes": ["Calendars.ReadWrite", "offline_access"],
+        }
+
+    def test_public_client_post_body_omits_client_secret(self, tmp_path, setup_script, monkeypatch):
+        """When MSGRAPH_*_CLIENT_SECRET is unset, client_secret must NOT appear in the POST body."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_TEST_CLIENT_SECRET", raising=False)
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_success(captured))
+
+        setup_script._do_token_exchange("test", "AUTH-CODE-XYZ", self._make_pending())
+
+        assert captured, "urlopen was not called"
+        body = urllib.parse.parse_qs(captured[0].data.decode("utf-8"))
+        assert "client_secret" not in body, "client_secret must be absent for public clients"
+        assert body["code_verifier"] == ["VERIFIER"]
+        assert body["code"] == ["AUTH-CODE-XYZ"]
+
+    def test_confidential_client_post_body_includes_client_secret(self, tmp_path, setup_script, monkeypatch):
+        """When MSGRAPH_*_CLIENT_SECRET is set, client_secret MUST appear in the POST body."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "super-secret-value")
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_success(captured))
+
+        setup_script._do_token_exchange("test", "AUTH-CODE-XYZ", self._make_pending())
+
+        assert captured, "urlopen was not called"
+        body = urllib.parse.parse_qs(captured[0].data.decode("utf-8"))
+        assert body.get("client_secret") == ["super-secret-value"]
+
+    def test_public_client_exchange_saves_token_file(self, tmp_path, setup_script, monkeypatch):
+        """Token exchange in public-client mode still saves the token file on success."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_TEST_CLIENT_SECRET", raising=False)
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen_success(captured))
+
+        setup_script._do_token_exchange("test", "CODE", self._make_pending())
+
+        token_path = tmp_path / "msgraph_token_test.json"
+        assert token_path.exists(), "Token file not written after public-client exchange"
+        saved = json.loads(token_path.read_text(encoding="utf-8"))
+        assert saved["access_token"] == "tok-123"
+        assert "client_secret" not in saved

@@ -35,12 +35,24 @@ Fallback (manual paste, for when port 8765 is unavailable):
 Env var naming:
   MSGRAPH_<KEY>_TENANT_ID     — Azure Directory (tenant) ID
   MSGRAPH_<KEY>_CLIENT_ID     — Azure Application (client) ID
-  MSGRAPH_<KEY>_CLIENT_SECRET — Client secret (never stored on disk)
+  MSGRAPH_<KEY>_CLIENT_SECRET — Client secret (OPTIONAL — only for confidential clients)
 
-Example for the 'clayduncan' account:
+Public-client vs confidential-client mode:
+  If MSGRAPH_<KEY>_CLIENT_SECRET is NOT set, the account runs in public-client mode:
+    no client_secret is sent in token-exchange or refresh requests; the PKCE
+    code_verifier (or refresh_token) is the sole proof of possession.  This is
+    required for apps whose Azure registration has a "Mobile and desktop applications"
+    platform entry (loopback or nativeclient redirect URI) — Azure enforces public-client
+    semantics for those redirect URIs and returns AADSTS700025 if a secret is sent.
+
+  If MSGRAPH_<KEY>_CLIENT_SECRET IS set, the account runs in confidential-client mode:
+    the secret is included in every /token POST.  Use this only if the Azure app
+    registration uses a "Web" platform redirect URI (not loopback / nativeclient).
+
+Example for the 'clayduncan' account (public client — no secret needed):
   MSGRAPH_CLAYDUNCAN_TENANT_ID=d14d6257-4cf6-45a2-83fd-5d218bda8aee
   MSGRAPH_CLAYDUNCAN_CLIENT_ID=1bb196a6-47c2-40d0-be2a-f38ddb007820
-  MSGRAPH_CLAYDUNCAN_CLIENT_SECRET=<secret>
+  # MSGRAPH_CLAYDUNCAN_CLIENT_SECRET — leave unset; app is registered as public client
 """
 
 from __future__ import annotations
@@ -215,14 +227,10 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
 # ── Client secret resolution ──────────────────────────────────────────────────
 
 
-def _get_client_secret(account_key: str) -> str:
+def _get_client_secret(account_key: str) -> str | None:
+    """Return the client secret from env, or None (public-client mode, no secret)."""
     key = f"MSGRAPH_{account_key.upper()}_CLIENT_SECRET"
-    secret = (os.environ.get(key) or "").strip()
-    if not secret:
-        print(f"ERROR: {key} is not set in the environment.")
-        print(f"Add it to ~/.hermes/.env and restart the gateway.")
-        sys.exit(1)
-    return secret
+    return (os.environ.get(key) or "").strip() or None
 
 
 # ── Loopback HTTP listener ────────────────────────────────────────────────────
@@ -282,23 +290,23 @@ def _do_token_exchange(account_key: str, code: str, pending: dict) -> None:
     """
     import time as _time
 
-    client_secret = _get_client_secret(account_key)
+    client_secret = _get_client_secret(account_key)  # str | None; None = public-client mode
     tenant_id: str = pending["tenant_id"]
     client_id: str = pending["client_id"]
     scopes: list[str] = pending.get("scopes") or DEFAULT_SCOPES
 
     token_url = f"{DEFAULT_GRAPH_AUTHORITY_URL}/{tenant_id}/oauth2/v2.0/token"
-    post_data = urllib.parse.urlencode(
-        {
-            "grant_type": "authorization_code",
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-            "redirect_uri": pending["redirect_uri"],
-            "code_verifier": pending["code_verifier"],
-            "scope": " ".join(scopes),
-        }
-    ).encode("utf-8")
+    post_body: dict[str, str] = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "redirect_uri": pending["redirect_uri"],
+        "code_verifier": pending["code_verifier"],
+        "scope": " ".join(scopes),
+    }
+    if client_secret:
+        post_body["client_secret"] = client_secret
+    post_data = urllib.parse.urlencode(post_body).encode("utf-8")
 
     try:
         req = urllib.request.Request(
@@ -385,13 +393,6 @@ def check_auth(account_key: str) -> bool:
         return True
 
     if token_file.refresh_token:
-        env_key = f"MSGRAPH_{account_key.upper()}_CLIENT_SECRET"
-        if not (os.environ.get(env_key) or "").strip():
-            print(
-                f"TOKEN_EXPIRED: Token for account '{account_key}' is expired and "
-                f"{env_key} is not set — cannot auto-refresh."
-            )
-            return False
         print(f"TOKEN_EXPIRED: Token for account '{account_key}' is expired — "
               "has refresh_token, will auto-refresh on next use.")
         return True
@@ -408,9 +409,12 @@ def configure(
     scopes: list[str] | None = None,
 ) -> None:
     """Store tenant_id, client_id, and scopes for an account (no secret stored)."""
-    # Validate that the client secret env var exists right now, so the user
-    # gets a clear error here rather than mysteriously later.
-    _get_client_secret(account_key)
+    client_secret = _get_client_secret(account_key)
+    auth_mode = (
+        "public-client (PKCE only — MSGRAPH_{}_CLIENT_SECRET not set)".format(account_key.upper())
+        if client_secret is None
+        else "confidential-client (client secret present in env)"
+    )
 
     resolved_scopes = scopes or DEFAULT_SCOPES
     if "offline_access" not in resolved_scopes:
@@ -427,6 +431,7 @@ def configure(
     print(f"  Tenant ID : {tenant_id.strip()}")
     print(f"  Client ID : {client_id.strip()}")
     print(f"  Scopes    : {', '.join(resolved_scopes)}")
+    print(f"  Auth mode : {auth_mode}")
     print(f"\nNext step: run --auth-url --account {account_key}")
 
 

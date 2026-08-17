@@ -19,8 +19,10 @@ import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -139,7 +141,6 @@ class TestLoopbackTimeout:
     def test_timeout_exits_1_without_hanging(self, tmp_path, setup_script, monkeypatch):
         """--auth-url with a very short timeout exits 1 without hanging the test suite."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy")
         _write_config(tmp_path)
 
         with pytest.raises(SystemExit) as exc_info:
@@ -149,7 +150,6 @@ class TestLoopbackTimeout:
     def test_timeout_keeps_pending_session_for_auth_code_fallback(self, tmp_path, setup_script, monkeypatch):
         """On timeout the pending session file is kept so --auth-code can still be used."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy")
         _write_config(tmp_path)
 
         with pytest.raises(SystemExit):
@@ -160,7 +160,6 @@ class TestLoopbackTimeout:
     def test_no_orphaned_listener_after_timeout(self, tmp_path, setup_script, monkeypatch):
         """After a timeout the loopback port is released (not still listening)."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy")
         _write_config(tmp_path)
 
         bound_port: list[int] = []
@@ -193,7 +192,6 @@ class TestStateMismatch:
     def test_wrong_state_in_callback_exits_1(self, tmp_path, setup_script, monkeypatch):
         """A callback with a mismatched state is rejected; process exits 1."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy")
         _write_config(tmp_path)
 
         result: list[int | None] = [None]
@@ -240,7 +238,6 @@ class TestStateMismatch:
     def test_missing_pending_session_after_state_mismatch(self, tmp_path, setup_script, monkeypatch):
         """Pending session is deleted after a state mismatch (security: must not reuse)."""
         monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
-        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "dummy")
         _write_config(tmp_path)
 
         result: list[int | None] = [None]
@@ -379,3 +376,90 @@ class TestManualAuthCodeFallback:
             setup_script.exchange_auth_code("test", url)
         assert exc_info.value.code == 1
         assert not calls, "_do_token_exchange must not be called on state mismatch"
+
+
+# ── _do_token_exchange: public vs confidential client POST body ───────────────
+
+
+def _make_success_urlopen(captured: list):
+    """urllib.request.urlopen stub — records the Request and returns a valid token payload."""
+    payload = json.dumps({
+        "access_token": "tok-abc",
+        "refresh_token": "ref-xyz",
+        "expires_in": 3600,
+        "scope": "Calendars.ReadWrite offline_access",
+        "token_type": "Bearer",
+    }).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = payload
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    return fake_urlopen
+
+
+def _make_pending_session(redirect_uri="http://localhost:8765/callback"):
+    return {
+        "state": "STATE",
+        "code_verifier": "VERIFIER123",
+        "redirect_uri": redirect_uri,
+        "tenant_id": "tenant-aaa",
+        "client_id": "client-bbb",
+        "scopes": ["Calendars.ReadWrite", "offline_access"],
+    }
+
+
+class TestTokenExchangeClientSecretHandling:
+    """Verify that _do_token_exchange omits/includes client_secret per public/confidential mode."""
+
+    def test_public_client_post_body_has_no_client_secret_key(self, tmp_path, setup_script, monkeypatch):
+        """AADSTS700025 fix: public-client exchange must NOT send client_secret at all."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_CLAYDUNCAN_CLIENT_SECRET", raising=False)
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _make_success_urlopen(captured))
+
+        setup_script._do_token_exchange("clayduncan", "AUTH-CODE", _make_pending_session())
+
+        assert captured, "urlopen was not called"
+        body = urllib.parse.parse_qs(captured[0].data.decode("utf-8"))
+        assert "client_secret" not in body, (
+            "Public client must not include client_secret — Azure returns AADSTS700025 if present"
+        )
+        assert body["code_verifier"] == ["VERIFIER123"]
+        assert body["grant_type"] == ["authorization_code"]
+
+    def test_confidential_client_post_body_includes_secret(self, tmp_path, setup_script, monkeypatch):
+        """Confidential-client exchange includes client_secret in the POST body."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("MSGRAPH_TEST_CLIENT_SECRET", "confidential-secret-value")
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _make_success_urlopen(captured))
+
+        setup_script._do_token_exchange("test", "AUTH-CODE", _make_pending_session())
+
+        assert captured, "urlopen was not called"
+        body = urllib.parse.parse_qs(captured[0].data.decode("utf-8"))
+        assert body.get("client_secret") == ["confidential-secret-value"]
+
+    def test_public_client_exchange_still_writes_token_file(self, tmp_path, setup_script, monkeypatch):
+        """Token exchange without client_secret still writes a valid token file."""
+        monkeypatch.setattr(setup_script, "_get_hermes_home", lambda: tmp_path)
+        monkeypatch.delenv("MSGRAPH_CLAYDUNCAN_CLIENT_SECRET", raising=False)
+
+        captured: list = []
+        monkeypatch.setattr(urllib.request, "urlopen", _make_success_urlopen(captured))
+
+        setup_script._do_token_exchange("clayduncan", "CODE", _make_pending_session())
+
+        token_path = tmp_path / "msgraph_token_clayduncan.json"
+        assert token_path.exists()
+        saved = json.loads(token_path.read_text(encoding="utf-8"))
+        assert saved["access_token"] == "tok-abc"
+        assert "client_secret" not in saved
