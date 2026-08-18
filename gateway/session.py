@@ -1017,14 +1017,14 @@ def build_channel_continuity_note(
     context via ``session_search`` before acting.
 
     Returns ``None`` (and the caller adds nothing) unless **all** hold:
-      - the source platform is Slack or Discord,
+      - the source platform is Slack, Discord, or Buzz,
       - this session was created by an auto-reset that had real activity,
       - the previous session_id was recorded on the entry.
 
     No LLM calls, no extra API/DB lookups — the previous session id is
     already known from :meth:`SessionStore.get_or_create_session`.
     """
-    if source.platform not in (Platform.SLACK, Platform.DISCORD):
+    if source.platform not in (Platform.SLACK, Platform.DISCORD, Platform("buzz")):
         return None
     if not getattr(entry, "reset_had_activity", False):
         return None
