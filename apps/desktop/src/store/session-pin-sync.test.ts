@@ -7,10 +7,14 @@ const patch = vi.fn<(id: string, pinned: boolean, profile?: null | string) => Pr
 )
 
 vi.mock('@/hermes', () => ({
+  // The layout store reaches the profile store, which sets the request profile
+  // at import time; this suite only cares about the pin call.
+  setApiRequestProfile: () => {},
   setSessionPinnedRemote: (id: string, pinned: boolean, profile?: null | string) => patch(id, pinned, profile)
 }))
 
 import { $pinnedSessionIds } from '@/store/layout'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $sessions } from '@/store/session'
 
 import { resetSessionPinMirror, watchSessionPins } from './session-pin-sync'
@@ -286,5 +290,34 @@ describe('watchSessionPins remote pull', () => {
 
     expect($pinnedSessionIds.get()).toContain('failed')
     expect(patch).toHaveBeenCalledWith('failed', true, undefined)
+  })
+
+  it('does not oscillate when two profiles share a session id with conflicting pins', async () => {
+    // The cross-profile list can hold the same durable id twice with opposite
+    // `pinned` flags (copied/imported profile DBs). A profile-blind pull would
+    // pin then unpin the id in one pass and re-fire reconcile forever,
+    // overflowing nanostores' listenerQueue (RangeError: Invalid array length).
+    $sessions.set([
+      row('shared', { profile: 'default', pinned: true }),
+      row('shared', { profile: 'hcoder', pinned: false })
+    ])
+    await flush()
+
+    // Deterministic: exactly one row wins, so the local set settles and no
+    // runaway re-entrant reconcile occurs.
+    expect($pinnedSessionIds.get()).toEqual(['shared'])
+  })
+
+  it('prefers the active gateway profile when duplicate ids disagree', async () => {
+    $activeGatewayProfile.set('hcoder')
+    $sessions.set([
+      row('shared', { profile: 'default', pinned: true }),
+      row('shared', { profile: 'hcoder', pinned: false })
+    ])
+    await flush()
+
+    // The active profile's row is authoritative, so the pin is dropped.
+    expect($pinnedSessionIds.get()).toEqual([])
+    $activeGatewayProfile.set('default')
   })
 })

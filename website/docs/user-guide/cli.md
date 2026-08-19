@@ -25,6 +25,11 @@ hermes
 # Single query mode (non-interactive)
 hermes chat -q "Hello"
 
+# Single query from a file or stdin — nothing is shell-interpreted, so
+# arbitrary text (quotes, $(...), backticks) arrives verbatim
+hermes chat --query-file prompt.txt
+hermes chat --query-file - < prompt.txt
+
 # With a specific model
 hermes chat --model "anthropic/claude-sonnet-4"
 
@@ -96,6 +101,7 @@ A persistent status bar sits above the input area, updating in real time:
 | 🗜️ N | **Context compression count** — how many times the running session has been auto-compressed. Appears once the first compression fires. |
 | ▶ N | **Active background tasks** — how many `/background` prompts are still running in the current session. Appears whenever at least one task is in flight. |
 | Duration | Elapsed session time |
+| Session title | Once the session has a title, it appears as a gold badge pinned to the far-right edge. Long titles truncate before displacing the essential model and context fields. |
 | ⚠ YOLO | **YOLO mode warning** — shown whenever `HERMES_YOLO_MODE` is on (either `hermes --yolo` at launch or `/yolo` toggled mid-session). Mirrors the banner-line warning so you can't forget you're in auto-approve mode. |
 
 The bar adapts to terminal width — full layout at ≥ 76 columns, compact at 52–75, minimal (model + duration, plus the YOLO badge when active) below 52.
@@ -269,6 +275,14 @@ There are two ways to enter multi-line messages:
   2. Returns the sum
 ```
 
+`Ctrl+J` and backslash continuation are enabled by default, matching Claude Code / Codex / OpenCode multiline shortcuts. On supported terminals such as iTerm2, Hermes also requests extended key reporting so `Shift+Enter` arrives as a distinct newline key. If your terminal sends LF for plain `Enter` and you need the legacy `Ctrl+J`-as-submit fallback, opt out:
+
+```yaml
+# ~/.hermes/config.yaml
+display:
+  cli_multiline_shortcuts: false
+```
+
 :::info
 Pasting multi-line text is supported — use any of the newline keys above, or simply paste content directly.
 :::
@@ -284,7 +298,7 @@ Most terminals send the same byte sequence for `Enter` and `Shift+Enter` by defa
 | Windows Terminal Preview 1.25+ | Supported once the Kitty protocol is enabled in settings |
 | macOS Terminal.app, stock Windows Terminal (stable) | Not supported — `Shift+Enter` is indistinguishable from `Enter` |
 
-Where the terminal cannot distinguish them, `Alt+Enter` and `Ctrl+J` continue to work everywhere. **On Windows Terminal specifically, `Alt+Enter` is captured by the terminal (toggles fullscreen) and never reaches Hermes — use `Ctrl+Enter` (delivered as `Ctrl+J`) or `Ctrl+J` directly for a newline.**
+Where the terminal cannot distinguish them, `Alt+Enter` and `Ctrl+J` continue to work by default. **On Windows Terminal specifically, `Alt+Enter` is captured by the terminal (toggles fullscreen) and never reaches Hermes — use `Ctrl+Enter` (delivered as `Ctrl+J`) or `Ctrl+J` directly for a newline.**
 
 ## Redirecting the Agent Mid-Turn
 

@@ -190,6 +190,30 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_cjk_and_emoji_round_trip_readable_in_jobs_json(self, tmp_cron_dir):
+        """CJK/emoji job text must round-trip AND stay human-readable on disk.
+
+        With json.dump's default ensure_ascii=True, every non-ASCII char in
+        jobs.json is written as \\uXXXX escapes, which users reported as
+        unreadable garbage when inspecting their job store (#52302, #29754).
+        ensure_ascii=False + the existing encoding="utf-8" writer keeps the
+        text literal; the utf-8-sig reader must parse it back identically.
+        """
+        name = "日次レポート 🎉 café"
+        job = create_job(prompt=f"Summarize {name}", schedule="30m", name=name)
+
+        # Round-trip through save/load is lossless.
+        fetched = get_job(job["id"])
+        assert fetched["name"] == name
+        assert name in fetched["prompt"]
+
+        # On-disk representation is literal UTF-8, not \uXXXX escapes.
+        from cron.jobs import JOBS_FILE
+        raw = JOBS_FILE.read_text(encoding="utf-8")
+        assert "日次レポート" in raw
+        assert "🎉" in raw
+        assert "\\u65e5" not in raw
+
     def test_create_and_get(self, tmp_cron_dir):
         job = create_job(prompt="Check server status", schedule="30m")
         assert job["id"]
@@ -459,6 +483,34 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+
+    def test_failure_streak_increments_and_resets(self, tmp_cron_dir):
+        """failure_streak counts consecutive agent failures; success resets."""
+        job = create_job(prompt="Flaky", schedule="every 1h")
+        assert get_job(job["id"])["failure_streak"] == 0
+        mark_job_run(job["id"], success=False, error="timeout")
+        mark_job_run(job["id"], success=False, error="timeout")
+        assert get_job(job["id"])["failure_streak"] == 2
+        mark_job_run(job["id"], success=True)
+        assert get_job(job["id"])["failure_streak"] == 0
+
+    def test_failure_streak_ignores_delivery_errors(self, tmp_cron_dir):
+        """A successful run with a delivery error must not count as a failure."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="timeout")
+        mark_job_run(job["id"], success=True, delivery_error="send failed: 502")
+        assert get_job(job["id"])["failure_streak"] == 0
+
+    def test_failure_streak_backcompat_missing_field(self, tmp_cron_dir):
+        """Jobs persisted before the field existed increment from 0."""
+        job = create_job(prompt="Old", schedule="every 1h")
+        # Simulate a pre-field record on disk.
+        jobs = load_jobs()
+        for j in jobs:
+            j.pop("failure_streak", None)
+        save_jobs(jobs)
+        mark_job_run(job["id"], success=False, error="boom")
+        assert get_job(job["id"])["failure_streak"] == 1
 
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):
