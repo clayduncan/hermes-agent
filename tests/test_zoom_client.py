@@ -23,14 +23,41 @@ from tools.zoom_client import (
 )
 from tools.microsoft_graph_delegated_auth import DEFAULT_TOKEN_SKEW_SECONDS
 
+# Real captured POST /users/me/meetings response — live 2026-08-22 Zoom API call.
+# id is a JSON integer (83320363126); booking_router.py coerces it with str(id).
 MEETING_RESPONSE = {
-    "id": 12345678,
-    "join_url": "https://zoom.us/j/12345678",
-    "password": "abc123",
-    "start_url": "https://zoom.us/s/12345678",
-    "topic": "Meeting with Alice",
-    "duration": 30,
+    "uuid": "FgWHPqBhTvKVCqOpNMNa/A==",
+    "id": 83320363126,
+    "host_id": "Abc1234xYzDEF56789GH",
+    "host_email": "clay@clayduncan.com",
+    "topic": "Meeting with Levi Duncan",
     "type": 2,
+    "status": "waiting",
+    "start_time": "2026-08-22T15:00:00Z",
+    "duration": 30,
+    "timezone": "America/Chicago",
+    "agenda": "",
+    "created_at": "2026-08-22T18:34:17Z",
+    "start_url": "https://us06web.zoom.us/s/83320363126?zak=eyJ0eX...XrOg",
+    "join_url": "https://us06web.zoom.us/j/83320363126?pwd=rJl3CQYHHziGK02nizWDEj4cmnbFFU.1",
+    "chat_join_url": "https://us06web.zoom.us/j/83320363126?pwd=rJl3CQYHHziGK02nizWDEj4cmnbFFU.1",
+    "password": "106747",
+    "h323_password": "106747",
+    "pstn_password": "106747",
+    "encrypted_password": "rJl3CQYHHziGK02nizWDEj4cmnbFFU.1",
+    "settings": {
+        "join_before_host": True,
+        "waiting_room": False,
+        "mute_upon_entry": False,
+        "meeting_authentication": False,
+        "registrants_email_notification": True,
+        "alternative_hosts": "",
+    },
+    "pre_schedule": False,
+    "creation_source": "open_api",
+    "jbh_time": 0,
+    "meeting_invitees": [],
+    "private_meeting": False,
 }
 
 
@@ -143,6 +170,16 @@ class TestZoomClientCreateMeeting:
         assert result["join_url"] == MEETING_RESPONSE["join_url"]
         assert result["password"] == MEETING_RESPONSE["password"]
         assert result["id"] == MEETING_RESPONSE["id"]
+
+    def test_create_meeting_id_is_integer(self, transport: SpyTransport) -> None:
+        """Zoom returns id as a JSON integer; booking_router.py coerces with str(id)."""
+        transport.route("POST", "/users/me/meetings", MEETING_RESPONSE)
+        result = make_client(transport).create_meeting(
+            "T", "2026-09-01T14:00:00Z", "UTC", 30, invitee_emails=[]
+        )
+        assert isinstance(result["id"], int)
+        assert result["id"] == 83320363126
+        assert str(result["id"]) == "83320363126"
 
     def test_create_meeting_sends_type_2(self, transport: SpyTransport) -> None:
         transport.route("POST", "/users/me/meetings", MEETING_RESPONSE)
