@@ -388,10 +388,13 @@ class CalendlyBookingWriteClient:
             trigger=trigger,
         )
 
+        # Real confirmed shape (2026-08-22 live 201 response):
+        # event_type is a plain URI string; location is a sibling key, not nested inside event_type.
         body = {
-            "event_type": {"location": location},
-            "invitee": invitee,
+            "event_type": event_type_uri,
             "start_time": start_time_iso,
+            "invitee": invitee,
+            "location": location,
         }
 
         url = build_url(self.base_url, "/invitees")

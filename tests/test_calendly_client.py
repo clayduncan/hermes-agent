@@ -355,6 +355,52 @@ class TestCalendlyBookingWriteHappyPath:
         assert "POST" in methods
         assert methods.index("GET") < methods.index("POST")
 
+    def test_post_invitees_request_body_matches_real_captured_shape(
+        self, transport: SpyTransport, log_dir: Path
+    ) -> None:
+        """The outgoing POST /invitees body must match the real live payload that produced
+        a 201 Created from Calendly on 2026-08-22 (Levi Duncan / Mortgage Talk booking).
+
+        Real confirmed body (four flat top-level keys):
+          event_type  — plain URI string, NOT an object
+          start_time  — ISO8601 string
+          invitee     — object with name/email/timezone
+          location    — sibling object, NOT nested inside event_type
+        """
+        route_available_times(transport)
+        route_create_invitee(transport)
+        invitee_payload = {
+            "name": "Levi Duncan",
+            "first_name": "Levi",
+            "last_name": "Duncan",
+            "email": "lduncan@princetonmortgage.com",
+            "timezone": "America/Chicago",
+        }
+        write_client(transport, log_dir).create_invitee(
+            EVENT_TYPE_URI,
+            START_TIME,
+            invitee_payload,
+            {"kind": "zoom_conference"},
+            trigger=TRIGGER,
+        )
+        post_call = next(c for c in transport.calls if c.method == "POST")
+        body = post_call.json_body
+        # event_type must be a plain URI string, not an object
+        assert body["event_type"] == EVENT_TYPE_URI, (
+            f"event_type must be a plain URI string; got {body['event_type']!r}"
+        )
+        # location must be a top-level sibling, not nested inside event_type
+        assert body["location"] == {"kind": "zoom_conference"}, (
+            f"location must be a top-level key; got {body.get('location')!r}"
+        )
+        assert body["start_time"] == START_TIME
+        assert body["invitee"] == invitee_payload
+        # Confirm the old wrong shape is absent: event_type must not be a dict
+        assert not isinstance(body["event_type"], dict), (
+            "event_type must not be an object — it was incorrectly set to "
+            f"{{'location': ...}} in the original implementation"
+        )
+
 
 # ── already_filled → CalendlySlotUnavailable ─────────────────────────────────
 
