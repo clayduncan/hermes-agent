@@ -61,9 +61,17 @@ from hermes_constants import get_hermes_home
 MSGRAPH_CONTACTS = "msgraph_contacts"
 MSGRAPH_TASKS = "msgraph_tasks"
 GHL_CONTACTS = "ghl_contacts"
+CALENDLY_BOOKINGS = "calendly_bookings"
+MSGRAPH_CALENDAR_EVENTS = "msgraph_calendar_events"
 
 #: Destinations this log understands.  Extend when a new record type is wired up.
-KNOWN_DESTINATIONS: tuple[str, ...] = (MSGRAPH_CONTACTS, MSGRAPH_TASKS, GHL_CONTACTS)
+KNOWN_DESTINATIONS: tuple[str, ...] = (
+    MSGRAPH_CONTACTS,
+    MSGRAPH_TASKS,
+    GHL_CONTACTS,
+    CALENDLY_BOOKINGS,
+    MSGRAPH_CALENDAR_EVENTS,
+)
 
 KNOWN_OPERATIONS: tuple[str, ...] = ("create", "update", "delete")
 

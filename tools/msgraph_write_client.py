@@ -44,6 +44,7 @@ from tools.sync_json_http import (
     urllib_request,
 )
 from tools.write_audit_log import (
+    MSGRAPH_CALENDAR_EVENTS,
     MSGRAPH_CONTACTS,
     MSGRAPH_TASKS,
     AuthorizedWrite,
@@ -293,9 +294,122 @@ class MicrosoftGraphTasksWriteClient(_AuditedGraphWriteClient):
         return before
 
 
+class MicrosoftGraphCalendarEventsWriteClient(_AuditedGraphWriteClient):
+    """Audited create/cancel against ``/me/events`` (Outlook Calendar).
+
+    Used by the exception booking path: create a Graph calendar event that carries
+    a Zoom join URL and the invitee's email as an attendee.
+
+    Known gap: update/reschedule is not implemented — cancel and re-create is the
+    intended workflow for this build.  Add ``update_event`` in a follow-up pass
+    when reschedule support is required.
+    """
+
+    DESTINATION = MSGRAPH_CALENDAR_EVENTS
+    ACTOR = "msgraph_calendar_events_client"
+
+    def _event_path(self, event_id: str) -> str:
+        return f"/me/events/{event_id}"
+
+    def _calendar_view(self, start: str, end: str) -> Any:
+        """``GET /me/calendarView`` — existing events in the requested window."""
+        from tools.sync_json_http import build_url as _build_url
+        url = _build_url(self.base_url, "/me/calendarView", {
+            "startDateTime": start,
+            "endDateTime": end,
+        })
+        return request_json(
+            self.request_fn,
+            "GET",
+            url,
+            headers=self._headers(),
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            sleep=self.sleep,
+        )
+
+    def get_event(self, event_id: str) -> Any:
+        """Read one calendar event — no audit line."""
+        return self._call("GET", self._event_path(event_id))
+
+    def create_event(
+        self,
+        subject: str,
+        start: str,
+        end: str,
+        attendees: list[dict],
+        *,
+        body_html: str | None = None,
+        location_display_name: str | None = None,
+        is_online_meeting: bool = False,
+        online_meeting_provider: str | None = None,
+        trigger: str,
+    ) -> Any:
+        """``POST /me/events`` — gated by the write-audit log.
+
+        ``before`` is a ``GET /me/calendarView`` for the requested window —
+        a conflict check proving existing state was inspected before writing.
+
+        *start* and *end* must be ISO8601 strings (e.g. ``"2026-09-01T14:00:00"``
+        with a ``"timeZone"`` field handled by the caller in the *attendees* dicts
+        or inlined here).  Pass bare ISO strings; Graph infers UTC when no offset is
+        given.
+
+        Reschedule/update is out of scope for this build — cancel and re-create.
+        """
+        require_trigger(trigger)
+        before = self._calendar_view(start, end)
+        authorized = self._authorize(
+            operation="create", record_id=None, before=before, trigger=trigger
+        )
+
+        event_body: dict[str, Any] = {
+            "subject": subject,
+            "start": {"dateTime": start, "timeZone": "UTC"},
+            "end": {"dateTime": end, "timeZone": "UTC"},
+            "attendees": attendees,
+        }
+        if body_html is not None:
+            event_body["body"] = {"contentType": "HTML", "content": body_html}
+        if location_display_name is not None:
+            event_body["location"] = {"displayName": location_display_name}
+        if is_online_meeting:
+            event_body["isOnlineMeeting"] = True
+            if online_meeting_provider:
+                event_body["onlineMeetingProvider"] = online_meeting_provider
+
+        created = self._call("POST", "/me/events", json_body=event_body)
+
+        record_id = created.get("id") if isinstance(created, dict) else None
+        if record_id:
+            after, after_fetch_failed = self._fetch_after(self._event_path(record_id))
+        else:
+            after, after_fetch_failed = None, True
+        authorized.record_outcome(
+            record_id=record_id, after=after, after_fetch_failed=after_fetch_failed
+        )
+        return created
+
+    def cancel_event(self, event_id: str, *, trigger: str) -> None:
+        """``DELETE /me/events/{id}`` — gated by the write-audit log.
+
+        ``before`` is the event state before deletion.  ``after`` is ``None``
+        (deleted).  Returns ``None``; the caller cannot act on a deleted resource.
+        """
+        require_trigger(trigger)
+        path = self._event_path(event_id)
+        before = self._call("GET", path)
+        authorized = self._authorize(
+            operation="delete", record_id=event_id, before=before, trigger=trigger
+        )
+        self._call("DELETE", path)
+        authorized.record_outcome(after=None)
+
+
 __all__ = [
     "DEFAULT_GRAPH_BASE_URL",
     "HttpRequestError",
+    "MicrosoftGraphCalendarEventsWriteClient",
     "MicrosoftGraphContactsWriteClient",
     "MicrosoftGraphTasksWriteClient",
     "delegated_token_provider",
