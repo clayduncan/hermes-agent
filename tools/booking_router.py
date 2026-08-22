@@ -113,11 +113,24 @@ def book_meeting(
             location,
             trigger=trigger,
         )
-        event_uri = resource.get("event") or resource.get("uri")
-        zoom_join_url = _extract_zoom_url_from_invitee(resource)
+        # The invitee resource (POST /invitees) does NOT carry a location field.
+        # The Zoom join URL lives on the scheduled_events resource, populated by
+        # Calendly's own Zoom integration after the booking is created.  Fetch it
+        # best-effort: a pending integration or network error must not fail the
+        # booking — the invitee was already created successfully.
+        event_uri = resource.get("event")
+        calendly_event_uri = event_uri or resource.get("uri")
+        zoom_join_url: str | None = None
+        if event_uri:
+            try:
+                scheduled_event = calendly_client.get_scheduled_event(event_uri)
+                zoom_join_url = _extract_zoom_url_from_event(scheduled_event)
+            except Exception:
+                pass  # Best-effort only; booking already succeeded.
+
         return BookingResult(
             path="calendly",
-            calendly_event_uri=event_uri,
+            calendly_event_uri=calendly_event_uri,
             zoom_join_url=zoom_join_url,
         )
 
@@ -210,12 +223,19 @@ def _add_minutes(start_time_iso: str, minutes: int) -> str:
     return end.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def _extract_zoom_url_from_invitee(resource: dict) -> str | None:
-    """Best-effort: find a Zoom join URL in a Calendly invitee resource."""
-    location = resource.get("location") or {}
-    if isinstance(location, dict):
-        return location.get("join_url") or location.get("location")
-    return None
+def _extract_zoom_url_from_event(event_resource: dict) -> str | None:
+    """Pull Zoom join URL from a GET /scheduled_events/{uuid} resource.
+
+    Real captured shape (2026-08-22 live session):
+        location.join_url  — the Zoom join URL
+        location.status    — "pushed" when Calendly's integration has attached it
+        location.type      — "zoom"
+    Returns None if location is absent, not yet pushed, or join_url is missing.
+    """
+    location = event_resource.get("location")
+    if not isinstance(location, dict):
+        return None
+    return location.get("join_url") or None
 
 
 def _build_exception_body_html(

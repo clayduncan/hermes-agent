@@ -225,6 +225,18 @@ class CalendlyClient:
         )
         return data.get("collection") or []
 
+    def get_scheduled_event(self, uuid_or_uri: str) -> dict:
+        """``GET /scheduled_events/{uuid}`` — accept a full URI or bare UUID.
+
+        Returns the unwrapped ``resource`` dict.  The real response shape includes
+        ``location.join_url`` when Calendly's Zoom integration has attached the
+        meeting (``location.status == "pushed"``).  Returns an empty dict if the
+        response has no ``resource`` key.
+        """
+        uuid = uuid_or_uri.rstrip("/").split("/")[-1]
+        data = self._get(f"/scheduled_events/{uuid}")
+        return data.get("resource") or data
+
     def get_user_availability_schedules(self, user_uri: str) -> list[dict]:
         """``GET /user_availability_schedules`` — returns all schedules for the user."""
         data = self._get(

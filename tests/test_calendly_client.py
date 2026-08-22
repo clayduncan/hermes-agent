@@ -45,13 +45,66 @@ AVAILABLE_TIMES_RESPONSE = {
     ]
 }
 
+# Real captured shape from POST /invitees live session 2026-08-22.
+# Notably: NO "location" key on the invitee resource.  The Zoom join URL lives
+# on the scheduled_events resource, not here.
 INVITEE_RESOURCE = {
-    "uri": "https://api.calendly.com/scheduled_events/XYZ/invitees/INV1",
-    "event": "https://api.calendly.com/scheduled_events/XYZ",
-    "name": "Test Person",
-    "email": "test@example.com",
+    "cancel_url": "https://calendly.com/cancellations/8b5e2bc5-52bb-4dc1-8ad0-41ef0d6084b8",
+    "created_at": "2026-08-22T17:13:17.150860Z",
+    "email": "lduncan@princetonmortgage.com",
+    "event": "https://api.calendly.com/scheduled_events/cdd4c933-653b-4373-937a-3f9b08111a4a",
+    "first_name": "Levi",
+    "invitee_scheduled_by": "https://api.calendly.com/users/a613a1bb-a118-46c0-b518-7d2795909c2c",
+    "last_name": "Duncan",
+    "name": "Levi Duncan",
+    "new_invitee": None,
+    "no_show": None,
+    "old_invitee": None,
+    "payment": None,
+    "questions_and_answers": [],
+    "reconfirmation": None,
+    "reschedule_url": "https://calendly.com/reschedulings/8b5e2bc5-52bb-4dc1-8ad0-41ef0d6084b8",
+    "rescheduled": False,
+    "routing_form_submission": None,
+    "scheduling_method": "api",
+    "status": "active",
+    "text_reminder_number": None,
+    "timezone": "America/Chicago",
+    "tracking": {
+        "utm_campaign": None, "utm_source": None, "utm_medium": None,
+        "utm_content": None, "utm_term": None, "salesforce_uuid": None,
+    },
+    "updated_at": "2026-08-22T17:13:17.150860Z",
+    "uri": "https://api.calendly.com/scheduled_events/cdd4c933-653b-4373-937a-3f9b08111a4a/invitees/8b5e2bc5-52bb-4dc1-8ad0-41ef0d6084b8",
 }
 INVITEE_BODY = {"resource": INVITEE_RESOURCE}
+
+# Real captured shape from GET /scheduled_events/{uuid} live session 2026-08-22.
+# "location.status": "pushed" means Calendly's Zoom integration has finished.
+SCHEDULED_EVENT_UUID = "cdd4c933-653b-4373-937a-3f9b08111a4a"
+SCHEDULED_EVENT_RESOURCE = {
+    "calendar_event": {
+        "external_id": "AAMkAGZkNjM2NDA0LTQ1YTktNDgzNy04MzgxLTE0ODE5NTVjOTBlYQ==",
+        "kind": "outlook",
+    },
+    "created_at": "2026-08-22T17:13:17.126040Z",
+    "end_time": "2026-08-25T14:00:00.000000Z",
+    "event_guests": [],
+    "event_type": "https://api.calendly.com/event_types/9ac0b557-1840-4846-b35b-cc457712510b",
+    "invitees_counter": {"active": 1, "limit": 1, "total": 1},
+    "location": {
+        "data": {"id": 82003739767, "password": "833132"},
+        "join_url": "https://us06web.zoom.us/j/82003739767?pwd=cWTCn392fefLbLZb5IC1XzvcD1XTjC.1",
+        "status": "pushed",
+        "type": "zoom",
+    },
+    "name": "Mortgage Talk",
+    "start_time": "2026-08-25T13:00:00.000000Z",
+    "status": "active",
+    "updated_at": "2026-08-22T17:13:25.597236Z",
+    "uri": f"https://api.calendly.com/scheduled_events/{SCHEDULED_EVENT_UUID}",
+}
+SCHEDULED_EVENT_BODY = {"resource": SCHEDULED_EVENT_RESOURCE}
 
 USER_RESOURCE = {"resource": {"uri": "https://api.calendly.com/users/ME", "name": "Clay"}}
 EVENT_TYPE_DATA = {"resource": {"uri": EVENT_TYPE_URI, "name": "30 Minute Meeting"}}
@@ -171,6 +224,32 @@ class TestCalendlyClientReads:
         transport.route("GET", "/scheduled_events/EVT1/invitees", resp)
         result = read_client(transport).get_event_invitees("EVT1")
         assert result == [{"email": "a@b.com"}]
+
+    def test_get_scheduled_event_bare_uuid(self, transport: SpyTransport) -> None:
+        transport.route("GET", f"/scheduled_events/{SCHEDULED_EVENT_UUID}", SCHEDULED_EVENT_BODY)
+        result = read_client(transport).get_scheduled_event(SCHEDULED_EVENT_UUID)
+        assert result == SCHEDULED_EVENT_RESOURCE
+        assert result["location"]["join_url"] == "https://us06web.zoom.us/j/82003739767?pwd=cWTCn392fefLbLZb5IC1XzvcD1XTjC.1"
+        assert result["location"]["status"] == "pushed"
+        assert result["location"]["type"] == "zoom"
+
+    def test_get_scheduled_event_full_uri(self, transport: SpyTransport) -> None:
+        full_uri = f"https://api.calendly.com/scheduled_events/{SCHEDULED_EVENT_UUID}"
+        transport.route("GET", f"/scheduled_events/{SCHEDULED_EVENT_UUID}", SCHEDULED_EVENT_BODY)
+        result = read_client(transport).get_scheduled_event(full_uri)
+        assert result == SCHEDULED_EVENT_RESOURCE
+
+    def test_get_scheduled_event_no_location_returns_empty_location(self, transport: SpyTransport) -> None:
+        event_without_zoom = {
+            "resource": {
+                "uri": f"https://api.calendly.com/scheduled_events/{SCHEDULED_EVENT_UUID}",
+                "status": "active",
+                # No "location" key — Zoom integration not yet attached
+            }
+        }
+        transport.route("GET", f"/scheduled_events/{SCHEDULED_EVENT_UUID}", event_without_zoom)
+        result = read_client(transport).get_scheduled_event(SCHEDULED_EVENT_UUID)
+        assert result.get("location") is None
 
     def test_list_meeting_recaps_raises_typed_error_on_403(self, transport: SpyTransport) -> None:
         transport.route("GET", "/scheduling_links", HttpResponse(status_code=403, body=b"Forbidden"))

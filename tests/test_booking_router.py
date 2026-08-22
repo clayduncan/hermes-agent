@@ -19,11 +19,18 @@ from tools.booking_router import BookingResult, book_meeting, _slot_in_collectio
 
 
 class FakeCalendlyClient:
-    """Read-only Calendly fake — controls what get_event_type_available_times returns."""
+    """Read-only Calendly fake — controls availability check and scheduled-event fetch."""
 
-    def __init__(self, available_times: list[dict] | Exception) -> None:
+    def __init__(
+        self,
+        available_times: list[dict] | Exception,
+        scheduled_event: dict | Exception | None = None,
+    ) -> None:
         self._available_times = available_times
+        # None → return {} (no Zoom link yet); Exception → raise it.
+        self._scheduled_event = scheduled_event
         self.calls: list[tuple] = []
+        self.event_fetch_calls: list[str] = []
 
     def get_event_type_available_times(
         self, event_type_uri: str, start_time: str, end_time: str
@@ -32,6 +39,14 @@ class FakeCalendlyClient:
         if isinstance(self._available_times, Exception):
             raise self._available_times
         return self._available_times
+
+    def get_scheduled_event(self, event_uri: str) -> dict:
+        self.event_fetch_calls.append(event_uri)
+        if isinstance(self._scheduled_event, Exception):
+            raise self._scheduled_event
+        if self._scheduled_event is None:
+            return {}
+        return self._scheduled_event
 
 
 class FakeCalendlyWriter:
@@ -91,11 +106,53 @@ START_TIME = "2026-09-01T14:00:00Z"
 TRIGGER = "router-test-2026-08-22"
 
 AVAILABLE_SLOT = {"start_time": START_TIME, "status": "available", "invitees_remaining": 1}
+
+# Real captured shape: POST /invitees response (2026-08-22 live session).
+# NO "location" field — that lives on the scheduled_events resource, not here.
 INVITEE_RESOURCE = {
-    "uri": "https://api.calendly.com/scheduled_events/XYZ/invitees/INV1",
-    "event": "https://api.calendly.com/scheduled_events/XYZ",
-    "location": {"kind": "zoom_conference", "join_url": "https://zoom.us/j/cal123"},
+    "cancel_url": "https://calendly.com/cancellations/8b5e2bc5-52bb-4dc1-8ad0-41ef0d6084b8",
+    "created_at": "2026-08-22T17:13:17.150860Z",
+    "email": "lduncan@princetonmortgage.com",
+    "event": "https://api.calendly.com/scheduled_events/cdd4c933-653b-4373-937a-3f9b08111a4a",
+    "first_name": "Levi",
+    "last_name": "Duncan",
+    "name": "Levi Duncan",
+    "new_invitee": None,
+    "no_show": None,
+    "questions_and_answers": [],
+    "rescheduled": False,
+    "scheduling_method": "api",
+    "status": "active",
+    "timezone": "America/Chicago",
+    "updated_at": "2026-08-22T17:13:17.150860Z",
+    "uri": "https://api.calendly.com/scheduled_events/cdd4c933-653b-4373-937a-3f9b08111a4a/invitees/8b5e2bc5-52bb-4dc1-8ad0-41ef0d6084b8",
 }
+
+# Real captured shape: GET /scheduled_events/{uuid} response (2026-08-22 live session).
+# location.status="pushed" means Calendly's Zoom integration has finished attaching.
+SCHEDULED_EVENT_UUID = "cdd4c933-653b-4373-937a-3f9b08111a4a"
+SCHEDULED_EVENT_RESOURCE = {
+    "calendar_event": {"external_id": "AAMkAGZk...", "kind": "outlook"},
+    "created_at": "2026-08-22T17:13:17.126040Z",
+    "end_time": "2026-08-25T14:00:00.000000Z",
+    "event_type": "https://api.calendly.com/event_types/9ac0b557-1840-4846-b35b-cc457712510b",
+    "invitees_counter": {"active": 1, "limit": 1, "total": 1},
+    "location": {
+        "data": {"id": 82003739767, "password": "833132"},
+        "join_url": "https://us06web.zoom.us/j/82003739767?pwd=cWTCn392fefLbLZb5IC1XzvcD1XTjC.1",
+        "status": "pushed",
+        "type": "zoom",
+    },
+    "name": "Mortgage Talk",
+    "start_time": "2026-08-25T13:00:00.000000Z",
+    "status": "active",
+    "uri": f"https://api.calendly.com/scheduled_events/{SCHEDULED_EVENT_UUID}",
+}
+
+
+def _default_calendly_client() -> FakeCalendlyClient:
+    """Default read-only fake: slot available, Zoom integration attached (pushed)."""
+    return FakeCalendlyClient([AVAILABLE_SLOT], scheduled_event=SCHEDULED_EVENT_RESOURCE)
 
 
 def _common_kwargs(
@@ -105,7 +162,7 @@ def _common_kwargs(
     zoom_client=None,
 ) -> dict:
     return {
-        "calendly_client": calendly_client or FakeCalendlyClient([AVAILABLE_SLOT]),
+        "calendly_client": calendly_client or _default_calendly_client(),
         "calendly_writer": calendly_writer or FakeCalendlyWriter(INVITEE_RESOURCE),
         "graph_calendar_writer": graph_writer or FakeGraphCalendarWriter(),
         "zoom_client": zoom_client or FakeZoomClient(),
@@ -124,7 +181,7 @@ def _common_kwargs(
 
 class TestBookingRouterPaths:
     def test_available_slot_routes_to_calendly(self) -> None:
-        calendly_client = FakeCalendlyClient([AVAILABLE_SLOT])
+        calendly_client = FakeCalendlyClient([AVAILABLE_SLOT], scheduled_event=SCHEDULED_EVENT_RESOURCE)
         calendly_writer = FakeCalendlyWriter(INVITEE_RESOURCE)
         graph_writer = FakeGraphCalendarWriter()
         zoom_client = FakeZoomClient()
@@ -281,7 +338,7 @@ class TestCalendlyAvailabilityCheckErrorPropagates:
 class TestBookingResultFields:
     def test_calendly_path_result_has_event_uri(self) -> None:
         result = book_meeting(**_common_kwargs(
-            calendly_client=FakeCalendlyClient([AVAILABLE_SLOT]),
+            calendly_client=FakeCalendlyClient([AVAILABLE_SLOT], scheduled_event=SCHEDULED_EVENT_RESOURCE),
             calendly_writer=FakeCalendlyWriter(INVITEE_RESOURCE),
         ))
         assert result.path == "calendly"
@@ -302,17 +359,55 @@ class TestBookingResultFields:
         assert result.graph_event_id == "gevent-7"
         assert result.calendly_event_uri is None
 
-    def test_calendly_path_extracts_zoom_url_from_location(self) -> None:
-        invitee_with_zoom = {
-            "uri": "inv-1",
-            "event": "evt-1",
-            "location": {"kind": "zoom_conference", "join_url": "https://zoom.us/j/cal999"},
-        }
+    def test_calendly_path_extracts_zoom_url_from_scheduled_event(self) -> None:
+        """Zoom join URL comes from GET /scheduled_events/{uuid}, not the invitee resource.
+
+        Real captured shape (2026-08-22 live session): the invitee POST response has
+        no location field; the scheduled_events GET response has location.join_url when
+        Calendly's Zoom integration has finished (location.status == "pushed").
+        """
         result = book_meeting(**_common_kwargs(
-            calendly_client=FakeCalendlyClient([AVAILABLE_SLOT]),
-            calendly_writer=FakeCalendlyWriter(invitee_with_zoom),
+            calendly_client=FakeCalendlyClient(
+                [AVAILABLE_SLOT],
+                scheduled_event=SCHEDULED_EVENT_RESOURCE,
+            ),
+            calendly_writer=FakeCalendlyWriter(INVITEE_RESOURCE),
         ))
-        assert result.zoom_join_url == "https://zoom.us/j/cal999"
+        assert result.zoom_join_url == "https://us06web.zoom.us/j/82003739767?pwd=cWTCn392fefLbLZb5IC1XzvcD1XTjC.1"
+
+    def test_calendly_path_zoom_url_is_none_when_location_absent(self) -> None:
+        """When Calendly's Zoom integration has not yet attached (location absent),
+        zoom_join_url is None and the booking is still reported as succeeded."""
+        event_without_location = {**SCHEDULED_EVENT_RESOURCE}
+        event_without_location.pop("location", None)
+        result = book_meeting(**_common_kwargs(
+            calendly_client=FakeCalendlyClient(
+                [AVAILABLE_SLOT],
+                scheduled_event=event_without_location,
+            ),
+            calendly_writer=FakeCalendlyWriter(INVITEE_RESOURCE),
+        ))
+        assert result.path == "calendly"
+        assert result.zoom_join_url is None
+        assert result.calendly_event_uri is not None
+
+    def test_calendly_path_zoom_url_is_none_when_scheduled_event_fetch_raises(self) -> None:
+        """A network error on the follow-up GET /scheduled_events must not fail
+        the booking — create_invitee already succeeded, this is a best-effort read.
+
+        This is the key resilience test: the booking must succeed even if Calendly's
+        scheduled_events API is temporarily unreachable immediately after booking.
+        """
+        result = book_meeting(**_common_kwargs(
+            calendly_client=FakeCalendlyClient(
+                [AVAILABLE_SLOT],
+                scheduled_event=ConnectionError("Calendly scheduled_events unreachable"),
+            ),
+            calendly_writer=FakeCalendlyWriter(INVITEE_RESOURCE),
+        ))
+        assert result.path == "calendly"
+        assert result.zoom_join_url is None
+        assert result.calendly_event_uri is not None
 
 
 # ── _slot_in_collection unit tests ────────────────────────────────────────────
