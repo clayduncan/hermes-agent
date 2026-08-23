@@ -128,8 +128,12 @@ export const en: Translations = {
     backendOutOfDateTitle: 'Backend out of date',
     backendOutOfDateMessage:
       'Your Hermes backend is older than this desktop build and may not work correctly. Update to align them.',
+    appOutOfDateTitle: 'Desktop app out of date',
+    appOutOfDateMessage:
+      'The remote backend has advanced beyond this desktop build. Update the desktop app to get the latest features and stay in sync.',
     installMethodUnsupportedTitle: 'Unsupported install method',
     updateHermes: 'Update Hermes',
+    updateDesktopApp: 'Update desktop app',
     updateReadyTitle: 'Update ready',
     updateReadyMessage: count => `${count} new change${count === 1 ? '' : 's'} available.`,
     updateReadyMessageUnknown: 'A new update is available.',

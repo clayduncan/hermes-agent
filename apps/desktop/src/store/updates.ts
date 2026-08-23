@@ -119,6 +119,23 @@ function isSkewToastSnoozed(): boolean {
   return Number.isFinite(until) && Date.now() < until
 }
 
+// Reverse-skew: the backend has advanced beyond REQUIRED_BACKEND_CONTRACT,
+// meaning this desktop build predates features the backend now expects the
+// client to support. Same snooze pattern as the backend-skew toast above.
+const APP_SKEW_TOAST_ID = 'app-version-skew'
+const APP_SKEW_TOAST_SNOOZE_KEY = 'hermes:app-skew-toast-snooze-until'
+const APP_SKEW_TOAST_COOLDOWN_MS = 24 * 60 * 60 * 1000
+
+function snoozeAppSkewToast(): void {
+  persistString(APP_SKEW_TOAST_SNOOZE_KEY, String(Date.now() + APP_SKEW_TOAST_COOLDOWN_MS))
+}
+
+function isAppSkewToastSnoozed(): boolean {
+  const until = Number(storedString(APP_SKEW_TOAST_SNOOZE_KEY) || 0)
+
+  return Number.isFinite(until) && Date.now() < until
+}
+
 const INSTALL_METHOD_TOAST_ID = 'install-method-not-supported'
 // Same time-based snooze pattern as the update/skew toasts: the warning is
 // re-derived from every session.info (session.create/resume/activate all
@@ -147,15 +164,13 @@ function isInstallMethodToastSnoozed(): boolean {
  * doesn't nag on every thread switch.
  */
 export function reportBackendContract(contract: number | undefined): void {
-  const backendContract = contract ?? 0
+  const actual = contract ?? 0
 
-  if (backendContract === REQUIRED_BACKEND_CONTRACT) {
-    dismissNotification(SKEW_TOAST_ID)
-    persistString(SKEW_TOAST_SNOOZE_KEY, null)
-    return
-  }
+  if (actual < REQUIRED_BACKEND_CONTRACT) {
+    // Backend is behind this app's requirements. Dismiss any reverse-skew toast.
+    dismissNotification(APP_SKEW_TOAST_ID)
+    persistString(APP_SKEW_TOAST_SNOOZE_KEY, null)
 
-  if (backendContract > REQUIRED_BACKEND_CONTRACT) {
     if (isSkewToastSnoozed()) {
       return
     }
@@ -165,38 +180,50 @@ export function reportBackendContract(contract: number | undefined): void {
         label: translateNow('notifications.updateHermes'),
         onClick: () => {
           snoozeSkewToast()
-          void applyUpdates()
+          void applyBackendUpdate()
         }
       },
       durationMs: 0,
       id: SKEW_TOAST_ID,
       kind: 'warning',
-      message: 'The desktop app is too old for this backend. Please update the app.',
+      message: translateNow('notifications.backendOutOfDateMessage'),
       onDismiss: () => snoozeSkewToast(),
-      title: 'Desktop App Out of Date'
+      title: translateNow('notifications.backendOutOfDateTitle')
     })
     return
   }
 
-  if (isSkewToastSnoozed()) {
+  // Backend is at or ahead of our required contract — backend-skew toast is no longer relevant.
+  dismissNotification(SKEW_TOAST_ID)
+  persistString(SKEW_TOAST_SNOOZE_KEY, null)
+
+  if (actual > REQUIRED_BACKEND_CONTRACT) {
+    // Backend has advanced beyond this desktop build.
+    if (isAppSkewToastSnoozed()) {
+      return
+    }
+
+    notify({
+      action: {
+        label: translateNow('notifications.updateDesktopApp'),
+        onClick: () => {
+          snoozeAppSkewToast()
+          void applyUpdates()
+        }
+      },
+      durationMs: 0,
+      id: APP_SKEW_TOAST_ID,
+      kind: 'warning',
+      message: translateNow('notifications.appOutOfDateMessage'),
+      onDismiss: () => snoozeAppSkewToast(),
+      title: translateNow('notifications.appOutOfDateTitle')
+    })
     return
   }
 
-  notify({
-    action: {
-      label: translateNow('notifications.updateHermes'),
-      onClick: () => {
-        snoozeSkewToast()
-        void applyBackendUpdate()
-      }
-    },
-    durationMs: 0,
-    id: SKEW_TOAST_ID,
-    kind: 'warning',
-    message: translateNow('notifications.backendOutOfDateMessage'),
-    onDismiss: () => snoozeSkewToast(),
-    title: translateNow('notifications.backendOutOfDateTitle')
-  })
+  // Exact match — both skew toasts clear.
+  dismissNotification(APP_SKEW_TOAST_ID)
+  persistString(APP_SKEW_TOAST_SNOOZE_KEY, null)
 }
 
 export function reportInstallMethodWarning(message: string | undefined): void {
@@ -284,8 +311,9 @@ export function startActiveUpdate(): void {
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
   if (target === 'backend') {
-    void applyBackendUpdate().then((res) => {
+    void applyBackendUpdate().then(res => {
       if (res.ok) {
+        $updateOverlayTarget.set('client')
         void applyUpdates()
       }
     })
@@ -537,6 +565,7 @@ function finishBackendApply(returned: boolean): DesktopUpdateApplyResult {
     $backendUpdateApply.set(IDLE)
     setUpdateOverlayOpen(false)
     void checkBackendUpdates()
+    void checkUpdates()
 
     return { ok: true, message: 'Backend update applied.' }
   }

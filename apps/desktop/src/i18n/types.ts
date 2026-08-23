@@ -170,8 +170,11 @@ export interface Translations {
     copyDetailFailed: string
     backendOutOfDateTitle: string
     backendOutOfDateMessage: string
+    appOutOfDateTitle: string
+    appOutOfDateMessage: string
     installMethodUnsupportedTitle: string
     updateHermes: string
+    updateDesktopApp: string
     updateReadyTitle: string
     updateReadyMessage: (count: number) => string
     updateReadyMessageUnknown: string
