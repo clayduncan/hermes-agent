@@ -147,12 +147,34 @@ function isInstallMethodToastSnoozed(): boolean {
  * doesn't nag on every thread switch.
  */
 export function reportBackendContract(contract: number | undefined): void {
-  if ((contract ?? 0) >= REQUIRED_BACKEND_CONTRACT) {
-    dismissNotification(SKEW_TOAST_ID)
-    // Backend caught up — forget any prior snooze so a future regression warns
-    // immediately rather than staying silent for the rest of the window.
-    persistString(SKEW_TOAST_SNOOZE_KEY, null)
+  const backendContract = contract ?? 0
 
+  if (backendContract === REQUIRED_BACKEND_CONTRACT) {
+    dismissNotification(SKEW_TOAST_ID)
+    persistString(SKEW_TOAST_SNOOZE_KEY, null)
+    return
+  }
+
+  if (backendContract > REQUIRED_BACKEND_CONTRACT) {
+    if (isSkewToastSnoozed()) {
+      return
+    }
+
+    notify({
+      action: {
+        label: translateNow('notifications.updateHermes'),
+        onClick: () => {
+          snoozeSkewToast()
+          void applyUpdates()
+        }
+      },
+      durationMs: 0,
+      id: SKEW_TOAST_ID,
+      kind: 'warning',
+      message: 'The desktop app is too old for this backend. Please update the app.',
+      onDismiss: () => snoozeSkewToast(),
+      title: 'Desktop App Out of Date'
+    })
     return
   }
 
@@ -261,7 +283,15 @@ export function startActiveUpdate(): void {
   const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
-  void (target === 'backend' ? applyBackendUpdate() : applyUpdates())
+  if (target === 'backend') {
+    void applyBackendUpdate().then((res) => {
+      if (res.ok) {
+        void applyUpdates()
+      }
+    })
+  } else {
+    void applyUpdates()
+  }
 }
 
 /**
