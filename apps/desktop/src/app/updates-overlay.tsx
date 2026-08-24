@@ -29,12 +29,12 @@ import {
   $updateOverlayOpen,
   $updateOverlayTarget,
   $updateStatus,
-  applyBackendUpdate,
   applyUpdates,
   checkBackendUpdates,
   checkUpdates,
   resetUpdateApplyState,
   setUpdateOverlayOpen,
+  startUpdateFor,
   type UpdateApplyState
 } from '@/store/updates'
 
@@ -58,7 +58,6 @@ export function UpdatesOverlay() {
   const checking = isBackend ? backendChecking : clientChecking
   const apply = isBackend ? backendApply : clientApply
   const check = isBackend ? checkBackendUpdates : checkUpdates
-  const install = isBackend ? applyBackendUpdate : applyUpdates
 
   useEffect(() => {
     if (open && !status && !checking) {
@@ -97,8 +96,11 @@ export function UpdatesOverlay() {
     }
   }
 
+  // Same "Update now" label as the About panel, so it must run the same action:
+  // a backend target is a two-stage backend-then-client update, not a backend
+  // update that leaves this desktop build behind.
   const handleInstall = () => {
-    void install()
+    startUpdateFor(target)
   }
 
   return (

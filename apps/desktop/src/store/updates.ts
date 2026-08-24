@@ -180,7 +180,10 @@ export function reportBackendContract(contract: number | undefined): void {
         label: translateNow('notifications.updateHermes'),
         onClick: () => {
           snoozeSkewToast()
-          void applyBackendUpdate()
+          // The docstring's "normal update flow": in remote mode that's the
+          // backend (plus the client stage that keeps them aligned), in local
+          // mode the one checkout both halves come from.
+          startActiveUpdate()
         }
       },
       durationMs: 0,
@@ -190,6 +193,7 @@ export function reportBackendContract(contract: number | undefined): void {
       onDismiss: () => snoozeSkewToast(),
       title: translateNow('notifications.backendOutOfDateTitle')
     })
+
     return
   }
 
@@ -208,7 +212,9 @@ export function reportBackendContract(contract: number | undefined): void {
         label: translateNow('notifications.updateDesktopApp'),
         onClick: () => {
           snoozeAppSkewToast()
-          void applyUpdates()
+          // Only the desktop app is behind here — the backend is already past
+          // this build's contract, so there is nothing to update on that side.
+          startUpdateFor('client')
         }
       },
       durationMs: 0,
@@ -218,6 +224,7 @@ export function reportBackendContract(contract: number | undefined): void {
       onDismiss: () => snoozeAppSkewToast(),
       title: translateNow('notifications.appOutOfDateTitle')
     })
+
     return
   }
 
@@ -299,27 +306,83 @@ export function openUpdatesWindow(): void {
   openUpdateOverlayFor(isRemoteMode() ? 'backend' : 'client')
 }
 
+function updateInProgress(): boolean {
+  // Mirror the overlay's `phase === 'applying'` predicate (updates-overlay.tsx)
+  // rather than `applying` alone: ingestProgress marks 'restart' terminal, so a
+  // handed-off update sits at applying:false while the app is mid-relaunch and
+  // the UI still shows a spinner. Starting a second apply in that window is
+  // rejected by the main process and turns into an error banner over a live
+  // update.
+  const busy = (state: UpdateApplyState) => state.applying || state.stage === 'restart'
+
+  return busy($updateApply.get()) || busy($backendUpdateApply.get())
+}
+
 /**
- * Start applying the available update for the active target right away. Opens
- * the updates overlay first so the user sees apply progress (the overlay
- * renders ApplyingView once `applying` flips true), then kicks off the install.
- * Used by the "Update now" affordance on the About panel, which would otherwise
- * only be able to open the changelog overlay.
+ * The single Update action. Opens the updates overlay first so the user sees
+ * apply progress (the overlay renders ApplyingView once `applying` flips true)
+ * and, just as importantly, any terminal state the apply lands on —
+ * manual/guiSkew/error are written into the apply store whether or not anyone
+ * is looking, and openUpdateOverlayFor() doesn't reset them.
+ *
+ * A 'backend' target is a TWO-STAGE update: the remote backend first and, only
+ * once it succeeds, the local desktop client that talks to it. Updating one
+ * half leaves the freshly-updated backend serving an old GUI — the exact skew
+ * reportBackendContract() warns about.
  */
-export function startActiveUpdate(): void {
-  const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
+export function startUpdateFor(target: UpdateTarget): void {
+  // Every Update affordance routes through here (About panel, ⌘K, the overlay's
+  // own button, both skew toasts), and the backend stage runs for minutes with
+  // those affordances still live. Without this guard, repeat clicks stack extra
+  // `.then` handlers onto the deduped backend promise and fire N concurrent
+  // client applies; the extras lose to Electron's "update already in progress"
+  // and strand the overlay on a spurious error while the real update proceeds.
+  if (updateInProgress()) {
+    return
+  }
+
   $updateOverlayTarget.set(target)
   $updateOverlayOpen.set(true)
-  if (target === 'backend') {
-    void applyBackendUpdate().then(res => {
-      if (res.ok) {
-        $updateOverlayTarget.set('client')
-        void applyUpdates()
-      }
-    })
-  } else {
+
+  if (target !== 'backend') {
     void applyUpdates()
+
+    return
   }
+
+  void applyBackendUpdate(true)
+    .then(result => {
+      if (!result.ok) {
+        return
+      }
+
+      // Stage one left the overlay open for us (finishBackendApply only closes
+      // it for a standalone backend update); retarget it at the client stage.
+      $updateOverlayTarget.set('client')
+      $updateOverlayOpen.set(true)
+      void applyUpdates().then(clientResult => {
+        if (!clientResult.handedOff) {
+          // Stage two ended without a relaunch (manual / guiSkew / error /
+          // AppImage), so this session keeps running. finishBackendApply skipped
+          // its refresh on our behalf — re-check now, or the pill and About
+          // panel keep advertising the backend update we just applied.
+          void checkBackendUpdates()
+        }
+      })
+    })
+    .catch(() => {
+      // runBackendUpdate resolves its own failures, so this only fires if the
+      // pre-try setup throws. Swallow it rather than leak an unhandled rejection.
+    })
+}
+
+/**
+ * Start applying the available update for the active target right away. Used by
+ * the "Update now" affordance on the About panel, which would otherwise only be
+ * able to open the changelog overlay.
+ */
+export function startActiveUpdate(): void {
+  startUpdateFor(isRemoteMode() ? 'backend' : 'client')
 }
 
 /**
@@ -418,6 +481,13 @@ export async function checkBackendUpdates(): Promise<DesktopUpdateStatus | null>
 }
 
 export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
+  // Same guard as refreshDesktopVersion: this is now also reached from the
+  // backend apply flow (finishBackendApply), which isn't renderer-only, so a
+  // bare `window` deref would surface as an unhandled rejection.
+  if (typeof window === 'undefined') {
+    return $updateStatus.get()
+  }
+
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge || $updateChecking.get()) {
@@ -560,11 +630,22 @@ const BACKEND_ACTION_POLL_MS = 1500
 const BACKEND_ACTION_MAX_MS = 6 * 60 * 1000
 const BACKEND_RETURN_MAX_MS = 4 * 60 * 1000
 
-function finishBackendApply(returned: boolean): DesktopUpdateApplyResult {
+function finishBackendApply(returned: boolean, chainClientUpdate: boolean): DesktopUpdateApplyResult {
   if (returned) {
     $backendUpdateApply.set(IDLE)
+
+    if (chainClientUpdate) {
+      // startUpdateFor() owns the overlay and the follow-on client apply from
+      // here. Leaving it open avoids a close→reopen flicker, and skipping the
+      // re-checks keeps their maybeNotifyUpdateAvailable() from racing an
+      // "update ready" toast against the stage-two apply that's about to start.
+      return { ok: true, message: 'Backend update applied.' }
+    }
+
     setUpdateOverlayOpen(false)
     void checkBackendUpdates()
+    // Refresh the client's own status too: a backend update commonly means the
+    // desktop build is now behind as well, and nothing else re-checks here.
     void checkUpdates()
 
     return { ok: true, message: 'Backend update applied.' }
@@ -627,7 +708,7 @@ function legacyBackendReachedTarget(
 
 let backendUpdateInFlight: Promise<DesktopUpdateApplyResult> | null = null
 
-async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+async function runBackendUpdate(chainClientUpdate: boolean): Promise<DesktopUpdateApplyResult> {
   dismissNotification(UPDATE_TOAST_ID)
   $backendUpdateApply.set({
     ...IDLE,
@@ -705,7 +786,7 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
       }
 
       if (last.exit_code === 0 || (last.exit_code === null && completedAfterRestart(last, started.action_id))) {
-        return finishBackendApply(true)
+        return finishBackendApply(true, chainClientUpdate)
       }
 
       if (!started.action_id && last.exit_code === null) {
@@ -713,7 +794,7 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
           const status = await checkHermesUpdate(true)
 
           if (legacyBackendReachedTarget(status, requestedTargetSha, previousVersion)) {
-            return finishBackendApply(true)
+            return finishBackendApply(true, chainClientUpdate)
           }
         } catch {
           continue
@@ -748,12 +829,19 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
   }
 }
 
-export function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+/**
+ * Apply the remote backend update, deduped across concurrent callers.
+ *
+ * `chainClientUpdate` is set only by startUpdateFor()'s two-stage flow: it tells
+ * the success path to hand the overlay off to the follow-on client apply instead
+ * of closing it and re-checking. Never pass an event handler's argument here.
+ */
+export function applyBackendUpdate(chainClientUpdate = false): Promise<DesktopUpdateApplyResult> {
   if (backendUpdateInFlight) {
     return backendUpdateInFlight
   }
 
-  backendUpdateInFlight = runBackendUpdate().finally(() => {
+  backendUpdateInFlight = runBackendUpdate(chainClientUpdate).finally(() => {
     backendUpdateInFlight = null
   })
 

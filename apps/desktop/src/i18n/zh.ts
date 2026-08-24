@@ -126,7 +126,7 @@ export const zh: Translations = {
     backendOutOfDateTitle: '后端版本过旧',
     backendOutOfDateMessage: '你的 Hermes 后端早于当前桌面构建，可能无法正常工作。请更新以保持一致。',
     appOutOfDateTitle: '桌面应用版本过旧',
-    appOutOfDateMessage: '远端后端已超过此桌面版本。请更新桌面应用以获取最新功能并保持同步。',
+    appOutOfDateMessage: '你的 Hermes 后端新于当前桌面构建，可能无法正常工作。请更新桌面应用以保持一致。',
     installMethodUnsupportedTitle: '不受支持的安装方式',
     updateHermes: '更新 Hermes',
     updateDesktopApp: '更新桌面应用',

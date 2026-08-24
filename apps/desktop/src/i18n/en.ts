@@ -130,7 +130,7 @@ export const en: Translations = {
       'Your Hermes backend is older than this desktop build and may not work correctly. Update to align them.',
     appOutOfDateTitle: 'Desktop app out of date',
     appOutOfDateMessage:
-      'The remote backend has advanced beyond this desktop build. Update the desktop app to get the latest features and stay in sync.',
+      'Your Hermes backend is newer than this desktop build and may not work correctly. Update the desktop app to align them.',
     installMethodUnsupportedTitle: 'Unsupported install method',
     updateHermes: 'Update Hermes',
     updateDesktopApp: 'Update desktop app',

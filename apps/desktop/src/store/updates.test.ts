@@ -54,6 +54,7 @@ const {
   $updateOverlayTarget,
   requestActiveUpdate,
   resetUpdateApplyState,
+  startActiveUpdate,
   startUpdatePoller,
   stopUpdatePoller,
   $updateStatus
@@ -139,6 +140,9 @@ describe('reportBackendContract', () => {
     storage.clear()
     notifySpy.mockClear()
     dismissSpy.mockClear()
+    // Both toast actions route through startUpdateFor(), which no-ops while an
+    // apply is in flight — start each case from a clean apply state.
+    resetUpdateApplyState()
     vi.useRealTimers()
   })
 
@@ -186,6 +190,273 @@ describe('reportBackendContract', () => {
     reportBackendContract(6) // backend updated → satisfied, snooze cleared
     reportBackendContract(5) // a later regression must warn immediately
     expect(notifySpy).toHaveBeenCalledTimes(1)
+  })
+
+  // FAIL-BEFORE: only the backend-behind direction was detected. A backend that
+  // moved PAST this build's contract (packaged app against an updated remote)
+  // silently dismissed the skew toast and warned about nothing at all.
+  it('warns that the DESKTOP APP is behind when the backend is ahead of the contract', () => {
+    reportBackendContract(7)
+
+    expect(notifySpy).toHaveBeenCalledTimes(1)
+    expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({
+      id: 'app-version-skew',
+      kind: 'warning',
+      title: 'Desktop app out of date'
+    })
+    // The opposite-direction warning must not linger.
+    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
+  })
+
+  it('offers the local desktop update — not the backend one — for the reverse skew', async () => {
+    const applyClientMock = vi.fn().mockResolvedValue({ ok: true, handedOff: true })
+
+    ;(globalThis as unknown as { window: unknown }).window = {
+      hermesDesktop: { updates: { apply: applyClientMock } }
+    }
+
+    try {
+      reportBackendContract(7)
+
+      const toast = notifySpy.mock.calls[0]?.[0] as { action: { label: string; onClick: () => void } }
+      expect(toast.action.label).toBe('Update desktop app')
+
+      toast.action.onClick()
+      await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled())
+      expect(updateHermesSpy).not.toHaveBeenCalled()
+      // The overlay must be up for it: manual/guiSkew/error all land in the
+      // apply store, and a closed dialog would swallow them silently.
+      expect($updateOverlayOpen.get()).toBe(true)
+      expect($updateOverlayTarget.get()).toBe('client')
+    } finally {
+      resetUpdateApplyState()
+      $updateOverlayOpen.set(false)
+      delete (globalThis as unknown as { window?: unknown }).window
+    }
+  })
+
+  it('clears BOTH skew toasts on an exact contract match', () => {
+    reportBackendContract(6)
+
+    expect(notifySpy).not.toHaveBeenCalled()
+    expect(dismissSpy).toHaveBeenCalledWith('backend-contract-skew')
+    expect(dismissSpy).toHaveBeenCalledWith('app-version-skew')
+  })
+
+  // The two directions must own separate snooze slots: reusing one meant
+  // closing the app-skew toast also silenced a later backend-skew warning.
+  it('snoozes each direction independently', () => {
+    reportBackendContract(7)
+    lastToast().onDismiss() // user closes the app-skew toast → its cooldown starts
+    notifySpy.mockClear()
+
+    reportBackendContract(7) // still ahead, still snoozed
+    expect(notifySpy).not.toHaveBeenCalled()
+
+    reportBackendContract(1) // opposite direction is a different slot — must warn
+    expect(notifySpy).toHaveBeenCalledTimes(1)
+    expect(notifySpy.mock.calls[0]?.[0]).toMatchObject({ id: 'backend-contract-skew' })
+  })
+
+  it('clears the app-skew snooze once the desktop build catches up', () => {
+    reportBackendContract(7)
+    lastToast().onDismiss()
+    notifySpy.mockClear()
+
+    reportBackendContract(6) // app rebuilt against the current contract
+    reportBackendContract(7) // a later regression must warn immediately
+    expect(notifySpy).toHaveBeenCalledTimes(1)
+  })
+})
+
+// Remote mode is a two-stage update: backend first, then the desktop client
+// that talks to it. Updating only one half is the exact skew the contract
+// warning above exists to complain about.
+describe('startActiveUpdate in remote mode', () => {
+  const applyClientMock = vi.fn()
+  const checkClientMock = vi.fn()
+  let overlayAtClientApply: { open: boolean; target: string } | null = null
+  // Every distinct value $updateOverlayOpen takes, in order. nanostores only
+  // notifies on change, so a stage-one close followed by a stage-two reopen
+  // shows up here as an extra false/true pair.
+  let overlayOpenTransitions: boolean[] = []
+  let unsubscribeOverlay: (() => void) | null = null
+
+  // Real timers + a real macrotask: enough for every queued microtask (the
+  // stage-one .then chain) to have run, so "X was never called" means it.
+  const flush = () => new Promise(resolve => globalThis.setTimeout(resolve, 50))
+
+  beforeEach(() => {
+    storage.clear()
+    notifySpy.mockClear()
+    dismissSpy.mockClear()
+    overlayAtClientApply = null
+    applyClientMock.mockReset().mockImplementation(() => {
+      overlayAtClientApply = { open: $updateOverlayOpen.get(), target: $updateOverlayTarget.get() }
+
+      return Promise.resolve({ ok: true, handedOff: true })
+    })
+    checkClientMock.mockReset().mockResolvedValue(status({ behind: 0 }))
+    updateHermesSpy.mockReset().mockResolvedValue({ ok: true, name: 'hermes-update', pid: 1 })
+    getActionStatusSpy.mockReset().mockResolvedValue({
+      exit_code: 0,
+      lines: ['=== hermes-update started now ===', '✓ Update complete!'],
+      name: 'hermes-update',
+      pid: 1,
+      running: false
+    })
+    checkHermesUpdateSpy.mockReset().mockResolvedValue({
+      behind: 0,
+      can_apply: true,
+      commits: [],
+      current_version: '0.17.0',
+      install_method: 'git',
+      message: null,
+      update_available: false,
+      update_command: null
+    })
+    resetUpdateApplyState()
+    $updateStatus.set(null)
+    $backendUpdateStatus.set(null)
+    $updateOverlayOpen.set(false)
+    $updateOverlayTarget.set('client')
+    ;(globalThis as unknown as { window: unknown }).window = {
+      hermesDesktop: { updates: { apply: applyClientMock, check: checkClientMock } }
+    }
+    overlayOpenTransitions = []
+    unsubscribeOverlay = $updateOverlayOpen.subscribe(open => overlayOpenTransitions.push(open))
+    vi.useRealTimers()
+  })
+
+  afterEach(async () => {
+    await vi.waitFor(() => expect($backendUpdateApply.get().applying).toBe(false), { timeout: 5000 })
+    unsubscribeOverlay?.()
+    unsubscribeOverlay = null
+    setRemote(false)
+    delete (globalThis as unknown as { window?: unknown }).window
+  })
+
+  // One Update action, both halves: updating only the backend left it serving
+  // an old GUI — the exact skew reportBackendContract then complains about.
+  it('rebuilds the local client after the backend update succeeds', async () => {
+    setRemote(true)
+
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    expect(updateHermesSpy).toHaveBeenCalledTimes(1)
+  })
+
+  // FAIL-BEFORE: finishBackendApply() closed the overlay on success, so stage
+  // two ran behind a closed dialog — no progress, then a surprise relaunch.
+  // Stage one now hands the overlay off instead (chainClientUpdate), so it must
+  // never dip closed: a close→reopen would unmount/remount the Radix dialog.
+  it('hands the overlay straight to stage two without closing it', async () => {
+    setRemote(true)
+
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    expect(overlayAtClientApply).toEqual({ open: true, target: 'client' })
+    // Initial false (beforeEach) then one open — no close/reopen pair between.
+    expect(overlayOpenTransitions).toEqual([false, true])
+  })
+
+  // finishBackendApply's re-checks are for a STANDALONE backend update. On the
+  // chained path they would race stage two: maybeNotifyUpdateAvailable can fire
+  // an "update ready" toast in the gap before applyUpdates flips `applying`.
+  it('skips the stage-one re-checks that would race stage two', async () => {
+    setRemote(true)
+
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    await flush()
+    // handedOff: the app is relaunching, so nothing needs re-checking at all.
+    expect(checkClientMock).not.toHaveBeenCalled()
+    expect(checkHermesUpdateSpy).not.toHaveBeenCalled()
+  })
+
+  // ...but if stage two lands on a terminal state instead of relaunching, this
+  // session keeps running and the backend pill would still advertise the update
+  // that was just applied.
+  it('refreshes the backend status when stage two ends without a relaunch', async () => {
+    setRemote(true)
+    applyClientMock.mockResolvedValue({ ok: false, error: 'apply-failed', message: 'rebuild failed' })
+
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(checkHermesUpdateSpy).toHaveBeenCalled(), { timeout: 5000 })
+  })
+
+  it('does not touch the client when the backend update fails', async () => {
+    setRemote(true)
+    updateHermesSpy.mockResolvedValue({ ok: false, message: 'not available', update_command: 'hermes update' })
+
+    startActiveUpdate()
+
+    // Wait for stage one to reach its terminal state, then let the chained
+    // .then run — without the result.ok gate the client apply lands here.
+    await vi.waitFor(() => expect($backendUpdateApply.get().stage).toBe('manual'), { timeout: 5000 })
+    await flush()
+
+    expect(applyClientMock).not.toHaveBeenCalled()
+    expect($updateOverlayTarget.get()).toBe('backend')
+  })
+
+  // ingestProgress marks 'restart' terminal (applying: false) while the app is
+  // mid-relaunch and the overlay still spins. A toast action firing here would
+  // hit the main process's "update already in progress" and paint an error over
+  // a perfectly healthy update.
+  it('stays out of the way while a handed-off update is restarting', () => {
+    setRemote(false)
+    $updateApply.set({ ...$updateApply.get(), applying: false, stage: 'restart' })
+
+    startActiveUpdate()
+
+    expect(applyClientMock).not.toHaveBeenCalled()
+  })
+
+  it('updates only the local client in local mode', async () => {
+    setRemote(false)
+
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    expect(updateHermesSpy).not.toHaveBeenCalled()
+    expect(overlayAtClientApply).toEqual({ open: true, target: 'client' })
+  })
+
+  // The backend stage runs for minutes with "Update now" still visible and
+  // enabled (About's gate reads the CLIENT apply state, which stays idle
+  // throughout). Without a guard each extra click stacks another .then on the
+  // deduped backend promise, so one backend update fans out into N client
+  // applies — the losers come back "update already in progress" and strand the
+  // overlay on an error banner while the real update is still running.
+  it('ignores repeat clicks while an update is already running', async () => {
+    setRemote(true)
+
+    startActiveUpdate()
+    startActiveUpdate()
+    startActiveUpdate()
+
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    expect(updateHermesSpy).toHaveBeenCalledTimes(1)
+    expect(applyClientMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('lets the backend-out-of-date toast run the same aligned update', async () => {
+    setRemote(true)
+    notifySpy.mockClear()
+
+    reportBackendContract(1)
+    const toast = notifySpy.mock.calls[0]?.[0] as { action: { onClick: () => void } }
+    toast.action.onClick()
+
+    // Not just applyBackendUpdate(): "update to align them" has to move both
+    // halves, or the toast re-fires the moment the backend passes contract 6.
+    await vi.waitFor(() => expect(applyClientMock).toHaveBeenCalled(), { timeout: 5000 })
+    expect(updateHermesSpy).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -319,13 +590,15 @@ describe('requestActiveUpdate', () => {
     expect($updateOverlayTarget.get()).toBe('client')
   })
 
-  it('applies the BACKEND update in remote mode', async () => {
+  it('applies the BACKEND update FIRST in remote mode', async () => {
     setRemote(true)
     $backendUpdateStatus.set(status({ behind: 3 }))
 
     requestActiveUpdate()
     await vi.waitFor(() => expect(updateHermesSpy).toHaveBeenCalled())
 
+    // Not "never" — remote mode chains the client rebuild once the backend
+    // lands (see the startActiveUpdate suite). It just must not lead with it.
     expect(applyClientMock).not.toHaveBeenCalled()
     expect($updateOverlayTarget.get()).toBe('backend')
   })

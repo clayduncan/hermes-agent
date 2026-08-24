@@ -131,7 +131,7 @@ export const ja = defineLocale({
       'Hermes バックエンドがこのデスクトップビルドより古く、正常に動作しない場合があります。更新して揃えてください。',
     appOutOfDateTitle: 'デスクトップアプリが古いです',
     appOutOfDateMessage:
-      'リモートバックエンドはこのデスクトップビルドより新しくなっています。最新の機能を使うためにデスクトップアプリを更新してください。',
+      'Hermes バックエンドがこのデスクトップビルドより新しく、正常に動作しない場合があります。デスクトップアプリを更新して揃えてください。',
     installMethodUnsupportedTitle: 'サポート対象外のインストール方法',
     updateHermes: 'Hermes を更新',
     updateDesktopApp: 'デスクトップアプリを更新',

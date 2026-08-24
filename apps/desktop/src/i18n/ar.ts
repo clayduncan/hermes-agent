@@ -115,7 +115,8 @@ export const ar = defineLocale({
     backendOutOfDateTitle: 'الخلفية قديمة',
     backendOutOfDateMessage: 'خلفية Hermes أقدم من إصدار سطح المكتب الحالي وقد لا تعمل كما يجب. حدثهما ليتوافقا.',
     appOutOfDateTitle: 'تطبيق سطح المكتب قديم',
-    appOutOfDateMessage: 'الخلفية البعيدة أحدث من هذا الإصدار من تطبيق سطح المكتب. حدّث التطبيق للحصول على أحدث الميزات والبقاء متزامناً.',
+    appOutOfDateMessage:
+      'خلفية Hermes أحدث من إصدار سطح المكتب الحالي وقد لا يعمل كما يجب. حدّث تطبيق سطح المكتب ليتوافقا.',
     updateHermes: 'تحديث Hermes',
     updateDesktopApp: 'تحديث تطبيق سطح المكتب',
     updateReadyTitle: 'التحديث جاهز',
