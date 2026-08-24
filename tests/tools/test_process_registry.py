@@ -2713,3 +2713,195 @@ class TestGetByPrefix:
         result = registry.poll("4dae56ca")
         assert result["session_id"] == "proc_4dae56ca81f6"
         assert result["status"] == "running"
+
+
+# =========================================================================
+# Non-PTY false-exit regression (#process-registry-false-exit)
+#
+# The defect: _reader_loop reached stdout EOF, called
+#   session.process.wait(timeout=5), ignored the TimeoutExpired, and then
+#   set session.exited=True / exit_code=None even when the child was still
+#   alive.  The completion notification fired before real process exit.
+#
+# The fix: wait() without a timeout so the session is only finalised once
+# the child actually exits or is explicitly killed.
+# =========================================================================
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX: uses os.close(1)")
+class TestNonPtyFalseExitFix:
+    """Regression suite for the non-PTY false-exit defect in _reader_loop."""
+
+    # Child: emit startup marker via raw os.write (bypasses Python buffering),
+    # close stdout fd (pipe gets EOF while process stays alive), wait for a
+    # signal file, then _exit with the requested code.
+    # os.write + os.close avoids TextIOWrapper state confusion after closing fd 1.
+    # os._exit skips Python cleanup (which would try to flush the closed fd 1).
+    # Newlines required: Python forbids compound statements after a semicolon.
+    _CHILD_WITH_SIGNAL = (
+        "import sys, os, time\n"
+        "os.write(1, b'started\\n')\n"
+        "os.close(1)\n"
+        "while not os.path.exists(sys.argv[1]):\n"
+        "    time.sleep(0.05)\n"
+        "os._exit(int(sys.argv[2]))\n"
+    )
+
+    def _spawn_child(self, tmp_path, exit_code: int):
+        signal_file = str(tmp_path / f"exit_signal_{exit_code}")
+        proc = subprocess.Popen(
+            [sys.executable, "-c", self._CHILD_WITH_SIGNAL,
+             signal_file, str(exit_code)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+        )
+        return proc, signal_file
+
+    def _register(self, registry, proc, notify=True):
+        s = _make_session(sid=f"proc_fex_{proc.pid}")
+        s.process = proc
+        s.pid = proc.pid
+        s.notify_on_complete = notify
+        registry._running[s.id] = s
+        return s
+
+    def _start_reader(self, registry, session):
+        done = threading.Event()
+
+        def _run():
+            registry._reader_loop(session)
+            done.set()
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t, done
+
+    def test_session_stays_running_after_stdout_eof_and_exits_with_real_code(
+        self, registry, tmp_path
+    ):
+        """Core regression.
+
+        Child closes stdout while remaining alive; session must stay in
+        _running (not _finished) past the old 5-second wait() threshold.
+        After the child is signalled to exit normally the real exit code (42)
+        must be recorded and exactly one completion event queued.
+        """
+        proc, signal_file = self._spawn_child(tmp_path, exit_code=42)
+        s = self._register(registry, proc)
+        t, done = self._start_reader(registry, s)
+
+        try:
+            # Wait for child to emit marker (stdout is still open at this point)
+            assert _wait_until(lambda: "started" in s.output_buffer, timeout=5.0), (
+                "Child did not emit startup marker"
+            )
+
+            # Allow reader thread to detect stdout EOF and enter wait()
+            time.sleep(0.4)
+
+            # --- session must still be live -----------------------------------
+            assert not s.exited, (
+                "session.exited is True before child exit — "
+                "false-exit regression: reader finalised on stdout EOF"
+            )
+            assert s.id in registry._running, "Session not in _running after stdout EOF"
+            assert s.id not in registry._finished, "Session moved to _finished prematurely"
+            assert s.exit_code is None, f"exit_code set before real exit: {s.exit_code!r}"
+            assert registry.completion_queue.empty(), (
+                "Completion event queued before real child exit"
+            )
+
+            # Hold past the old 5-second wait() timeout.  With the old code the
+            # session would be falsely exited (exit_code=None) inside this window.
+            time.sleep(6)
+            assert not s.exited, "False exit occurred after old 5-second wait window"
+            assert s.id in registry._running
+            assert registry.completion_queue.empty(), (
+                "Completion event queued during post-EOF live period"
+            )
+
+            # Signal child to exit with the non-zero code
+            open(signal_file, "w").close()
+
+            assert done.wait(timeout=5.0), (
+                "_reader_loop did not return after child exit"
+            )
+
+            # --- session correctly finalised ----------------------------------
+            assert s.exited is True
+            assert s.exit_code == 42, f"Expected exit_code=42, got {s.exit_code!r}"
+            assert s.completion_reason == "exited"
+            assert s.id in registry._finished
+            assert s.id not in registry._running
+
+            # --- exactly one completion notification --------------------------
+            assert not registry.completion_queue.empty(), "No completion event queued"
+            item = registry.completion_queue.get_nowait()
+            assert item["type"] == "completion"
+            assert item["session_id"] == s.id
+            assert item["exit_code"] == 42
+            assert registry.completion_queue.empty(), (
+                "Duplicate completion event (expected exactly one)"
+            )
+        finally:
+            open(signal_file, "w").close()   # unblock child if still alive
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            t.join(timeout=2.0)
+
+    def test_kill_after_stdout_eof_records_killed_reason_no_duplicate(
+        self, registry, tmp_path
+    ):
+        """kill_process() while the reader is blocked in wait() must finalise
+        the session once; no duplicate completion event.
+
+        The session object's completion_reason ends up as 'killed' regardless
+        of which thread wins the finalization race — kill_process() always
+        overwrites the session field.  The event in the queue may carry either
+        'killed' or 'exited' (SIGTERM returncode) depending on which thread
+        runs _move_to_finished first; the test verifies the session state and
+        duplicate-event guard rather than pinning the event's reason field.
+        """
+        proc, signal_file = self._spawn_child(tmp_path, exit_code=0)
+        s = self._register(registry, proc)
+        t, done = self._start_reader(registry, s)
+
+        try:
+            assert _wait_until(lambda: "started" in s.output_buffer, timeout=5.0), (
+                "Child did not emit startup marker"
+            )
+            time.sleep(0.4)   # let reader enter the indefinite wait()
+
+            # Kill while reader is blocking — process receives SIGTERM/SIGKILL
+            result = registry.kill_process(s.id)
+            assert result["status"] == "killed", result
+
+            # Reader must return once kill signal causes child to exit
+            assert done.wait(timeout=5.0), "_reader_loop blocked after kill"
+
+            # kill_process() always writes completion_reason="killed" to the
+            # session object (even if the reader finalized first and the queue
+            # event carries "exited").
+            assert s.exited is True
+            assert s.completion_reason == "killed"
+            assert s.id in registry._finished
+            assert s.id not in registry._running
+
+            # _move_to_finished is idempotent — whichever thread wins the
+            # race enqueues one event; the other's call is a no-op.
+            evt_count = 0
+            while not registry.completion_queue.empty():
+                registry.completion_queue.get_nowait()
+                evt_count += 1
+            assert evt_count <= 1, (
+                f"Expected at most one completion event, got {evt_count} "
+                "(duplicate finalization detected)"
+            )
+        finally:
+            open(signal_file, "w").close()
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            t.join(timeout=2.0)

@@ -1437,11 +1437,18 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # Reap the child.  stdout reaching EOF does NOT guarantee the child
+            # has exited — a non-PTY process can close its stdout fd while
+            # remaining alive (e.g. a daemon that redirects output to a log
+            # file after startup).  The old wait(timeout=5) + ignore-timeout
+            # pattern would finalise the session with exit_code=None and fire
+            # the completion notification before real process exit.  Block here
+            # until the child actually exits; kill_process() escalates to
+            # SIGKILL so the child always exits eventually.
             try:
-                session.process.wait(timeout=5)
+                session.process.wait()
             except Exception as e:
-                logger.debug("Process wait timed out or failed: %s", e)
+                logger.debug("Process wait failed: %s", e)
             session.exited = True
             if session.completion_reason != "killed":
                 session.exit_code = session.process.returncode
