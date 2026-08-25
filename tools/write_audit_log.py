@@ -63,6 +63,7 @@ MSGRAPH_TASKS = "msgraph_tasks"
 GHL_CONTACTS = "ghl_contacts"
 CALENDLY_BOOKINGS = "calendly_bookings"
 MSGRAPH_CALENDAR_EVENTS = "msgraph_calendar_events"
+EXCH_ONLINE_CONFIG = "exch_online_config"
 
 #: Destinations this log understands.  Extend when a new record type is wired up.
 KNOWN_DESTINATIONS: tuple[str, ...] = (
@@ -71,6 +72,7 @@ KNOWN_DESTINATIONS: tuple[str, ...] = (
     GHL_CONTACTS,
     CALENDLY_BOOKINGS,
     MSGRAPH_CALENDAR_EVENTS,
+    EXCH_ONLINE_CONFIG,
 )
 
 KNOWN_OPERATIONS: tuple[str, ...] = ("create", "update", "delete")
