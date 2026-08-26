@@ -1,0 +1,10 @@
+name: team_duncan_contacts
+version: 1.0.0
+description: "Clay-approved Team Duncan contact activation registry (OPS-72)"
+author: "Team Duncan / Zippy"
+kind: standalone
+platforms: [linux, macos]
+
+provides_tools:
+  - prepare_activation
+  - confirm_activation
