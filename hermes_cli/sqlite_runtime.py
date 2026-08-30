@@ -14,6 +14,52 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+_SHELL_NAMES = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+
+
+def _is_recursive_shell_launcher(executable: Path) -> bool:
+    """Return True if *executable* is a shell script whose exec target is itself."""
+    try:
+        with executable.open("rb") as fh:
+            header = fh.read(4096)
+    except OSError:
+        return False
+    if not header.startswith(b"#!"):
+        return False
+    try:
+        text = header.decode("ascii", errors="replace")
+    except Exception:
+        return False
+    lines = text.splitlines()
+    if not lines:
+        return False
+    shebang_parts = lines[0][2:].split()
+    interp_name = Path(shebang_parts[0]).name if shebang_parts else ""
+    if interp_name == "env":
+        interp_name = shebang_parts[1] if len(shebang_parts) > 1 else ""
+    if interp_name not in _SHELL_NAMES:
+        return False
+    try:
+        canonical = executable.resolve()
+    except OSError:
+        return False
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped.startswith("exec "):
+            continue
+        parts = stripped.split()
+        if len(parts) < 2:
+            continue
+        exec_arg = parts[1]
+        if not exec_arg.startswith("/"):
+            continue
+        try:
+            if Path(exec_arg).resolve() == canonical:
+                return True
+        except OSError:
+            continue
+    return False
+
 
 def _version_tuple(parts: Iterable[object]) -> tuple[int, int, int]:
     values = [int(part) for part in parts]
@@ -86,6 +132,8 @@ def probe_sqlite_runtime(
     data.  The child runs isolated from inherited Python path overrides.
     """
     executable = Path(python)
+    if _is_recursive_shell_launcher(executable):
+        return None
     env = dict(os.environ)
     for key in (
         "CONDA_DEFAULT_ENV",

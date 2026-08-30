@@ -54,6 +54,29 @@ def test_probe_reports_the_requested_interpreters_linked_sqlite() -> None:
     assert info.sqlite_source_id == source_id
 
 
+@pytest.mark.skipif(os.name == "nt", reason="shell launchers are a POSIX concept")
+def test_recursive_shell_launcher_rejected_without_spawning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    launcher = tmp_path / "python3"
+    launcher.write_text(
+        f"#!/bin/bash\nexec {launcher} \"$@\"\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+
+    def _must_not_spawn(*args: object, **kwargs: object) -> object:
+        raise AssertionError("subprocess.run must not be called for a recursive shell launcher")
+
+    import subprocess as _subprocess
+    monkeypatch.setattr(_subprocess, "run", _must_not_spawn)
+
+    result = probe_sqlite_runtime(launcher)
+
+    assert result is None
+
+
 @pytest.mark.skipif(os.name == "nt", reason="uses a POSIX executable probe stub")
 def test_probe_uses_child_payload_and_sanitizes_python_environment(
     tmp_path: Path,
