@@ -579,8 +579,17 @@ def _export_dump_excluding_session_vars(
         # would make the FIRST command's value override a later outer
         # harness value arriving via the process env, exactly like the
         # session-var leak this dump already guards against.
+        #
+        # HERMES_DELEGATED_CHILD_CONTEXT is a per-command lineage marker
+        # injected into the subprocess env by _scrub_delegated_child_kanban_env
+        # (via scrub_kanban_env) during delegate_task child execution.  It must
+        # not persist into the shared snapshot: one long-lived LocalEnvironment
+        # backend is shared across normal parent and delegated-child task IDs in
+        # default shared-container mode.  A marker left in the snapshot would be
+        # sourced by the next parent command, making it appear to run inside a
+        # delegated child and triggering incorrect Kanban-mutation denials.
         "AI_AGENT HERMES_AGENT "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID HERMES_DELEGATED_CHILD_CONTEXT{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
