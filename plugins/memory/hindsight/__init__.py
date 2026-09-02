@@ -1815,7 +1815,10 @@ class HindsightMemoryProvider(MemoryProvider):
                     profile_env = _embedded_profile_env_path(self._config)
                     expected_env = _build_embedded_profile_env(self._config)
                     saved = _load_simple_env(profile_env)
-                    config_changed = saved != expected_env
+                    # Compare only keys owned by Hermes. Manager-owned keys
+                    # (e.g. HINDSIGHT_API_PORT) in the saved file do not count
+                    # as drift; missing or changed Hermes-owned keys do.
+                    config_changed = {k: saved.get(k) for k in expected_env} != expected_env
 
                     if config_changed:
                         profile_env = _materialize_embedded_profile_env(self._config)
