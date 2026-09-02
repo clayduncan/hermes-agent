@@ -1250,6 +1250,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._idle_timeout = idle_timeout
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
+                # Known debt: couples Hermes to the private _manager interface of
+                # DaemonEmbedManager. Accepted pending upstream contribution evaluation.
+                _mgr = getattr(self._client, "_manager", None)
+                if _mgr is not None and hasattr(_mgr, "get_url"):
+                    from .is_running_telemetry import install as _install_is_running_telemetry
+                    _install_is_running_telemetry(_mgr)
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
