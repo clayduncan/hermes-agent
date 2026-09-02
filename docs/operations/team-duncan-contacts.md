@@ -24,10 +24,11 @@ never cross into agent-visible inputs, outputs, logs, or stored state.
 | Plugin code | `plugins/team_duncan_contacts/` (in git) |
 | Runtime state | `$HERMES_HOME/plugin-data/team_duncan_contacts/registry.json` |
 | HMAC key | `$HERMES_HOME/plugin-data/team_duncan_contacts/hmac_key` |
+| **Activity ledger** | `$HERMES_HOME/plugin-data/team_duncan_contacts/activity.db` |
 | Plugin data root | `$HERMES_HOME/plugin-data/team_duncan_contacts/` |
 
 Runtime PII and registry state belong outside git. The plugin code and tests
-belong in git. Never commit `registry.json` or `hmac_key`.
+belong in git. Never commit `registry.json`, `hmac_key`, or `activity.db`.
 
 ---
 
@@ -84,11 +85,25 @@ added in this build. Backup the data directory, including:
 
 - `registry.json`: contacts, HMAC indexes, history, lifecycle state
 - `hmac_key`: required to resolve events after restore
+- `activity.db`: the contact activity ledger (WAL mode; covered by `hermes backup`)
 
 A restore without the `hmac_key` file leaves existing contacts unresolvable.
 The key must be restored alongside the state file with mode `0600`.
 
 **Do not add a new backup job.** The existing backup system covers this path.
+
+### Activity Ledger Online Backup (OPS-74)
+
+```python
+from plugins.team_duncan_contacts import activity_ledger
+activity_ledger.backup(Path("/path/to/backup.db"))
+```
+
+`backup()` uses SQLite online backup (WAL-safe, works with open connections).
+`dest_path` must not already exist. The live ledger is never cleared or replaced
+in place by any API method. To restore: validate a backup copy in a throwaway
+`ActivityLedger` instance, then replace the live file at the OS level after
+stopping the agent.
 
 ---
 

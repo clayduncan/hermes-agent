@@ -23,6 +23,10 @@ log = logging.getLogger(__name__)
 
 _PLUGIN_NAME = "team_duncan_contacts"
 
+# Module-level ledger instance, set by register() at plugin load time.
+# Internal Python API only; not agent-facing.
+activity_ledger = None
+
 
 def _load_location_id() -> str:
     """Read the Team Duncan location ID from config.yaml.
@@ -161,6 +165,17 @@ def register(ctx) -> None:
             type(exc).__name__,
         )
         return
+
+    from .activity_ledger import ActivityLedger
+    import plugins.team_duncan_contacts as _self
+
+    data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    _self.activity_ledger = ActivityLedger(data_dir / "activity.db", registry)
+    log.info(
+        "team_duncan_contacts: activity ledger initialised at %s.",
+        data_dir / "activity.db",
+    )
 
     prepare_handler = make_prepare_handler(registry, ghl_reader)
     confirm_handler = make_confirm_handler(registry)
