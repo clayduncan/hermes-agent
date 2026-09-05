@@ -190,10 +190,23 @@ hindsight = ["hindsight-client==0.6.1"]
 # Declared here so the dependency is reproducible, not incidental. Pinned to the
 # exact versions verified working on 2026-08-16; keep in sync with
 # ~/.hermes/hindsight-local-requirements.txt (used by the repair path).
+#
+# fastmcp==4.0.3 (added 2026-09-05, verified working): hindsight_api.extensions
+# imports fastmcp, which had been resolving to the latest 3.x release
+# (fastmcp-slim[client,server] capped at mcp<2.0) in this venv. That collided
+# with the mcp==2.0.0 pin the main project's [mcp]/[computer-use]/[dev] extras
+# require in the same venv, so `from mcp.server.lowlevel.server import
+# request_ctx` raised ImportError (that symbol was redesigned out of mcp 2.x),
+# which fastmcp masked as "FastMCP server support is not installed" and the
+# daemon supervisor turned into a silent idle-timeout respawn loop that never
+# bound the port. fastmcp 4.0.3's fastmcp-slim requires mcp>=2.0.0,<3.0.0 —
+# compatible with the mcp==2.0.0 pin below — so pinning it explicitly here
+# closes the gap that let the two extras drift apart with nothing to catch it.
 hindsight-local = [
   "hindsight-all==0.9.1",
   "hindsight-api-slim==0.9.1",
   "hindsight-embed==0.9.1",
+  "fastmcp==4.0.3",
   "sentence-transformers==5.7.0",
   "torch==2.13.0",
   "transformers==5.15.0",
@@ -416,6 +429,14 @@ exclude-newer = "14 days"
 # transformers 5.15.0 (2026-08-10) — all inside the 14-day window at fix time (2026-08-16);
 # all verified working by hand before this override was added.
 #
+# fastmcp, fastmcp-slim: published 2026-09-05 (fix time), inside the 14-day
+# window. fastmcp==4.0.3 depends on the separate fastmcp-slim distribution
+# (also published 2026-09-05), so both need the exception. Pinned to resolve
+# the fastmcp/mcp 2.0.0 ImportError in hindsight-local (see the pin comment
+# above); verified by hand that fastmcp-slim==4.0.3 declares
+# `mcp<3.0.0,>=2.0.0`, satisfying the mcp==2.0.0 pin, before this override
+# was added.
+#
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,
 # request-smuggling) fix in 4.4.1, published 2026-08-03. Remove after 2026-08-17.
 # aiohttp, cryptography: same shape — the advisory fixes are newer than the
@@ -440,7 +461,7 @@ exclude-newer = "14 days"
 # cutoff can still brick installs. Exempting exact pins is pure brick-risk
 # removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, hindsight-all = false, hindsight-api-slim = false, hindsight-embed = false, sentence-transformers = false, transformers = false }
+exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false, hindsight-all = false, hindsight-api-slim = false, hindsight-embed = false, sentence-transformers = false, transformers = false, fastmcp = false, fastmcp-slim = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's

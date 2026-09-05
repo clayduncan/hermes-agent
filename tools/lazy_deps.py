@@ -197,10 +197,19 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # versions verified working on 2026-08-16; keep in sync with the
     # `hindsight-local` extra in pyproject.toml. Installed on demand by
     # plugins/memory/hindsight/__init__.py when the packages are missing.
+    #
+    # fastmcp==4.0.3 (added 2026-09-05): hindsight_api.extensions imports
+    # fastmcp, whose latest 3.x releases cap fastmcp-slim at mcp<2.0 — a
+    # straight conflict with the mcp==2.0.0 pin the [mcp]/[computer-use]
+    # extras require in the same venv (`request_ctx` ImportError, masked by
+    # fastmcp as "FastMCP server support is not installed", which silently
+    # loops the daemon supervisor). fastmcp-slim==4.0.3 declares
+    # `mcp<3.0.0,>=2.0.0`, so pinning fastmcp here explicitly closes that gap.
     "memory.hindsight_local": (
         "hindsight-all==0.9.1",
         "hindsight-api-slim==0.9.1",
         "hindsight-embed==0.9.1",
+        "fastmcp==4.0.3",
         "sentence-transformers==5.7.0",
         "torch==2.13.0",
         "transformers==5.15.0",

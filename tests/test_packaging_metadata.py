@@ -346,6 +346,72 @@ _REQUIRED_SECURITY_PINS = {
 }
 
 
+# fastmcp 3.x's fastmcp-slim hard-caps `mcp<2.0`, which conflicts with the
+# mcp==2.0.0 pin required by the [mcp]/[computer-use]/[dev] extras in the same
+# venv: hindsight_api.extensions imports fastmcp, which imports a symbol mcp
+# 2.0.0 removed, raising an ImportError that silently loops the Hindsight
+# local-embedded daemon's supervisor instead of binding its port. fastmcp
+# 4.0.0+ dropped that cap (fastmcp-slim declares `mcp<3.0.0,>=2.0.0`), so the
+# fix is pinning fastmcp>=4 in hindsight-local. This floor guards against a
+# future edit re-pinning fastmcp back into the 3.x range.
+_FASTMCP_MCP2_COMPAT_FLOOR = (4, 0, 0)
+
+
+def test_hindsight_local_pins_fastmcp_compatible_with_mcp2():
+    """Regression guard for the fastmcp/mcp 2.0.0 ImportError (daemon down
+    2026-08-02 to 2026-09-05).
+
+    `hindsight-local` must exact-pin fastmcp at a version whose fastmcp-slim
+    dependency accepts mcp>=2.0 (i.e. >=4.0.0), and the pin must be mirrored
+    in `tools/lazy_deps.py`'s `memory.hindsight_local` entry — otherwise a
+    fresh eager install and a lazy-installed one diverge on whether the
+    daemon can even start.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    hindsight_local = data["project"]["optional-dependencies"]["hindsight-local"]
+
+    pyproject_pin = _pins_from_specs(hindsight_local).get("fastmcp")
+    assert pyproject_pin, "[hindsight-local] must exact-pin fastmcp"
+    assert len(pyproject_pin) == 1, f"fastmcp pinned to multiple versions in [hindsight-local]: {pyproject_pin}"
+    pyproject_version = next(iter(pyproject_pin))
+    assert _version_tuple(pyproject_version) >= _FASTMCP_MCP2_COMPAT_FLOOR, (
+        f"[hindsight-local] pins fastmcp=={pyproject_version}, below the "
+        f"mcp-2.x-compatible floor {'.'.join(map(str, _FASTMCP_MCP2_COMPAT_FLOOR))} "
+        "(fastmcp<4 hard-caps fastmcp-slim's mcp dependency at <2.0)"
+    )
+
+    by_feature = _lazy_deps_by_feature()
+    lazy_specs = by_feature.get("memory.hindsight_local")
+    assert lazy_specs is not None, "LAZY_DEPS must still declare memory.hindsight_local"
+    lazy_pin = _pins_from_specs(lazy_specs).get("fastmcp")
+    assert lazy_pin == pyproject_pin, (
+        "LAZY_DEPS['memory.hindsight_local'] fastmcp pin "
+        f"{sorted(lazy_pin) if lazy_pin else 'MISSING'} does not match the "
+        f"[hindsight-local] extra pin {sorted(pyproject_pin)} — a lazy install "
+        "and an eager install of the same feature would land different, "
+        "possibly-incompatible fastmcp versions"
+    )
+
+
+def test_hindsight_pins_unchanged_by_fastmcp_fix():
+    """The fastmcp addition must not disturb the pins it was layered next to.
+
+    mcp stays at 2.0.0 (the version the fastmcp fix targets compatibility
+    with) and the Hindsight 0.9.1 stack stays put — this fix is additive,
+    not a version bump of the packages it was resolving a conflict for.
+    """
+    pins = _pins_from_specs(_pyproject_pinned_specs())
+    assert pins.get("mcp") == {"2.0.0"}, (
+        f"mcp pin changed to {pins.get('mcp')}; the fastmcp/mcp2 fix pins "
+        "fastmcp to accept the existing mcp==2.0.0, not the other way around"
+    )
+    for pkg in ("hindsight-all", "hindsight-api-slim", "hindsight-embed"):
+        assert pins.get(pkg) == {"0.9.1"}, (
+            f"{pkg} pin changed to {pins.get(pkg)}; expected the verified "
+            "0.9.1 pin to remain untouched by the fastmcp fix"
+        )
+
+
 def test_security_pins_present_in_mirrored_lazy_features():
     """Curated security pins must be present (not just version-consistent) in
     every lazy feature that bundles an SDK pulling that package transitively.
