@@ -359,7 +359,7 @@ _FASTMCP_MCP2_COMPAT_FLOOR = (4, 0, 0)
 
 def test_hindsight_local_pins_fastmcp_compatible_with_mcp2():
     """Regression guard for the fastmcp/mcp 2.0.0 ImportError (daemon down
-    2026-08-02 to 2026-09-05).
+    2026-09-02 to 2026-09-05).
 
     `hindsight-local` must exact-pin fastmcp at a version whose fastmcp-slim
     dependency accepts mcp>=2.0 (i.e. >=4.0.0), and the pin must be mirrored
