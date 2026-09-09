@@ -291,6 +291,84 @@ def test_circuit_breaker_backoff_tiers_and_reset(monkeypatch):
     assert circuit.next_allowed_attempt_at == 0.0
 
 
+def test_circuit_stays_latched_open_past_15_minute_window_while_still_dead(monkeypatch):
+    """A second failed automatic attempt latches the circuit open.
+
+    Elapsing the full 15 minute suppression window must not by itself
+    re-authorize a third automatic restart while the daemon is still dead.
+    Only a verified healthy result reopens the path to another attempt.
+    """
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(health_contract.time, "monotonic", lambda: clock["t"])
+    manager = _stub_manager()
+
+    # Incident starts: first dead classification authorizes one attempt.
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d1 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d1.final_bool is False
+    assert d1.reason_code == "restart_authorized"
+
+    # First attempt fails, past its 30s warm-start grace -> 5 minute
+    # suppression opens.
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d2 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d2.final_bool is True
+    assert d2.reason_code == "circuit_open_suppressed"
+
+    # 5 minutes elapse -> second automatic attempt authorized.
+    clock["t"] += 300
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d3 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d3.final_bool is False
+    assert d3.reason_code == "restart_authorized"
+
+    # Second attempt also fails, past its own 30s warm-start grace -> 15
+    # minute suppression, circuit latches open.
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d4 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d4.final_bool is True
+    assert d4.reason_code == "circuit_open_suppressed"
+
+    circuit = health_contract._get_circuit(_PROFILE)
+    assert circuit.circuit_open is True
+
+    # Advance the full 15 minutes plus a large additional margin while the
+    # daemon remains dead. No third automatic restart may be authorized.
+    clock["t"] += 900 + 3600
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d5 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d5.state == health_contract.DEAD
+    assert d5.final_bool is True
+    assert d5.reason_code == "circuit_open_suppressed"
+    assert circuit.attempt_pending is False
+    assert circuit.failure_count == 2
+
+    # Advancing further still keeps it suppressed -- the latch does not
+    # decay with time.
+    clock["t"] += 100000
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d6 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d6.final_bool is True
+    assert d6.reason_code == "circuit_open_suppressed"
+    assert circuit.failure_count == 2
+
+    # Only a verified healthy result reopens the circuit.
+    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    d7 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d7.state == health_contract.HEALTHY
+    assert circuit.circuit_open is False
+    assert circuit.failure_count == 0
+
+    # With the circuit reset, a fresh incident can authorize an attempt
+    # again.
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d8 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d8.final_bool is False
+    assert d8.reason_code == "restart_authorized"
+
+
 # ---------------------------------------------------------------------------
 # Telemetry: sampling, recovery-always-logged, one event per sequence
 # ---------------------------------------------------------------------------

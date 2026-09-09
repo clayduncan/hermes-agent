@@ -15,11 +15,14 @@ and owns the single boolean handed back to
     open. Two confirmed no-listener results, outside any startup activity,
     are required.
 
-A per-profile circuit breaker limits automatic restarts to one attempt per
-incident: a failed attempt suppresses the next one for 5 minutes, a second
-failure opens the circuit at a 15 minute cadence, and a verified healthy
-result resets it. This adapter never kills a process itself -- the existing
-upstream exact listener-PID validation remains the only termination path.
+A per-profile circuit breaker limits automatic restarts to two attempts per
+incident: a failed first attempt suppresses the next one for 5 minutes, and
+a failed second attempt latches the circuit open, suppressing every further
+automatic attempt regardless of elapsed time. Only a verified healthy
+result (or a fresh process, which starts with a clean in-memory circuit)
+reopens the path to another automatic attempt. This adapter never kills a
+process itself -- the existing upstream exact listener-PID validation
+remains the only termination path.
 
 While upstream's own per-profile start lock is held -- the internal startup
 poll loop in ``DaemonEmbedManager._start_daemon_locked`` calls
@@ -106,6 +109,12 @@ class _ProfileCircuit:
         self.attempt_id = NONE_SENTINEL
         self.last_started_seen_at = 0.0
         self.last_healthy_log_at = 0.0
+        # Latched True after the second failed automatic attempt. Unlike
+        # next_allowed_attempt_at, this never clears on its own once the
+        # suppression window elapses -- only a verified healthy result (or
+        # a new process, which starts with a fresh circuit) reopens the
+        # path to an automatic restart attempt.
+        self.circuit_open = False
 
 
 _circuits: dict[str, _ProfileCircuit] = {}
@@ -284,12 +293,13 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
 
     if seq_state == HEALTHY:
         with circuit.lock:
-            recovered = circuit.attempt_pending or circuit.failure_count > 0
+            recovered = circuit.attempt_pending or circuit.failure_count > 0 or circuit.circuit_open
             attempt_id = circuit.attempt_id if circuit.attempt_pending else NONE_SENTINEL
             circuit.attempt_pending = False
             circuit.failure_count = 0
             circuit.next_allowed_attempt_at = 0.0
             circuit.attempt_id = NONE_SENTINEL
+            circuit.circuit_open = False
         force = recovered or len(probes) > 1
         reason = "healthy_recovery" if force else "healthy"
         decision = HealthDecision(
@@ -327,14 +337,17 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
         if circuit.attempt_pending:
             circuit.attempt_pending = False
             circuit.failure_count += 1
-            suppress = (
-                _FIRST_FAILURE_SUPPRESS_SECONDS
-                if circuit.failure_count == 1
-                else _SECOND_FAILURE_SUPPRESS_SECONDS
-            )
+            if circuit.failure_count == 1:
+                suppress = _FIRST_FAILURE_SUPPRESS_SECONDS
+            else:
+                suppress = _SECOND_FAILURE_SUPPRESS_SECONDS
+                # Latch open. Elapsing the suppression window no longer
+                # re-authorizes an automatic attempt on its own -- only a
+                # verified healthy result (or a fresh process) resets this.
+                circuit.circuit_open = True
             circuit.next_allowed_attempt_at = now + suppress
 
-        if now < circuit.next_allowed_attempt_at:
+        if circuit.circuit_open or now < circuit.next_allowed_attempt_at:
             decision = HealthDecision(
                 state=DEAD, final_bool=True, reason_code="circuit_open_suppressed",
                 probes=probes, listener_present=False,
