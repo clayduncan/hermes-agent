@@ -62,6 +62,61 @@ GHL_ACCOUNT_KEYS: tuple[str, ...] = (
     "tracey",
 )
 
+#: The Team Duncan sub-account's fixed identity. Every Team Duncan client must
+#: be built with exactly this pair — see ``scoped_client()`` below.
+TEAM_DUNCAN_ACCOUNT_KEY = "team_duncan"
+TEAM_DUNCAN_LOCATION_ID = "abi5iDumIeysZCvWt99r"
+
+#: account_key -> the one location_id that account is pinned to.  scoped_client()
+#: checks both directions: the named account key must use this location, and no
+#: other account key may claim this location either.  Only Team Duncan needs this
+#: fail-closed guarantee today; accounts with no entry here (chillcabins,
+#: clay_personal, tracey) are unaffected and keep using whatever location_id
+#: their own call sites already pass.
+FIXED_SCOPE_BINDINGS: dict[str, str] = {
+    TEAM_DUNCAN_ACCOUNT_KEY: TEAM_DUNCAN_LOCATION_ID,
+}
+
+
+class ScopeViolationError(ValueError):
+    """A scoped-client boundary would be crossed.
+
+    Raised before any GHL transport request, audit authorization, or audit
+    intent is recorded.  ``scoped_client()`` raises this for a wrong account
+    key or wrong configured location at construction time; the write and read
+    methods on ``GoHighLevelWriteClient`` raise it when a caller payload names
+    a location other than the one the client is scoped to.
+    """
+
+
+def scoped_client(
+    account_key: str, location_id: str, **kwargs: Any
+) -> "GoHighLevelWriteClient":
+    """The one place call-ingestion code should build a GHL client.
+
+    Fails closed — before constructing anything or touching the network — if
+    *account_key*/*location_id* don't match a fixed binding this boundary
+    knows about.  This is the reusable enforcement point behind both reads and
+    writes: every method on the returned client is scoped to *location_id* for
+    the lifetime of the client, so a wrong pairing caught here can never reach
+    a GHL lookup, an audit authorization, an audit intent, or a destination
+    write.
+    """
+    for bound_key, bound_location in FIXED_SCOPE_BINDINGS.items():
+        if account_key == bound_key and location_id != bound_location:
+            raise ScopeViolationError(
+                f"Refusing to build a GoHighLevel client for account {account_key!r}: "
+                f"it is pinned to location {bound_location!r}, not {location_id!r}. "
+                "No GHL request was attempted and no audit record was written."
+            )
+        if location_id == bound_location and account_key != bound_key:
+            raise ScopeViolationError(
+                f"Refusing to build a GoHighLevel client for location {location_id!r}: "
+                f"it is pinned to account {bound_key!r}, not {account_key!r}. "
+                "No GHL request was attempted and no audit record was written."
+            )
+    return GoHighLevelWriteClient(account_key, location_id=location_id, **kwargs)
+
 
 def api_key_env_var(account_key: str) -> str:
     return f"MCP_GHL_{account_key.upper()}_API_KEY"
@@ -188,8 +243,59 @@ class GoHighLevelWriteClient:
     def get_contact(self, contact_id: str) -> Any:
         return _unwrap_contact(self._call("GET", f"/contacts/{contact_id}"))
 
+    def get_contact_in_scope(self, contact_id: str) -> Any:
+        """Return the contact only if it belongs to this client's fixed location.
+
+        Same reusable boundary as the write path: even if a lookup-by-id
+        somehow reached a contact from another sub-account, it is treated as
+        not found here rather than handed back to the caller.
+        """
+        try:
+            contact = self.get_contact(contact_id)
+        except HttpRequestError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        if not isinstance(contact, dict):
+            return None
+        if self.location_id and contact.get("locationId") not in (None, self.location_id):
+            return None
+        return contact
+
+    def search_contacts(self, query: str) -> list[Any]:
+        """``GET /contacts/search`` scoped to this client's fixed location.
+
+        The query always uses this client's own ``location_id`` — there is no
+        parameter for a caller to override it — and any result whose
+        ``locationId`` doesn't match is dropped defensively before returning.
+        """
+        if not self.location_id:
+            raise ValueError(
+                "search_contacts() needs a location_id: construct "
+                "GoHighLevelWriteClient(..., location_id='<sub-account location id>')."
+            )
+        result = self._call(
+            "GET",
+            "/contacts/search",
+            params={"locationId": self.location_id, "query": query, "limit": "20"},
+        )
+        contacts = result.get("contacts") if isinstance(result, dict) else None
+        if not isinstance(contacts, list):
+            return []
+        return [
+            c for c in contacts
+            if isinstance(c, dict) and c.get("locationId") == self.location_id
+        ]
+
     def find_duplicate(self, *, email: str | None = None, phone: str | None = None) -> Any:
-        """Look up an existing contact by email/phone via ``/contacts/search/duplicate``."""
+        """Look up an existing contact by email/phone via ``/contacts/search/duplicate``.
+
+        Subject to the same scope boundary as contact creation: the request
+        always uses this client's own ``location_id`` (there is no override
+        parameter), and a result naming a different location is treated as no
+        match — the same phone or email in another sub-account is never
+        returned here.
+        """
         if not self.location_id:
             raise ValueError(
                 "find_duplicate() needs a location_id: construct "
@@ -207,7 +313,10 @@ class GoHighLevelWriteClient:
             if exc.status_code == 404:
                 return None
             raise
-        return _unwrap_contact(found) or None
+        contact = _unwrap_contact(found) or None
+        if isinstance(contact, dict) and contact.get("locationId") not in (None, self.location_id):
+            return None
+        return contact
 
     # ── Audit gate ───────────────────────────────────────────────────────────
 
@@ -223,8 +332,25 @@ class GoHighLevelWriteClient:
         )
 
     def _with_location(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Fix the write's ``locationId`` to this client's scope.
+
+        A payload naming a different location fails closed here — before the
+        audit intent is authorized and before any GHL request — rather than
+        being silently overwritten or forwarded.  A payload naming the same
+        location explicitly is left alone; a payload naming none gets this
+        client's location filled in.
+        """
         body = dict(payload)
-        if self.location_id and not body.get("locationId"):
+        payload_location = body.get("locationId")
+        if payload_location:
+            if self.location_id and payload_location != self.location_id:
+                raise ScopeViolationError(
+                    f"Refusing to write a contact with locationId {payload_location!r}: "
+                    f"this client (account {self.account_key!r}) is scoped to location "
+                    f"{self.location_id!r}. No GHL request was attempted and no audit "
+                    "record was written."
+                )
+        elif self.location_id:
             body["locationId"] = self.location_id
         return body
 
@@ -371,11 +497,16 @@ class GoHighLevelWriteClient:
 
 
 __all__ = [
+    "FIXED_SCOPE_BINDINGS",
     "GHL_ACCOUNT_KEYS",
     "GHL_API_BASE_URL",
     "GHL_API_VERSION",
     "GoHighLevelWriteClient",
     "HttpRequestError",
+    "ScopeViolationError",
+    "TEAM_DUNCAN_ACCOUNT_KEY",
+    "TEAM_DUNCAN_LOCATION_ID",
     "api_key_env_var",
     "api_key_from_hermes_env",
+    "scoped_client",
 ]

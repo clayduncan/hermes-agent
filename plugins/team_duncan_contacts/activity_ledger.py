@@ -22,11 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.ghl_client import TEAM_DUNCAN_LOCATION_ID
+
 from .sanitizer import sanitize_output
 
 log = logging.getLogger(__name__)
-
-TEAM_DUNCAN_LOCATION_ID = "abi5iDumIeysZCvWt99r"
 
 _INIT_SQL = """
 PRAGMA journal_mode=WAL;

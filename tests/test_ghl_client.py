@@ -15,12 +15,17 @@ import pytest
 import tools.write_audit_log as write_audit_log
 from tests.fakes.write_audit_http import SpyTransport
 from tools.ghl_client import (
+    FIXED_SCOPE_BINDINGS,
     GHL_ACCOUNT_KEYS,
     GHL_API_BASE_URL,
     GHL_API_VERSION,
+    ScopeViolationError,
+    TEAM_DUNCAN_ACCOUNT_KEY,
+    TEAM_DUNCAN_LOCATION_ID,
     GoHighLevelWriteClient,
     api_key_env_var,
     api_key_from_hermes_env,
+    scoped_client,
 )
 from tools.sync_json_http import HttpResponse
 from tools.write_audit_log import (
@@ -431,3 +436,245 @@ class TestCredentials:
         assert headers["Authorization"] == "Bearer fake-pit"
         assert headers["Version"] == GHL_API_VERSION
         assert headers["User-Agent"]
+
+
+# ── Scoped-client construction boundary (OPS-104 acceptance A, E, F) ─────────
+
+
+class TestScopedClientConstruction:
+    """scoped_client() is the one enforcement point for account/location pairing."""
+
+    def test_wrong_location_for_team_duncan_account_fails_closed(
+        self, transport, log_dir
+    ) -> None:
+        with pytest.raises(ScopeViolationError, match="pinned to location"):
+            scoped_client(
+                TEAM_DUNCAN_ACCOUNT_KEY,
+                "not-the-real-team-duncan-location",
+                api_key="fake-pit",
+                request_fn=transport,
+                log_dir=log_dir,
+            )
+        assert transport.calls == []
+        assert entries(log_dir) == []
+
+    def test_wrong_account_key_for_the_fixed_location_fails_closed(
+        self, transport, log_dir
+    ) -> None:
+        with pytest.raises(ScopeViolationError, match="pinned to account"):
+            scoped_client(
+                "tracey",
+                TEAM_DUNCAN_LOCATION_ID,
+                api_key="fake-pit",
+                request_fn=transport,
+                log_dir=log_dir,
+            )
+        assert transport.calls == []
+        assert entries(log_dir) == []
+
+    def test_correct_team_duncan_pairing_succeeds(self, transport, log_dir) -> None:
+        route_create(transport)
+        ghl = scoped_client(
+            TEAM_DUNCAN_ACCOUNT_KEY,
+            TEAM_DUNCAN_LOCATION_ID,
+            api_key="fake-pit",
+            request_fn=transport,
+            log_dir=log_dir,
+            sleep=lambda _seconds: None,
+        )
+        created = ghl.create_contact({"firstName": "Fresh"}, trigger=TRIGGER)
+        assert created == CONTACT_CREATED
+
+    def test_unrelated_accounts_have_no_fixed_binding(self, transport, log_dir) -> None:
+        """Tracey and Chill Cabins aren't pinned: scoped_client() is transparent for them."""
+        assert "tracey" not in FIXED_SCOPE_BINDINGS
+        assert "chillcabins" not in FIXED_SCOPE_BINDINGS
+        route_create(transport)
+        ghl = scoped_client(
+            "tracey",
+            "tracey-own-location",
+            api_key="fake-pit",
+            request_fn=transport,
+            log_dir=log_dir,
+            sleep=lambda _seconds: None,
+        )
+        created = ghl.create_contact({"firstName": "Fresh"}, trigger=TRIGGER)
+        assert created == CONTACT_CREATED
+        assert transport.writes[0].json_body["locationId"] == "tracey-own-location"
+
+
+# ── Payload location is fixed to the client's scope (acceptance D) ──────────
+
+
+class TestPayloadLocationIsEnforced:
+    def test_create_with_mismatched_location_fails_before_the_gate(
+        self, transport, log_dir
+    ) -> None:
+        route_create(transport)
+        with pytest.raises(ScopeViolationError, match="locationId"):
+            client(transport, log_dir).create_contact(
+                {"firstName": "Fresh", "locationId": "some-other-location"},
+                trigger=TRIGGER,
+            )
+        assert transport.calls == []
+        assert entries(log_dir) == []
+
+    def test_create_with_matching_explicit_location_succeeds(
+        self, transport, log_dir
+    ) -> None:
+        route_create(transport)
+        created = client(transport, log_dir).create_contact(
+            {"firstName": "Fresh", "locationId": LOCATION_ID}, trigger=TRIGGER
+        )
+        assert created == CONTACT_CREATED
+
+    def test_upsert_with_mismatched_location_fails_before_the_gate(
+        self, transport, log_dir
+    ) -> None:
+        route_upsert_new(transport)
+        with pytest.raises(ScopeViolationError, match="locationId"):
+            client(transport, log_dir).upsert_contact(
+                {**UPSERT_BODY, "locationId": "some-other-location"}, trigger=TRIGGER
+            )
+        assert transport.calls == []
+        assert entries(log_dir) == []
+
+    def test_upsert_with_matching_explicit_location_succeeds(
+        self, transport, log_dir
+    ) -> None:
+        route_upsert_new(transport)
+        client(transport, log_dir).upsert_contact(
+            {**UPSERT_BODY, "locationId": LOCATION_ID}, trigger=TRIGGER
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["operation"] == "create"
+
+
+# ── Reads go through the same scope boundary as writes (acceptance B, C) ────
+
+
+class TestReadsAreScopedToOneLocation:
+    def test_find_duplicate_only_sends_the_fixed_location(
+        self, transport, log_dir
+    ) -> None:
+        transport.route("GET", "/contacts/search/duplicate", {"contact": CONTACT_BEFORE})
+        client(transport, log_dir).find_duplicate(phone="+15551234567")
+        assert f"locationId={LOCATION_ID}" in transport.calls[0].url
+
+    def test_find_duplicate_rejects_a_result_from_another_location(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/search/duplicate", {"contact": foreign})
+        assert client(transport, log_dir).find_duplicate(phone="+15551234567") is None
+
+    def test_get_contact_in_scope_returns_none_for_another_location(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        assert client(transport, log_dir).get_contact_in_scope("g-1") is None
+
+    def test_get_contact_in_scope_returns_the_contact_for_the_matching_location(
+        self, transport, log_dir
+    ) -> None:
+        same = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": same})
+        assert client(transport, log_dir).get_contact_in_scope("g-1") == same
+
+    def test_search_contacts_sends_the_fixed_location_and_filters_results(
+        self, transport, log_dir
+    ) -> None:
+        transport.route(
+            "GET",
+            "/contacts/search",
+            {
+                "contacts": [
+                    {"id": "g-1", "locationId": LOCATION_ID, "firstName": "Nathan"},
+                    {"id": "g-99", "locationId": "some-other-location", "firstName": "Other"},
+                ]
+            },
+        )
+        results = client(transport, log_dir).search_contacts("Nathan")
+        assert [c["id"] for c in results] == ["g-1"]
+        assert f"locationId={LOCATION_ID}" in transport.calls[0].url
+
+
+class TestCrossAccountIsolation:
+    """Acceptance C: the same phone/email in two sub-accounts never crosses over."""
+
+    def test_same_phone_in_two_sub_accounts_only_resolves_within_its_own(
+        self, log_dir
+    ) -> None:
+        td_transport = SpyTransport(GHL_API_BASE_URL)
+        td_transport.route(
+            "GET",
+            "/contacts/search/duplicate",
+            {"contact": {"id": "g-td", "locationId": TEAM_DUNCAN_LOCATION_ID, "firstName": "Nathan"}},
+        )
+        tracey_transport = SpyTransport(GHL_API_BASE_URL)
+        tracey_transport.route(
+            "GET",
+            "/contacts/search/duplicate",
+            {"contact": {"id": "g-tracey", "locationId": "tracey-location", "firstName": "Nathan"}},
+        )
+
+        td_client = scoped_client(
+            TEAM_DUNCAN_ACCOUNT_KEY,
+            TEAM_DUNCAN_LOCATION_ID,
+            api_key="fake-pit",
+            request_fn=td_transport,
+            log_dir=log_dir,
+        )
+        tracey_client = GoHighLevelWriteClient(
+            "tracey",
+            api_key="fake-pit",
+            location_id="tracey-location",
+            request_fn=tracey_transport,
+            log_dir=log_dir,
+        )
+
+        td_result = td_client.find_duplicate(phone="+15551234567")
+        tracey_result = tracey_client.find_duplicate(phone="+15551234567")
+
+        assert td_result["id"] == "g-td"
+        assert tracey_result["id"] == "g-tracey"
+        assert f"locationId={TEAM_DUNCAN_LOCATION_ID}" in td_transport.calls[0].url
+        assert "locationId=tracey-location" in tracey_transport.calls[0].url
+
+
+# ── Tracey and Chill Cabins keep working through the shared client (acceptance E) ─
+
+
+class TestExistingSubAccountsStillWork:
+    def test_tracey_create_still_works_with_its_own_scope(self, log_dir) -> None:
+        transport = SpyTransport(GHL_API_BASE_URL)
+        transport.route("POST", "/contacts/", {"contact": CONTACT_CREATED})
+        transport.route("GET", "/contacts/g-9", {"contact": CONTACT_CREATED})
+        ghl = GoHighLevelWriteClient(
+            "tracey",
+            api_key="fake-pit",
+            location_id="tracey-location",
+            request_fn=transport,
+            log_dir=log_dir,
+            sleep=lambda _seconds: None,
+        )
+        created = ghl.create_contact({"firstName": "Fresh"}, trigger=TRIGGER)
+        assert created == CONTACT_CREATED
+        assert transport.writes[0].json_body["locationId"] == "tracey-location"
+
+    def test_chillcabins_create_still_works_with_its_own_scope(self, log_dir) -> None:
+        transport = SpyTransport(GHL_API_BASE_URL)
+        transport.route("POST", "/contacts/", {"contact": CONTACT_CREATED})
+        transport.route("GET", "/contacts/g-9", {"contact": CONTACT_CREATED})
+        ghl = GoHighLevelWriteClient(
+            "chillcabins",
+            api_key="fake-pit",
+            location_id="chillcabins-location",
+            request_fn=transport,
+            log_dir=log_dir,
+            sleep=lambda _seconds: None,
+        )
+        created = ghl.create_contact({"firstName": "Fresh"}, trigger=TRIGGER)
+        assert created == CONTACT_CREATED
+        assert transport.writes[0].json_body["locationId"] == "chillcabins-location"

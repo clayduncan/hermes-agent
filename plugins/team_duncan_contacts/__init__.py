@@ -55,72 +55,23 @@ def _load_location_id() -> str:
 
 
 def _build_live_ghl_reader(location_id: str):
-    """Construct the production GHL contact reader for Team Duncan."""
-    from .ghl_reader import GhlContactReader
+    """Construct the production GHL contact reader for Team Duncan.
+
+    Goes through ``tools.ghl_client.scoped_client()``, the same reusable
+    boundary contact writes go through: this raises ``ScopeViolationError``
+    before any GHL transport request if *location_id* (from config.yaml)
+    does not match the location the ``team_duncan`` account is pinned to, so
+    a misconfigured config can never reach the network under this account.
+    """
     from hermes_constants import get_hermes_home
-    from tools.sync_json_http import urllib_request, build_url, request_json
-    from tools.ghl_client import GHL_API_BASE_URL, GHL_API_VERSION, api_key_from_hermes_env
+    from tools.ghl_client import TEAM_DUNCAN_ACCOUNT_KEY, scoped_client
 
-    class _LiveReader(GhlContactReader):
-        def __init__(self):
-            self._api_key = None
-            self._hermes_home = get_hermes_home()
+    from .ghl_reader import ScopedGhlReader
 
-        @property
-        def _key(self) -> str:
-            if self._api_key is None:
-                self._api_key = api_key_from_hermes_env(
-                    "team_duncan", hermes_home=self._hermes_home
-                )
-            return self._api_key
-
-        def _headers(self) -> dict:
-            return {
-                "Authorization": f"Bearer {self._key}",
-                "Version": GHL_API_VERSION,
-                "Accept": "application/json",
-                "User-Agent": "Hermes-Agent/team-duncan-contacts-reader",
-            }
-
-        def get_contact_by_id(self, contact_id: str) -> dict | None:
-            try:
-                result = request_json(
-                    urllib_request,
-                    "GET",
-                    build_url(GHL_API_BASE_URL, f"/contacts/{contact_id}", None),
-                    headers=self._headers(),
-                    timeout=20.0,
-                    max_retries=2,
-                    sleep=__import__("time").sleep,
-                )
-                c = result.get("contact") if isinstance(result, dict) else result
-                return c if isinstance(c, dict) else None
-            except Exception:
-                return None
-
-        def search_contacts_by_name(
-            self, query: str, location_id: str
-        ) -> list[dict]:
-            try:
-                result = request_json(
-                    urllib_request,
-                    "GET",
-                    build_url(
-                        GHL_API_BASE_URL,
-                        "/contacts/search",
-                        {"locationId": location_id, "query": query, "limit": "20"},
-                    ),
-                    headers=self._headers(),
-                    timeout=20.0,
-                    max_retries=2,
-                    sleep=__import__("time").sleep,
-                )
-                contacts = result.get("contacts") if isinstance(result, dict) else None
-                return contacts if isinstance(contacts, list) else []
-            except Exception:
-                return []
-
-    return _LiveReader()
+    client = scoped_client(
+        TEAM_DUNCAN_ACCOUNT_KEY, location_id, hermes_home=get_hermes_home()
+    )
+    return ScopedGhlReader(client)
 
 
 def register(ctx) -> None:

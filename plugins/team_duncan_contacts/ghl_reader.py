@@ -31,6 +31,38 @@ class GhlContactReader:
         raise NotImplementedError
 
 
+class ScopedGhlReader(GhlContactReader):
+    """Adapts a scoped ``GoHighLevelWriteClient`` to the ``GhlContactReader`` protocol.
+
+    The client is already fixed to one account/location at construction (see
+    ``tools.ghl_client.scoped_client``), so a lookup here goes through the same
+    reusable scope boundary contact writes do and can never cross it: a
+    contact from another sub-account comes back as "not found", never as a
+    result.  Network/transport failures are swallowed here (not by the client)
+    so a GHL outage degrades to "no match" for the registry rather than
+    raising through the agent-facing tool handlers.
+    """
+
+    def __init__(self, client: Any) -> None:
+        self._client = client
+
+    def get_contact_by_id(self, contact_id: str) -> dict[str, Any] | None:
+        try:
+            return self._client.get_contact_in_scope(contact_id)
+        except Exception:
+            return None
+
+    def search_contacts_by_name(
+        self, query: str, location_id: str
+    ) -> list[dict[str, Any]]:
+        # location_id is accepted only for protocol compatibility with
+        # FakeGhlReader; this client is already pinned to its own location.
+        try:
+            return self._client.search_contacts(query)
+        except Exception:
+            return []
+
+
 class FakeGhlReader(GhlContactReader):
     """In-memory GHL reader for isolated tests.
 
