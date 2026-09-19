@@ -610,6 +610,23 @@ def _embedded_profile_env_path(config: dict[str, Any]):
     return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
+def _local_embedded_probe_url(config: dict[str, Any]) -> str | None:
+    """Return the last-known local_embedded daemon URL, or None if unknown.
+
+    Reads ``HINDSIGHT_API_PORT`` from the profile's env file, a manager-owned
+    key the daemon manager writes once it has actually bound a port. This is a
+    plain file read: it never starts the daemon and never guesses a port. No
+    port on record means no daemon has ever run for this profile, which is
+    correctly reported as "not currently listening" by the caller.
+    """
+    env_values = _load_simple_env(_embedded_profile_env_path(config))
+    port = env_values.get("HINDSIGHT_API_PORT")
+    if not port:
+        return None
+    host = env_values.get("HINDSIGHT_API_HOST") or "127.0.0.1"
+    return f"http://{host}:{port}"
+
+
 def _secure_write_profile_env(profile_env, content: str) -> None:
     """Create/overwrite *profile_env* with owner-only (0600) permissions.
 
@@ -867,7 +884,14 @@ class HindsightMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "hindsight"
 
-    def is_available(self) -> bool:
+    def is_capable(self) -> bool:
+        """Cheap, network-free config/deps check; see MemoryProvider.is_capable.
+
+        This is the one-time init/registration gate (agent_init.py). It must
+        stay network-free: a local_embedded daemon that simply hasn't been
+        started yet reports capable here so initialize() gets to start it.
+        Use is_available() for truthful live status instead.
+        """
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
@@ -886,10 +910,33 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception:
             return False
 
+    def is_available(self) -> bool:
+        """Truthful current status; see MemoryProvider.is_available.
+
+        Cloud and local_external report exactly is_capable() (no live check,
+        unchanged from before). local/local_embedded additionally requires a
+        listener to actually answer at the last-known daemon port; this never
+        starts or restarts the daemon, and never touches the restart circuit.
+        """
+        if not self.is_capable():
+            return False
+        try:
+            cfg = _load_config()
+            mode = cfg.get("mode", "cloud")
+        except Exception:
+            return False
+        if mode not in {"local", "local_embedded"}:
+            return True
+        url = _local_embedded_probe_url(cfg)
+        if url is None:
+            return False
+        from .health_contract import listener_present
+        return listener_present(url)
+
     def unavailable_reason(self) -> str:
         """Explain an unavailable local_embedded provider (missing runtime).
 
-        ``is_available()`` returns False for local modes when the embedded
+        ``is_capable()`` returns False for local modes when the embedded
         runtime can't be imported, so ``initialize()`` — and the hint it would
         log — is never reached (#7718). Surface the install guidance here, where
         agent_init warns about an unavailable provider.
@@ -1526,12 +1573,21 @@ class HindsightMemoryProvider(MemoryProvider):
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
             logger.info(
-                "Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s",
+                "Hindsight embedded daemon appears unreachable; recreating client, "
+                "waiting for it via the authorized startup path, and retrying once: %s",
                 exc,
             )
             self._client = None
             client = self._get_client()
             self._client = client
+            # Reuse the daemon's own authorized startup path instead of retrying
+            # blind: it consults the OPS-14 health contract (is_running) to decide
+            # whether a restart is authorized, and if so waits (bounded, no
+            # arbitrary sleep of our own) for real health before returning. A
+            # circuit-suppressed daemon returns without starting anything, so the
+            # retry below fails with the same clear connection error rather than
+            # looping.
+            client._ensure_started()
             return self._run_sync(operation(client))
 
     def _probe_url(self) -> str:

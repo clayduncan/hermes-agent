@@ -440,6 +440,20 @@ def _maybe_log_healthy(decision: HealthDecision, profile: str, circuit: _Profile
         _emit(decision, profile, logging.INFO)
 
 
+def listener_present(url: str, timeout: float = _STAGE_TIMEOUTS[0]) -> bool:
+    """Single, non-mutating, read-only probe: True if something answers at *url*.
+
+    Unlike :func:`classify`, this never touches the per-profile circuit
+    breaker, never authorizes or logs a restart decision, and never starts
+    or restarts anything. Intended for status/diagnostic callers (e.g.
+    ``is_available()``) that need a truthful "is anyone listening" answer
+    without side-effecting the restart-decision state machine that owns the
+    actual daemon lifecycle.
+    """
+    probe = _do_probe(url, timeout)
+    return probe.outcome != "no_listener"
+
+
 def make_is_running(manager):
     """Build the ``is_running(profile)`` replacement installed on *manager*."""
 

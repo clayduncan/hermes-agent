@@ -3,6 +3,8 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent.memory_provider import MemoryProvider
+
 
 class RecordingMemoryProvider:
     name = "recording"
@@ -126,6 +128,94 @@ def test_aiagent_forwards_user_id_alt_to_memory_provider():
     assert provider.init_kwargs["platform"] == "feishu"
     assert "warning_callback" not in provider.init_kwargs
     assert "status_callback" not in provider.init_kwargs
+
+
+class CapableButNotYetAvailableProvider(MemoryProvider):
+    """OPS-14: capable (installed/configured) but not currently live.
+
+    Mirrors Hindsight local_embedded on cold start -- is_available() is
+    truthfully False (nothing listening yet) but is_capable() is True, and
+    registration/initialize() must proceed on is_capable(), not
+    is_available(), since initialize() is what starts the daemon.
+    """
+
+    name = "capable_unavailable"
+
+    def __init__(self):
+        self.initialized = False
+
+    def is_available(self):
+        return False
+
+    def is_capable(self):
+        return True
+
+    def initialize(self, session_id, **kwargs):
+        self.initialized = True
+
+    def get_tool_schemas(self):
+        return [{"name": "capable_tool", "description": "x", "parameters": {}}]
+
+
+def test_is_available_false_does_not_block_registration_when_capable():
+    """Truthful is_available()==False must not gate init/registration/tool
+    exposure when is_capable() reports the provider eligible to activate."""
+    provider = CapableButNotYetAvailableProvider()
+    cfg = {"memory": {"provider": "capable_unavailable"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("agent.ssl_guard.verify_ca_bundle_with_fallback"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.initialized is True
+    assert agent._memory_manager.has_tool("capable_tool")
+
+
+def test_is_capable_missing_falls_back_to_is_available():
+    """Provider objects that predate is_capable() and don't subclass the ABC
+    (duck-typed test doubles, old third-party plugins) must still register
+    via their existing is_available()."""
+    provider = RecordingMemoryProvider()
+    assert not hasattr(type(provider), "is_capable")
+    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("agent.ssl_guard.verify_ca_bundle_with_fallback"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    assert provider.init_session_id is not None
 
 
 class CoreShadowProvider:

@@ -499,6 +499,60 @@ class TestToolHandlers:
         first_client.arecall.assert_called_once()
         second_client.arecall.assert_called_once()
 
+    def test_local_embedded_recall_waits_via_ensure_started_before_retry(self, provider, monkeypatch):
+        """OPS-14: a direct recall that starts from a confirmed no-listener
+        state must use the daemon's own authorized startup path (which waits
+        for real health) before retrying -- not retry blind."""
+        first_client = _make_mock_client()
+        first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:9177")
+        second_client = _make_mock_client()
+        call_order = []
+        second_client._ensure_started.side_effect = lambda: call_order.append("ensure_started")
+
+        async def _arecall(**kwargs):
+            call_order.append("arecall")
+            return SimpleNamespace(results=[SimpleNamespace(text="Recovered memory")])
+
+        second_client.arecall = AsyncMock(side_effect=_arecall)
+        clients = iter([first_client, second_client])
+
+        provider._mode = "local_embedded"
+        provider._client = first_client
+        monkeypatch.setattr(provider, "_get_client", lambda: next(clients))
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "test"}
+        ))
+
+        assert result["result"] == "1. Recovered memory"
+        second_client._ensure_started.assert_called_once()
+        first_client._ensure_started.assert_not_called()
+        # _ensure_started() must complete before the retried operation runs,
+        # not after -- otherwise it isn't actually waiting for readiness.
+        assert call_order == ["ensure_started", "arecall"]
+
+    def test_local_embedded_recall_fails_boundedly_when_daemon_stays_dead(self, provider, monkeypatch):
+        """A daemon that is genuinely unavailable (or circuit-suppressed) must
+        fail with a clear error after exactly one retry -- no restart storm."""
+        first_client = _make_mock_client()
+        first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:9177")
+        second_client = _make_mock_client()
+        second_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:9177")
+        clients = iter([first_client, second_client])
+
+        provider._mode = "local_embedded"
+        provider._client = first_client
+        monkeypatch.setattr(provider, "_get_client", lambda: next(clients))
+
+        result = json.loads(provider.handle_tool_call(
+            "hindsight_recall", {"query": "test"}
+        ))
+
+        assert "error" in result
+        first_client.arecall.assert_called_once()
+        second_client.arecall.assert_called_once()
+        second_client._ensure_started.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # Prefetch tests
@@ -1355,6 +1409,114 @@ class TestAvailability:
         p = HindsightMemoryProvider()
         p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
         assert p._mode == "disabled"
+
+    def test_local_external_available_unchanged(self, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_external")
+        p = HindsightMemoryProvider()
+        assert p.is_capable() is True
+        assert p.is_available() is True
+
+    def test_local_embedded_capable_but_unavailable_when_no_port_on_record(self, monkeypatch):
+        """OPS-14: capable() stays import-only; available() requires a listener.
+
+        No profile env file exists yet (nothing has ever started), which is
+        the exact cold-start / never-launched shape is_capable() must NOT
+        treat as unavailable (it gates initialize(), the only thing that
+        starts the daemon) while is_available() correctly reports the truth.
+        """
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, None)
+        )
+        p = HindsightMemoryProvider()
+        assert p.is_capable() is True
+        assert p.is_available() is False
+
+    def test_local_embedded_unavailable_when_recorded_listener_is_gone(self, monkeypatch):
+        """Ground truth: a port is on record (daemon ran before) but nothing
+        answers there now -- is_available() must report unavailable, and the
+        probe must target exactly the recorded host:port, non-mutating."""
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, None)
+        )
+        profile_env = Path.home() / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True, exist_ok=True)
+        profile_env.write_text("HINDSIGHT_API_PORT=9177\n")
+
+        probed = {}
+
+        def _fake_listener_present(url, timeout=2.0):
+            probed["url"] = url
+            return False
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.health_contract.listener_present",
+            _fake_listener_present,
+        )
+
+        assert HindsightMemoryProvider().is_available() is False
+        assert probed["url"] == "http://127.0.0.1:9177"
+
+    def test_local_embedded_available_when_recorded_listener_answers(self, monkeypatch):
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, None)
+        )
+        profile_env = Path.home() / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True, exist_ok=True)
+        profile_env.write_text("HINDSIGHT_API_PORT=9177\n")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.health_contract.listener_present",
+            lambda url, timeout=2.0: True,
+        )
+
+        assert HindsightMemoryProvider().is_available() is True
+
+    def test_is_available_probe_never_constructs_embedded_client(self, monkeypatch):
+        """The truthful status check must never start (or attempt to start)
+        the daemon -- it must not even construct the client class that
+        _start_daemon() later uses to call _ensure_started()."""
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, None)
+        )
+
+        class ExplodingHindsightEmbedded:
+            def __init__(self, **kwargs):
+                raise AssertionError("is_available() must not construct the embedded client")
+
+        monkeypatch.setitem(
+            sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=ExplodingHindsightEmbedded)
+        )
+
+        # No profile env on disk -- is_available() must return False without
+        # ever reaching for HindsightEmbedded.
+        assert HindsightMemoryProvider().is_available() is False
+
+    def test_is_available_probe_does_not_touch_restart_circuit(self, monkeypatch):
+        """A pure status check must never feed the OPS-14 restart circuit --
+        only the real is_running() probe (used from _ensure_started()) may."""
+        from plugins.memory.hindsight import health_contract
+
+        monkeypatch.setenv("HINDSIGHT_MODE", "local_embedded")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._check_local_runtime", lambda: (True, None)
+        )
+        profile_env = Path.home() / ".hindsight" / "profiles" / "hermes.env"
+        profile_env.parent.mkdir(parents=True, exist_ok=True)
+        profile_env.write_text("HINDSIGHT_API_PORT=9177\n")
+
+        def _refused(*args, **kwargs):
+            raise ConnectionRefusedError("connection refused")
+
+        health_contract.reset_state()
+        try:
+            monkeypatch.setattr(health_contract.httpx, "Client", _refused)
+            assert HindsightMemoryProvider().is_available() is False
+            assert health_contract._circuits == {}
+        finally:
+            health_contract.reset_state()
 
 
 class TestSharedEventLoopLifecycle:

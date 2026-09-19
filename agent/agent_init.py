@@ -70,7 +70,7 @@ _warned_unavailable_providers: set[str] = set()
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn (once per provider) when a configured memory provider is unavailable.
 
-    ``is_available()`` is a fast, side-effect-free hot-path check, so it can't
+    ``is_capable()`` is a fast, side-effect-free hot-path check, so it can't
     log for itself. Without this warning a provider whose credentials/config are
     missing is silently dropped — the user has ``memory.provider`` set but gets
     no memory and no diagnostic. A common trigger is systemd/gateway services
@@ -1806,7 +1806,15 @@ def init_agent(
                 from plugins.memory import load_memory_provider as _load_mem
                 agent._memory_manager = _MemoryManager()
                 _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
+                # is_capable(), not is_available(): this is the one-time
+                # activation gate, and must never depend on a live network/
+                # daemon probe. A provider whose live daemon simply hasn't
+                # started yet (e.g. Hindsight local_embedded on cold start)
+                # must still be added and initialized; initialize() is what
+                # starts it. See MemoryProvider.is_capable(). getattr falls
+                # back to is_available() for provider objects that predate
+                # is_capable() and don't subclass the ABC (e.g. test doubles).
+                if _mp and getattr(_mp, "is_capable", _mp.is_available)():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
                     # Skip the (potentially expensive) unavailable_reason() call

@@ -32,7 +32,7 @@ def test_no_hint_for_unrelated_runtime_error():
 
 
 # unavailable_reason() — surfaces the hint through the reachable path (#7718):
-# is_available() gates initialize() out, so the hint must come from here.
+# is_capable() gates initialize() out, so the hint must come from here.
 
 
 def test_unavailable_reason_surfaces_hint_for_local_embedded(monkeypatch):

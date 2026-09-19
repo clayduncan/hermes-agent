@@ -138,6 +138,15 @@ class TestMemoryProviderABC:
         p.sync_turn("user", "assistant")
         p.shutdown()
 
+    def test_is_capable_defaults_to_is_available(self):
+        """Providers with no live-reachability distinction get is_capable()
+        for free by inheriting is_available() -- no provider needs to change
+        just because Hindsight now overrides both separately."""
+        available = FakeMemoryProvider(available=True)
+        unavailable = FakeMemoryProvider(available=False)
+        assert available.is_capable() is True
+        assert unavailable.is_capable() is False
+
 
 # ---------------------------------------------------------------------------
 # MemoryManager tests

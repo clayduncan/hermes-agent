@@ -113,11 +113,33 @@ class MemoryProvider(ABC):
 
     @abstractmethod
     def is_available(self) -> bool:
-        """Return True if this provider is configured, has credentials, and is ready.
+        """Return True if this provider is currently usable.
+
+        For most providers this is identical to :meth:`is_capable`, a check
+        of config/credentials/installed deps, no network calls. A provider
+        backing a live local service (e.g. a daemon on a local port) may
+        additionally report truthful live reachability here, for accurate
+        status surfaces (``hermes memory status``, ``hermes doctor``).
+
+        Init/registration and other one-time activation decisions use
+        :meth:`is_capable` instead, specifically so a live-reachability
+        check here can never block a provider from ever activating (a local
+        daemon that simply hasn't been started yet must still get the
+        chance to start).
+        """
+
+    def is_capable(self) -> bool:
+        """Return True if this provider is configured, has credentials, and could run.
 
         Called during agent init to decide whether to activate the provider.
-        Should not make network calls — just check config and installed deps.
+        Must be cheap and MUST NOT make network calls, just check config and
+        installed deps. Defaults to :meth:`is_available`, which is correct for
+        every provider that has no live-reachability distinction from
+        capability. Override this (not just ``is_available``) if the provider
+        needs to teach ``is_available`` a network probe without breaking the
+        init-time activation check.
         """
+        return self.is_available()
 
     @abstractmethod
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -146,8 +168,8 @@ class MemoryProvider(ABC):
     def unavailable_reason(self) -> str:
         """Actionable reason this provider reports unavailable, for the caller.
 
-        ``is_available()`` gates initialization, so a provider that reports
-        unavailable is never initialized — any diagnostic it would log from
+        ``is_capable()`` gates initialization, so a provider that reports
+        not capable is never initialized; any diagnostic it would log from
         ``initialize()`` is unreachable. Return a short, user-facing hint here
         (e.g. which package to install) so the caller's "provider unavailable"
         warning can surface it. Empty string (the default) adds nothing.
