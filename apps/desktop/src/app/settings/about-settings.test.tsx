@@ -68,6 +68,7 @@ describe('AboutSettings', () => {
       String(REQUIRED_BACKEND_CONTRACT),
       shortSha
     ]
+
     expect(new Set(values).size).toBe(values.length)
   })
 
