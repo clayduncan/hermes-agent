@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import hmac as _hmac_mod
 import hashlib
+import json
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from ..ingestion_state_db import SOURCE_DESK_CALL
 
@@ -133,8 +135,15 @@ def build_routine_command(
         f"{_SQLITE3_BIN} -readonly -uri -batch "
         f"'file:{_CALL_HISTORY_DB_PATH}?mode=ro'"
     )
-    argv = ["ssh", "-i", ssh_identity, ssh_target, remote_cmd]
+    argv = [
+        "ssh", "-i", ssh_identity,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        ssh_target, remote_cmd,
+    ]
     stdin = (
+        ".mode json\n"
         f".parameter set :cutoff_apple_epoch {cutoff_apple_epoch!r}\n"
         + _ROUTINE_SQL_PATH.read_text(encoding="utf-8")
     ).encode("utf-8")
@@ -165,10 +174,17 @@ def build_replay_command(
         f"{_SQLITE3_BIN} -readonly -uri -batch "
         f"'file:{_CALL_HISTORY_DB_PATH}?mode=ro'"
     )
-    argv = ["ssh", "-i", ssh_identity, ssh_target, remote_cmd]
+    argv = [
+        "ssh", "-i", ssh_identity,
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", "ConnectTimeout=10",
+        ssh_target, remote_cmd,
+    ]
 
     if duration_s is None:
         stdin_text = (
+            ".mode json\n"
             f".parameter set :target_zdate {target_zdate!r}\n"
             f".parameter set :zoriginated {int(zoriginated)!r}\n"
             f".parameter set :zanswered {int(zanswered)!r}\n"
@@ -179,6 +195,7 @@ def build_replay_command(
         duration_low = duration_s - _DURATION_TOLERANCE_SECONDS
         duration_high = duration_s + _DURATION_TOLERANCE_SECONDS
         stdin_text = (
+            ".mode json\n"
             f".parameter set :target_zdate {target_zdate!r}\n"
             f".parameter set :duration_low {duration_low!r}\n"
             f".parameter set :duration_high {duration_high!r}\n"
@@ -209,6 +226,138 @@ class DeskTransport(Protocol):
     ) -> list[dict[str, Any]]:
         """Return raw rows matching the exact-event point lookup."""
         ...
+
+
+class DeskTransportError(RuntimeError):
+    """Raised for every `LiveDeskTransport` failure path. The message is
+    always a fixed classification string -- never stdout, stderr, remote
+    command text, SQL, row content, or credentials."""
+
+
+#: Fixed production identity/target. Not configurable via argument,
+#: environment variable, or runtime option -- widening this requires a new,
+#: separately authorized plan.
+_LIVE_SSH_IDENTITY = "/Users/claysystemshq/.ssh/desk_deploy"
+_LIVE_SSH_TARGET = "clayduncan@100.115.84.20"
+
+#: Fixed subprocess timeout, in seconds. Not configurable.
+_SUBPROCESS_TIMEOUT_S = 120
+
+#: Fixed maximum row count enforced before any normalization.
+_MAX_DESK_ROWS = 10_000
+
+#: The exact five columns every row must contain, no more, no less.
+_EXPECTED_ROW_FIELDS = frozenset({"ZDATE", "ZADDRESS", "ZDURATION", "ZORIGINATED", "ZANSWERED"})
+
+
+def _run_ssh_subprocess(argv: list[str], stdin_bytes: bytes) -> subprocess.CompletedProcess:
+    """Default production runner: one-shot `argv` execution, never a shell.
+    The fixed SQL script travels only through `input=`, never a file, and
+    never touches the Desk's disk."""
+    return subprocess.run(
+        argv,
+        input=stdin_bytes,
+        capture_output=True,
+        timeout=_SUBPROCESS_TIMEOUT_S,
+        check=False,
+    )
+
+
+def _validate_desk_row_shape(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise DeskTransportError("Desk transport returned a malformed row.")
+    if set(item.keys()) != _EXPECTED_ROW_FIELDS:
+        raise DeskTransportError("Desk transport returned a malformed row.")
+
+    zdate = item["ZDATE"]
+    if isinstance(zdate, bool) or not isinstance(zdate, (int, float)):
+        raise DeskTransportError("Desk transport returned a malformed row.")
+
+    zaddress = item["ZADDRESS"]
+    if not isinstance(zaddress, str):
+        raise DeskTransportError("Desk transport returned a malformed row.")
+
+    for key in ("ZDURATION", "ZORIGINATED", "ZANSWERED"):
+        value = item[key]
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            raise DeskTransportError("Desk transport returned a malformed row.")
+
+    return item
+
+
+def _parse_desk_rows(stdout_bytes: bytes) -> list[dict[str, Any]]:
+    """Parse fixed `.mode json` sqlite3 stdout into a validated row list.
+    Never falls back to ad hoc delimiter parsing."""
+    stripped = stdout_bytes.strip()
+    if not stripped:
+        return []
+    try:
+        parsed = json.loads(stripped)
+    except (ValueError, UnicodeDecodeError):
+        raise DeskTransportError("Desk transport returned unparseable output.") from None
+
+    if not isinstance(parsed, list):
+        raise DeskTransportError("Desk transport returned a malformed result.")
+    if len(parsed) > _MAX_DESK_ROWS:
+        raise DeskTransportError("Desk transport returned an oversized result.")
+
+    return [_validate_desk_row_shape(item) for item in parsed]
+
+
+class LiveDeskTransport:
+    """Production `DeskTransport`: one-shot SSH subprocess per read against
+    the fixed Team Duncan Desk, no ControlMaster, no PTY. Identity, target,
+    and every hardening option are fixed constants, never configurable via
+    argument, environment variable, or runtime option. *runner* is the only
+    injectable seam -- tests supply a fake so this build's own test suite
+    never spawns a real process."""
+
+    def __init__(
+        self,
+        *,
+        runner: Callable[[list[str], bytes], subprocess.CompletedProcess] = _run_ssh_subprocess,
+    ) -> None:
+        self._runner = runner
+
+    def run_routine_scan(self, now: datetime) -> list[dict[str, Any]]:
+        cutoff = routine_cutoff_apple_epoch(now)
+        argv, stdin = build_routine_command(
+            ssh_identity=_LIVE_SSH_IDENTITY,
+            ssh_target=_LIVE_SSH_TARGET,
+            cutoff_apple_epoch=cutoff,
+        )
+        return self._execute(argv, stdin)
+
+    def run_replay_lookup(
+        self,
+        *,
+        target_zdate: float,
+        zoriginated: int,
+        zanswered: int,
+        duration_s: float | None,
+    ) -> list[dict[str, Any]]:
+        argv, stdin = build_replay_command(
+            ssh_identity=_LIVE_SSH_IDENTITY,
+            ssh_target=_LIVE_SSH_TARGET,
+            target_zdate=target_zdate,
+            zoriginated=zoriginated,
+            zanswered=zanswered,
+            duration_s=duration_s,
+        )
+        return self._execute(argv, stdin)
+
+    def _execute(self, argv: list[str], stdin_bytes: bytes) -> list[dict[str, Any]]:
+        try:
+            completed = self._runner(argv, stdin_bytes)
+        except subprocess.TimeoutExpired:
+            raise DeskTransportError("Desk transport timed out.") from None
+        except Exception:
+            raise DeskTransportError("Desk transport failed to execute.") from None
+
+        if completed.returncode != 0:
+            raise DeskTransportError("Desk transport process exited abnormally.")
+
+        return _parse_desk_rows(completed.stdout)
 
 
 @dataclass

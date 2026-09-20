@@ -9,7 +9,7 @@ No cron/background invocation can reach a source read.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -30,6 +30,14 @@ from tools.ghl_client import TEAM_DUNCAN_LOCATION_ID
 
 
 class _EmptyTransport:
+    """Fake source transport. Counts routine/replay invocations so tests can
+    assert exactly how many times (if any) a source read was reached --
+    never a real SSH, Plaud, or network call."""
+
+    def __init__(self) -> None:
+        self.routine_calls = 0
+        self.replay_calls = 0
+
     def get_deployment_boundary(self):
         return "boundary-0"
 
@@ -40,9 +48,11 @@ class _EmptyTransport:
         return None
 
     def run_routine_scan(self, now):
+        self.routine_calls += 1
         return []
 
     def run_replay_lookup(self, **kwargs):
+        self.replay_calls += 1
         return []
 
 
@@ -51,30 +61,48 @@ class _NoopNotifier:
         return False
 
 
+class _Clock:
+    def __init__(self, start: datetime) -> None:
+        self.now = start
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **kwargs) -> None:
+        self.now = self.now + timedelta(**kwargs)
+
+
 @pytest.fixture(autouse=True)
 def _clear_cron_env(monkeypatch):
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
 
 
 @pytest.fixture()
-def state_db(tmp_path: Path) -> IngestionStateDb:
-    return IngestionStateDb(tmp_path / "ingestion_state.db")
+def clock() -> _Clock:
+    return _Clock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+@pytest.fixture()
+def state_db(tmp_path: Path, clock: _Clock) -> IngestionStateDb:
+    return IngestionStateDb(tmp_path / "ingestion_state.db", clock=clock)
 
 
 @pytest.fixture()
 def runner_factory(tmp_path: Path, state_db: IngestionStateDb):
     registry = ContactRegistry(tmp_path / "registry", team_duncan_location_id=TEAM_DUNCAN_LOCATION_ID)
     ledger = ActivityLedger(tmp_path / "activity.db", registry)
+    desk_transport = _EmptyTransport()
 
     def _factory():
         runner = IngestionRunner(
             registry=registry, activity_ledger=ledger, state_db=state_db,
             plaud_collector=PlaudCollector(_EmptyTransport()),
-            desk_collector=CallHistoryCollector(_EmptyTransport(), b"\x0a" * 32),
+            desk_collector=CallHistoryCollector(desk_transport, b"\x0a" * 32),
             notifier=_NoopNotifier(),
         )
         return runner, state_db
 
+    _factory.desk_transport = desk_transport
     return _factory
 
 
@@ -177,6 +205,56 @@ def test_confirm_rejects_garbage_token(state_db, runner_factory) -> None:
     result = json.loads(confirm_handler({"token": "not-a-real-token"}))
     assert result["status"] == "rejected"
     assert result["reason"] == "token_not_found_or_expired"
+
+
+def test_confirm_valid_token_invokes_desk_exactly_once(state_db, runner_factory) -> None:
+    prepare_handler = make_prepare_call_log_ingest_handler(state_db)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+
+    prep = json.loads(prepare_handler({}))
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "awaiting_acceptance"
+    assert runner_factory.desk_transport.routine_calls == 1
+
+
+def test_confirm_invalid_expired_reused_cron_invoke_desk_zero_times(
+    state_db, runner_factory, clock, monkeypatch
+) -> None:
+    prepare_handler = make_prepare_call_log_ingest_handler(state_db)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    desk_transport = runner_factory.desk_transport
+
+    # Invalid (garbage) token.
+    result = json.loads(confirm_handler({"token": "not-a-real-token"}))
+    assert result["status"] == "rejected"
+    assert desk_transport.routine_calls == 0
+
+    # Expired token.
+    expired_prep = json.loads(prepare_handler({}))
+    clock.advance(seconds=301)
+    result = json.loads(confirm_handler({"token": expired_prep["token"]}))
+    assert result["status"] == "rejected"
+    assert desk_transport.routine_calls == 0
+
+    # Cron/background context: rejected before the token is even consumed.
+    prep = json.loads(prepare_handler({}))
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "rejected"
+    assert result["reason"] == "cron_context"
+    assert desk_transport.routine_calls == 0
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+
+    # The still-valid token now succeeds, invoking Desk exactly once.
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "awaiting_acceptance"
+    assert desk_transport.routine_calls == 1
+
+    # Reused token: rejected, invoking Desk zero additional times.
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "rejected"
+    assert result["reason"] == "token_not_found_or_expired"
+    assert desk_transport.routine_calls == 1
 
 
 # --- accept_call_log_ingest_run -------------------------------------------------
