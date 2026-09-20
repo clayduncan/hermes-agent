@@ -23,6 +23,7 @@ from plugins.team_duncan_contacts.collectors.call_history_collector import (
     DeskTransportError,
     LiveDeskTransport,
     SANDBOX_FILE_READ_ALLOWLIST,
+    _sandbox_profile,
     apple_epoch_to_utc,
     build_replay_command,
     build_routine_command,
@@ -85,21 +86,82 @@ def test_routine_command_uses_fixed_sandbox_and_no_shell_interpolation() -> None
         ssh_identity="~/.ssh/desk_deploy", ssh_target="user@host",
         cutoff_apple_epoch=800000000.0,
     )
-    assert argv[0] == "ssh"
+    assert argv[0] == "/usr/bin/ssh"
     joined = " ".join(argv)
-    assert "sandbox-exec" in joined
+    assert "/usr/bin/sandbox-exec" in joined
     assert "-readonly" in joined
     assert "mode=ro" in joined
     assert "/usr/bin/sqlite3" in joined
     for path in SANDBOX_FILE_READ_ALLOWLIST:
         assert path in joined
-    assert len(SANDBOX_FILE_READ_ALLOWLIST) == 5
+    assert len(SANDBOX_FILE_READ_ALLOWLIST) == 4
     assert "deny default" in joined
     assert "deny file-write" in joined
     assert "deny network" in joined
     # Dynamic value bound via .parameter set, never concatenated into SQL text.
     assert b".parameter set :cutoff_apple_epoch" in stdin
     assert str(800000000.0).split(".")[0] in stdin.decode()
+
+
+def test_routine_and_replay_use_absolute_ssh_and_sandbox_exec() -> None:
+    argv_routine, _ = build_routine_command(
+        ssh_identity="i", ssh_target="t", cutoff_apple_epoch=1.0,
+    )
+    argv_replay, _ = build_replay_command(
+        ssh_identity="i", ssh_target="t", target_zdate=1.0,
+        zoriginated=1, zanswered=1, duration_s=90,
+    )
+    for argv in (argv_routine, argv_replay):
+        assert argv[0] == "/usr/bin/ssh"
+        joined = " ".join(argv)
+        assert "/usr/bin/sandbox-exec" in joined
+
+
+def test_routine_and_replay_omit_unsupported_uri_flag() -> None:
+    argv_routine, _ = build_routine_command(
+        ssh_identity="i", ssh_target="t", cutoff_apple_epoch=800000000.0,
+    )
+    argv_replay, _ = build_replay_command(
+        ssh_identity="i", ssh_target="t", target_zdate=1.0,
+        zoriginated=1, zanswered=1, duration_s=90,
+    )
+    for argv in (argv_routine, argv_replay):
+        joined = " ".join(argv)
+        assert "-uri" not in joined.split()
+        assert "-readonly" in joined
+        assert "-batch" in joined
+
+
+def test_sandbox_profile_has_exactly_one_root_bootstrap_literal_rule() -> None:
+    profile = _sandbox_profile()
+    assert profile.count('(allow file-read-data (literal "/"))') == 1
+    assert "dyld_shared_cache" not in profile
+    assert "Cryptex" not in profile
+    assert "cryptex" not in profile
+    # Root bootstrap is a literal-only data-read rule, never subpath or regex.
+    assert '(literal "/")' in profile
+    assert "(subpath" not in profile
+    assert "(regex" not in profile
+
+
+def test_sandbox_profile_denies_writes_and_network_and_only_execs_sqlite3() -> None:
+    profile = _sandbox_profile()
+    assert "(deny default)" in profile
+    assert "(deny file-write*)" in profile
+    assert "(deny network*)" in profile
+    assert profile.count("(allow process-exec*") == 1
+    assert '(allow process-exec* (literal "/usr/bin/sqlite3"))' in profile
+
+
+def test_sandbox_profile_and_scan_command_contain_no_integrity_only_binaries() -> None:
+    profile = _sandbox_profile()
+    argv, _stdin = build_routine_command(
+        ssh_identity="i", ssh_target="t", cutoff_apple_epoch=1.0,
+    )
+    joined_argv = " ".join(argv)
+    for banned in ("shasum", "perl", "Perl", "/usr/bin/stat", "/usr/bin/openssl"):
+        assert banned not in profile
+        assert banned not in joined_argv
 
 
 def test_command_construction_rejects_bool_and_str_dynamic_values() -> None:
@@ -307,7 +369,7 @@ def test_live_desk_transport_run_replay_lookup_uses_injected_runner() -> None:
         target_zdate=1.0, zoriginated=1, zanswered=1, duration_s=None,
     )
     assert rows == []
-    assert captured["argv"][0] == "ssh"
+    assert captured["argv"][0] == "/usr/bin/ssh"
 
 
 def test_live_desk_transport_valid_json_rows_become_exact_dictionaries() -> None:
