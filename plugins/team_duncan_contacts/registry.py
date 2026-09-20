@@ -19,6 +19,7 @@ import re
 import secrets
 import stat
 import threading
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -142,6 +143,155 @@ def _mask_handle(raw: str, kind: str) -> str:
     if kind == "email":
         return _mask_email(raw)
     return "***"
+
+
+# --- Candidate label support (OPS-18, additive only) ---
+#
+# These helpers derive a non-PII, collision-checkable "candidate row" label
+# for multiple_match review, entirely from data already captured inside the
+# registry's own state at prepare/confirm time (no GHL read, no network call
+# happens here). See resolve_event()'s match_outcome handling below.
+
+#: Closed set of match_outcome values. Never affects `decision`.
+MATCH_OUTCOME_ZERO = "zero_match"
+MATCH_OUTCOME_MULTIPLE = "multiple_match"
+MATCH_OUTCOME_UNIQUE = "unique_match"
+MATCH_OUTCOME_UNAVAILABLE = "unavailable"
+
+#: Domain-separation salt for deriving the selection-token key from the same
+#: HMAC key used for phone/email matching. Keeps the two derived keys
+#: cryptographically independent even though they share one root key file.
+_SELECTION_TOKEN_SALT = b"team-duncan-selection-token-v1"
+
+#: Owners this build recognizes on candidate rows. Any other value (or an
+#: absent one) normalizes to "(none)" rather than being shown or withholding
+#: the candidate: an owner mismatch is never a reason to hide a candidate.
+_OWNER_ALLOWLIST = ("Clay Duncan", "Levi Duncan")
+
+#: Telegram MarkdownV2 reserved characters that must be backslash-escaped
+#: before a sanitized label fragment is safe to render verbatim.
+_MARKDOWN_V2_RESERVED = set("_*[]()~`>#+-=|{}.!")
+
+_LABEL_MAX_LEN = 60
+
+
+def _sanitize_label_text(raw: str | None) -> str | None:
+    """Sanitize free-text for candidate-label rendering.
+
+    Order: NFKC-normalize, strip control/newline/tab chars to a single
+    space, collapse whitespace runs, truncate to 60 chars, then escape every
+    MarkdownV2-reserved character. Returns None for empty/absent input.
+    """
+    if not raw:
+        return None
+    text = unicodedata.normalize("NFKC", raw)
+    chars = []
+    for ch in text:
+        if ch in ("\n", "\r", "\t") or unicodedata.category(ch) == "Cc":
+            chars.append(" ")
+        else:
+            chars.append(ch)
+    text = re.sub(r"\s+", " ", "".join(chars)).strip()
+    if not text:
+        return None
+    text = text[:_LABEL_MAX_LEN]
+    return "".join(
+        f"\\{ch}" if ch in _MARKDOWN_V2_RESERVED else ch for ch in text
+    )
+
+
+def _masked_phone_last4_from_masked(masked_phone: str | None) -> str | None:
+    """Extract "****1234" from an already-masked phone string, if possible."""
+    if not masked_phone:
+        return None
+    m = re.search(r"(\d{4})$", masked_phone)
+    if not m:
+        return None
+    return "****" + m.group(1)
+
+
+def _mask_email_domain_preserving(raw_email: str) -> str | None:
+    """Mask an email's local part while keeping its domain, for candidate labels.
+
+    Distinct from `_mask_email` (used for masked_handles), which redacts the
+    domain too. Only called at prepare/confirm time, before the raw handle is
+    discarded; never persisted as raw text.
+    """
+    if not raw_email or "@" not in raw_email:
+        return None
+    local, _, domain = raw_email.partition("@")
+    if not domain:
+        return None
+    if len(local) <= 1:
+        return f"*@{domain}"
+    return f"{local[0]}***@{domain}"
+
+
+def _normalize_owner(raw: str | None) -> str | None:
+    """Return the allowlisted owner name, or None (unassigned or unrecognized)."""
+    if not raw:
+        return None
+    text = unicodedata.normalize("NFKC", raw)
+    text = re.sub(r"\s+", " ", text).strip()
+    for allowed in _OWNER_ALLOWLIST:
+        if text == allowed:
+            return allowed
+    return None
+
+
+def _extract_candidate_label_fields(contact: dict[str, Any]) -> dict[str, Any]:
+    """Derive candidate-label source fields from a GHL contact dict.
+
+    Called only inside prepare_activation, on the same contact dict already
+    returned by the injected reader for this call: no additional read.
+    Brokerage/owner field names are this build's documented convention: flat
+    optional keys on the contact dict, matching the existing firstName /
+    lastName / phone / email convention in ghl_reader.py.
+    """
+    raw_email = (contact.get("email") or "").strip()
+    return {
+        "masked_email": _mask_email_domain_preserving(raw_email) if raw_email else None,
+        "brokerage": (contact.get("brokerage") or "").strip() or None,
+        "assigned_owner": _normalize_owner(contact.get("assignedOwner")),
+    }
+
+
+def _derive_selection_token_key(base_key: bytes) -> bytes:
+    return _hmac_mod.new(base_key, _SELECTION_TOKEN_SALT, hashlib.sha256).digest()
+
+
+def _selection_token(
+    base_key: bytes, contact_id: str, source: str, source_event_id: str
+) -> str:
+    token_key = _derive_selection_token_key(base_key)
+    msg = f"selection_token|{contact_id}|{source}|{source_event_id}"
+    return _hmac_mod.new(token_key, msg.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def build_candidate_display_label(contact: dict[str, Any]) -> str:
+    """Build the one canonical, pre-rendered candidate label for *contact*.
+
+    `contact` is a stored registry contact record (as in state["contacts"][id]),
+    not a GHL contact dict. Must be rendered verbatim downstream, in full,
+    with no further truncation or reformatting: this is the exact string
+    collision-compared against every other candidate's label.
+    """
+    display_name = _sanitize_label_text(contact.get("display_name"))
+    masked_phone_last4 = _masked_phone_last4_from_masked(
+        (contact.get("masked_labels") or {}).get("phone")
+    )
+    label_fields = contact.get("candidate_label_fields") or {}
+    masked_email = label_fields.get("masked_email")
+    brokerage = _sanitize_label_text(label_fields.get("brokerage"))
+    assigned_owner = label_fields.get("assigned_owner")
+    parts = [
+        display_name or "(none)",
+        masked_phone_last4 or "(none)",
+        masked_email or "(none)",
+        brokerage or "(none)",
+        assigned_owner or "(none)",
+    ]
+    return "|".join(parts)
 
 
 # --- HMAC ---
@@ -282,6 +432,10 @@ class ResolveResult:
         cutoff_decision: str | None = None,
         masked_metadata: dict[str, Any] | None = None,
         message: str = "",
+        match_outcome: str = MATCH_OUTCOME_UNAVAILABLE,
+        candidate_rows: list[dict[str, Any]] | None = None,
+        candidate_collision: bool = False,
+        selected_contact_id: str | None = None,
     ) -> None:
         self.decision = decision
         self.registry_contact_id = registry_contact_id
@@ -291,6 +445,14 @@ class ResolveResult:
         self.cutoff_decision = cutoff_decision
         self.masked_metadata = masked_metadata or {}
         self.message = message
+        # OPS-18 additive fields. Never influence `decision`.
+        self.match_outcome = match_outcome
+        self.candidate_rows = candidate_rows
+        self.candidate_collision = candidate_collision
+        # Set only when a `selection_token` was passed to resolve_event() and
+        # it matched exactly one currently-registered candidate. Internal
+        # use only (ingestion_runner); never included in any *Result.to_dict().
+        self.selected_contact_id = selected_contact_id
 
     @property
     def authorized(self) -> bool:
@@ -589,6 +751,12 @@ class ContactRegistry:
                 hmac_indexes[kind] = _hmac_hex(key, canonical)
                 masked_handles[kind] = _mask_handle(raw, kind)
 
+            # Candidate-label fields (OPS-18): derived once here from the same
+            # contact dict already returned by the reader, before raw handles
+            # go out of scope. Carried through the token into the activation
+            # record for later multiple_match candidate rendering.
+            candidate_label_fields = _extract_candidate_label_fields(contact)
+
             # Issue token
             token = secrets.token_urlsafe(32)
             now = self._clock()
@@ -604,6 +772,7 @@ class ContactRegistry:
                 "location_id": location_id,
                 "masked_handles": masked_handles,
                 "hmac_indexes": hmac_indexes,
+                "candidate_label_fields": candidate_label_fields,
                 "expires_at": expires_iso,
             }
             self._save_state(state)
@@ -661,6 +830,7 @@ class ContactRegistry:
             location_id = token_data["location_id"]
             masked_handles = token_data["masked_handles"]
             hmac_indexes = token_data["hmac_indexes"]
+            candidate_label_fields = token_data.get("candidate_label_fields") or {}
 
             # Idempotency: already activated
             existing = state.get("contacts", {}).get(contact_id)
@@ -696,6 +866,7 @@ class ContactRegistry:
                 "approved_handle_kinds": list(hmac_indexes.keys()),
                 "hmac_indexes": hmac_indexes,
                 "masked_labels": masked_handles,
+                "candidate_label_fields": candidate_label_fields,
                 "history": [
                     {
                         "timestamp": activated_at_iso,
@@ -726,16 +897,35 @@ class ContactRegistry:
             )
 
     def resolve_event(
-        self, raw_handle: str, event_ts: datetime
+        self,
+        raw_handle: str,
+        event_ts: datetime,
+        *,
+        source: str | None = None,
+        source_event_id: str | None = None,
+        selection_token: str | None = None,
     ) -> ResolveResult:
         """Internal resolver: decide whether a source event is authorized.
 
         Input: raw handle (phone/email/etc.) + event timestamp.
-        Output: ResolveResult with decision and masked metadata.
+        Output: ResolveResult with decision, match_outcome, and masked metadata.
 
         This method writes no state and performs no GHL mutations.
         Raw handles are canonicalized and HMAC'd inside this method and never
         returned, logged, or stored externally.
+
+        `source`/`source_event_id` are optional and additive (OPS-18): when
+        both are given and the match_outcome is multiple_match, they are used
+        to derive per-candidate opaque selection tokens. Existing callers that
+        omit them (e.g. ActivityLedger.record_event) are unaffected; they get
+        candidate_rows with no usable selection token, which they never use.
+
+        `selection_token` is also optional and additive: when given, it is
+        matched (constant-time) against every fresh candidate's own token,
+        entirely inside this method, and the winning contact_id (if any) is
+        returned via `ResolveResult.selected_contact_id`. Candidate rows
+        themselves never carry a contact_id (non-PII by design), so this is
+        the only way to turn Clay's exact token back into a contact.
         """
         with self._lock:
             state = self._load_state_raw()
@@ -744,6 +934,7 @@ class ContactRegistry:
             if not contacts:
                 return ResolveResult(
                     decision="review_required",
+                    match_outcome=MATCH_OUTCOME_UNAVAILABLE,
                     message="No activated contacts in registry.",
                 )
 
@@ -752,6 +943,7 @@ class ContactRegistry:
             except MissingHmacKeyError:
                 return ResolveResult(
                     decision="review_required",
+                    match_outcome=MATCH_OUTCOME_UNAVAILABLE,
                     message="HMAC key unavailable; cannot resolve handle.",
                 )
 
@@ -768,13 +960,19 @@ class ContactRegistry:
                         matches.append(cid)
                         break
 
-            if len(matches) != 1:
+            if len(matches) == 0:
                 return ResolveResult(
                     decision="review_required",
+                    match_outcome=MATCH_OUTCOME_ZERO,
                     message=(
-                        "No unique registry match for the provided handle. "
-                        "Zero or multiple contacts match; no event is authorized."
+                        "No registry match for the provided handle. "
+                        "No event is authorized."
                     ),
+                )
+
+            if len(matches) > 1:
+                return self._resolve_multiple_match(
+                    key, contacts, matches, source, source_event_id, selection_token
                 )
 
             contact_id = matches[0]
@@ -800,6 +998,7 @@ class ContactRegistry:
                     lifecycle_state=lifecycle,
                     cutoff_decision=cutoff_decision,
                     masked_metadata=masked_meta,
+                    match_outcome=MATCH_OUTCOME_UNIQUE,
                     message=(
                         "Event timestamp is before the contact's activation cutoff. "
                         "No write or visibility is authorized."
@@ -817,6 +1016,7 @@ class ContactRegistry:
                     lifecycle_state=lifecycle,
                     cutoff_decision=cutoff_decision,
                     masked_metadata=masked_meta,
+                    match_outcome=MATCH_OUTCOME_UNIQUE,
                     message="Contact is paused; new events are not authorized.",
                 )
 
@@ -828,6 +1028,7 @@ class ContactRegistry:
                     lifecycle_state=lifecycle,
                     cutoff_decision=cutoff_decision,
                     masked_metadata=masked_meta,
+                    match_outcome=MATCH_OUTCOME_UNIQUE,
                     message="Contact is retired; new events are not authorized.",
                 )
 
@@ -839,8 +1040,71 @@ class ContactRegistry:
                 lifecycle_state=lifecycle,
                 cutoff_decision=cutoff_decision,
                 masked_metadata=masked_meta,
+                match_outcome=MATCH_OUTCOME_UNIQUE,
                 message="Event authorized.",
             )
+
+    def _resolve_multiple_match(
+        self,
+        key: bytes,
+        contacts: dict[str, Any],
+        matches: list[str],
+        source: str | None,
+        source_event_id: str | None,
+        selection_token: str | None = None,
+    ) -> ResolveResult:
+        """Build (and collision-check) candidate rows for a multiple_match event.
+
+        Fails closed: any two candidates rendering an identical display_label
+        withhold every candidate row and report candidate_collision=True. No
+        GHL read happens here; labels are derived only from what the registry
+        already stored at prepare/confirm time.
+        """
+        labels: dict[str, str] = {
+            cid: build_candidate_display_label(contacts[cid]) for cid in matches
+        }
+        collision = len(set(labels.values())) != len(labels)
+
+        if collision:
+            return ResolveResult(
+                decision="review_required",
+                match_outcome=MATCH_OUTCOME_MULTIPLE,
+                candidate_rows=None,
+                candidate_collision=True,
+                message=(
+                    "Multiple registry contacts matched and at least two "
+                    "render an identical candidate label. No candidate can be "
+                    "safely selected; resolve directly in GHL."
+                ),
+            )
+
+        candidate_rows = []
+        selected_contact_id = None
+        for cid in matches:
+            token = None
+            if source and source_event_id:
+                token = _selection_token(key, cid, source, source_event_id)
+                if (
+                    selection_token is not None
+                    and secrets.compare_digest(token, selection_token)
+                ):
+                    selected_contact_id = cid
+            candidate_rows.append(
+                {"selection_token": token, "display_label": labels[cid]}
+            )
+
+        return ResolveResult(
+            decision="review_required",
+            match_outcome=MATCH_OUTCOME_MULTIPLE,
+            candidate_rows=candidate_rows,
+            candidate_collision=False,
+            selected_contact_id=selected_contact_id,
+            message=(
+                "Multiple registry contacts matched the provided handle. "
+                "Exact opaque selection is required; no event is authorized "
+                "without it."
+            ),
+        )
 
     # --- Lifecycle management ---
 

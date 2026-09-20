@@ -1,6 +1,8 @@
 """team_duncan_contacts plugin: Clay-approved contact activation registry.
 
-Registers two agent-facing tools: prepare_activation and confirm_activation.
+Registers agent-facing tools: prepare_activation, confirm_activation, and
+(OPS-18) list_pending_call_reviews, prepare_call_log_ingest,
+confirm_call_log_ingest, accept_call_log_ingest_run.
 See plugins/team_duncan_contacts/registry.py for core invariants.
 
 Installation: add ``team_duncan_contacts`` to ``plugins.enabled`` in config.yaml.
@@ -12,6 +14,14 @@ Required config (in config.yaml):
       team_duncan_contacts:
         settings:
           location_id: "<GoHighLevel location ID for Team Duncan>"
+
+OPS-18 note: registering these ingestion tools does not enable live
+ingestion. confirm_call_log_ingest's actual source reads go through
+`_UnconfiguredTransport` until a future change wires real Plaud/Desk
+transports -- every source fetch attempt in this build fails safely and
+locally, with no socket ever opened. The manual-run gate (prepare/confirm/
+accept, single-use 300s tokens, cron rejection) and the Pending Call
+Reviews surface are otherwise fully functional against local state.
 """
 
 from __future__ import annotations
@@ -72,6 +82,71 @@ def _build_live_ghl_reader(location_id: str):
         TEAM_DUNCAN_ACCOUNT_KEY, location_id, hermes_home=get_hermes_home()
     )
     return ScopedGhlReader(client)
+
+
+class _LiveTransportNotConfiguredError(RuntimeError):
+    """Raised by every method of `_UnconfiguredTransport`. No live Plaud/Desk
+    transport is wired into this build; confirm_call_log_ingest's own fetch
+    handling turns this into a clean per-source error, never a live call."""
+
+
+class _UnconfiguredTransport:
+    """Stand-in for a live source transport. Every call raises immediately,
+    in-process, with no I/O of any kind -- guaranteeing this build can never
+    reach the Desk or Plaud even if ingestion is triggered."""
+
+    def __getattr__(self, name: str):
+        def _raise(*_args, **_kwargs):
+            raise _LiveTransportNotConfiguredError(
+                "No live transport is configured for this source in this build. "
+                "Live ingestion requires Clay acceptance and separate transport "
+                "wiring (OPS-41/OPS-18 live activation), not part of this build."
+            )
+
+        return _raise
+
+
+class _UnconfiguredNotifier:
+    """Always reports delivery failure; never sends anything anywhere."""
+
+    def send(self, payload) -> bool:  # noqa: ANN001 - matches Notifier protocol
+        return False
+
+
+def _build_ingestion_runner_factory(hermes_home: Path, registry):
+    """Return a zero-arg factory producing a fresh (IngestionRunner, state_db)
+    pair. Deferred construction keeps plugin load itself free of any DB or
+    transport work beyond what prepare/list already need."""
+
+    def _factory():
+        from .collectors.call_history_collector import CallHistoryCollector
+        from .collectors.plaud_collector import PlaudCollector
+        from .ingestion_state_db import IngestionStateDb, load_or_create_identity_key
+        from .ingestion_runner import IngestionRunner
+        from .notifications import TelegramPrimaryEmailFallbackNotifier
+
+        data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        state_db = IngestionStateDb(data_dir / "ingestion_state.db")
+        identity_key = load_or_create_identity_key(data_dir)
+
+        plaud_collector = PlaudCollector(_UnconfiguredTransport())
+        desk_collector = CallHistoryCollector(_UnconfiguredTransport(), identity_key)
+        notifier = TelegramPrimaryEmailFallbackNotifier(
+            _UnconfiguredNotifier(), _UnconfiguredNotifier()
+        )
+
+        runner = IngestionRunner(
+            registry=registry,
+            activity_ledger=activity_ledger,
+            state_db=state_db,
+            plaud_collector=plaud_collector,
+            desk_collector=desk_collector,
+            notifier=notifier,
+        )
+        return runner, state_db
+
+    return _factory
 
 
 def register(ctx) -> None:
@@ -151,4 +226,55 @@ def register(ctx) -> None:
         "team_duncan_contacts: registered prepare_activation and confirm_activation "
         "tools for location %s.",
         location_id,
+    )
+
+    # --- OPS-18: Pending Call Reviews + manual-run ingestion gate ---
+    from .ingestion_state_db import IngestionStateDb
+    from .tools import (
+        ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA,
+        CONFIRM_CALL_LOG_INGEST_SCHEMA,
+        LIST_PENDING_CALL_REVIEWS_SCHEMA,
+        PREPARE_CALL_LOG_INGEST_SCHEMA,
+        make_accept_call_log_ingest_run_handler,
+        make_confirm_call_log_ingest_handler,
+        make_list_pending_call_reviews_handler,
+        make_prepare_call_log_ingest_handler,
+    )
+
+    ingestion_state_db = IngestionStateDb(data_dir / "ingestion_state.db")
+    runner_factory = _build_ingestion_runner_factory(hermes_home, registry)
+
+    ctx.register_tool(
+        name="list_pending_call_reviews",
+        toolset=_PLUGIN_NAME,
+        schema=LIST_PENDING_CALL_REVIEWS_SCHEMA,
+        handler=make_list_pending_call_reviews_handler(ingestion_state_db),
+        description=LIST_PENDING_CALL_REVIEWS_SCHEMA["function"]["description"],
+    )
+    ctx.register_tool(
+        name="prepare_call_log_ingest",
+        toolset=_PLUGIN_NAME,
+        schema=PREPARE_CALL_LOG_INGEST_SCHEMA,
+        handler=make_prepare_call_log_ingest_handler(ingestion_state_db),
+        description=PREPARE_CALL_LOG_INGEST_SCHEMA["function"]["description"],
+    )
+    ctx.register_tool(
+        name="confirm_call_log_ingest",
+        toolset=_PLUGIN_NAME,
+        schema=CONFIRM_CALL_LOG_INGEST_SCHEMA,
+        handler=make_confirm_call_log_ingest_handler(runner_factory),
+        description=CONFIRM_CALL_LOG_INGEST_SCHEMA["function"]["description"],
+    )
+    ctx.register_tool(
+        name="accept_call_log_ingest_run",
+        toolset=_PLUGIN_NAME,
+        schema=ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA,
+        handler=make_accept_call_log_ingest_run_handler(ingestion_state_db),
+        description=ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA["function"]["description"],
+    )
+
+    log.info(
+        "team_duncan_contacts: registered OPS-18 Pending Call Reviews and "
+        "call-log ingestion manual-run gate tools. Live source transports "
+        "are not configured in this build; source reads fail safely local-only."
     )
