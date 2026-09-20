@@ -16,12 +16,18 @@ Required config (in config.yaml):
           location_id: "<GoHighLevel location ID for Team Duncan>"
 
 OPS-18 note: registering these ingestion tools does not enable live
-ingestion. confirm_call_log_ingest's actual source reads go through
-`_UnconfiguredTransport` until a future change wires real Plaud/Desk
-transports -- every source fetch attempt in this build fails safely and
-locally, with no socket ever opened. The manual-run gate (prepare/confirm/
-accept, single-use 300s tokens, cron rejection) and the Pending Call
-Reviews surface are otherwise fully functional against local state.
+ingestion by itself. The Desk production transport (`LiveDeskTransport`) is
+now wired for confirm_call_log_ingest's `desk_call` source: a fixed-path,
+fixed-identity, one-shot SSH read is possible once Clay accepts this build
+and enables the plugin. Plaud remains explicitly unconfigured pending
+OPS-110 -- every Plaud source fetch attempt still goes through
+`_UnconfiguredTransport` and fails safely and locally, with no socket ever
+opened. The manual-run gate (prepare/confirm/accept, single-use 300s
+tokens, cron rejection) still governs every source read: prepare_call_log_ingest
+never reads a source, and only confirm_call_log_ingest, after consuming its
+single-use token, can invoke the Desk transport -- never a scheduler, never
+a background process. The Pending Call Reviews surface is otherwise fully
+functional against local state.
 """
 
 from __future__ import annotations
@@ -119,7 +125,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
     transport work beyond what prepare/list already need."""
 
     def _factory():
-        from .collectors.call_history_collector import CallHistoryCollector
+        from .collectors.call_history_collector import CallHistoryCollector, LiveDeskTransport
         from .collectors.plaud_collector import PlaudCollector
         from .ingestion_state_db import IngestionStateDb, load_or_create_identity_key
         from .ingestion_runner import IngestionRunner
@@ -130,8 +136,11 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
         state_db = IngestionStateDb(data_dir / "ingestion_state.db")
         identity_key = load_or_create_identity_key(data_dir)
 
+        # Desk: production transport, fixed identity/target, manual-run gate
+        # only (see confirm_call_log_ingest). Plaud: fail-closed pending
+        # OPS-110; not part of this build's scope.
         plaud_collector = PlaudCollector(_UnconfiguredTransport())
-        desk_collector = CallHistoryCollector(_UnconfiguredTransport(), identity_key)
+        desk_collector = CallHistoryCollector(LiveDeskTransport(), identity_key)
         notifier = TelegramPrimaryEmailFallbackNotifier(
             _UnconfiguredNotifier(), _UnconfiguredNotifier()
         )
@@ -275,6 +284,8 @@ def register(ctx) -> None:
 
     log.info(
         "team_duncan_contacts: registered OPS-18 Pending Call Reviews and "
-        "call-log ingestion manual-run gate tools. Live source transports "
-        "are not configured in this build; source reads fail safely local-only."
+        "call-log ingestion manual-run gate tools. Desk production transport "
+        "configured (fixed identity/target, manual-run gate only, no "
+        "scheduler). Plaud transport not configured and fails safely, "
+        "pending OPS-110."
     )

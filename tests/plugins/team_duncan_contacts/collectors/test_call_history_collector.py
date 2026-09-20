@@ -8,14 +8,20 @@ covered for stability and non-reversibility.
 
 from __future__ import annotations
 
+import inspect
+import json
+import subprocess
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from plugins.team_duncan_contacts.collectors import call_history_collector as chc_module
 from plugins.team_duncan_contacts.collectors.call_history_collector import (
     AmbiguousReplayError,
     CALL_HISTORY_LOOKBACK_DAYS,
     CallHistoryCollector,
+    DeskTransportError,
+    LiveDeskTransport,
     SANDBOX_FILE_READ_ALLOWLIST,
     apple_epoch_to_utc,
     build_replay_command,
@@ -201,3 +207,263 @@ def test_fetch_exact_event_ambiguous_raises() -> None:
             target_zdate=1.0, zoriginated=1, zanswered=1, duration_s=90,
             expected_source_event_id=expected_id,
         )
+
+
+# --- SSH hardening on the command builders ----------------------------------
+
+_SSH_HARDENING_OPTIONS = ("BatchMode=yes", "StrictHostKeyChecking=accept-new", "ConnectTimeout=10")
+
+
+def test_routine_command_includes_ssh_hardening_exactly_once_and_retains_identity_target() -> None:
+    argv, _stdin = build_routine_command(
+        ssh_identity="/Users/claysystemshq/.ssh/desk_deploy",
+        ssh_target="clayduncan@100.115.84.20",
+        cutoff_apple_epoch=800000000.0,
+    )
+    joined = " ".join(argv)
+    for option in _SSH_HARDENING_OPTIONS:
+        assert argv.count(option) == 1
+        assert joined.count(option) == 1
+    assert "/Users/claysystemshq/.ssh/desk_deploy" in argv
+    assert "clayduncan@100.115.84.20" in argv
+
+
+def test_replay_command_includes_ssh_hardening_exactly_once_and_retains_identity_target() -> None:
+    argv, _stdin = build_replay_command(
+        ssh_identity="/Users/claysystemshq/.ssh/desk_deploy",
+        ssh_target="clayduncan@100.115.84.20",
+        target_zdate=1.0, zoriginated=1, zanswered=1, duration_s=90,
+    )
+    joined = " ".join(argv)
+    for option in _SSH_HARDENING_OPTIONS:
+        assert argv.count(option) == 1
+        assert joined.count(option) == 1
+    assert "/Users/claysystemshq/.ssh/desk_deploy" in argv
+    assert "clayduncan@100.115.84.20" in argv
+
+
+# --- .mode json stdin ordering ------------------------------------------------
+
+def test_routine_stdin_begins_with_mode_json_then_params_then_sql() -> None:
+    _argv, stdin = build_routine_command(
+        ssh_identity="i", ssh_target="t", cutoff_apple_epoch=800000000.0,
+    )
+    text = stdin.decode()
+    mode_idx = text.index(".mode json")
+    param_idx = text.index(".parameter set :cutoff_apple_epoch")
+    sql_idx = text.index("SELECT ZDATE")
+    assert mode_idx < param_idx < sql_idx
+    assert text.startswith(".mode json")
+
+
+def test_replay_stdin_begins_with_mode_json_and_preserves_parameters() -> None:
+    _argv, stdin = build_replay_command(
+        ssh_identity="i", ssh_target="t", target_zdate=1.0,
+        zoriginated=1, zanswered=1, duration_s=90,
+    )
+    text = stdin.decode()
+    assert text.startswith(".mode json")
+    assert ".parameter set :target_zdate" in text
+    assert ".parameter set :duration_low" in text
+    assert ".parameter set :duration_high" in text
+    assert ".parameter set :zoriginated" in text
+    assert ".parameter set :zanswered" in text
+
+
+# --- LiveDeskTransport: injected runner, never real SSH -----------------------
+
+def _completed(argv, returncode=0, stdout=b"", stderr=b""):
+    return subprocess.CompletedProcess(args=argv, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_live_desk_transport_uses_fixed_identity_and_target() -> None:
+    captured: dict = {}
+
+    def fake_runner(argv, stdin_bytes):
+        captured["argv"] = argv
+        captured["stdin"] = stdin_bytes
+        return _completed(argv, returncode=0, stdout=b"[]")
+
+    transport = LiveDeskTransport(runner=fake_runner)
+    rows = transport.run_routine_scan(datetime.now(timezone.utc))
+
+    assert rows == []
+    assert "/Users/claysystemshq/.ssh/desk_deploy" in captured["argv"]
+    assert "clayduncan@100.115.84.20" in captured["argv"]
+    for option in _SSH_HARDENING_OPTIONS:
+        assert captured["argv"].count(option) == 1
+    assert captured["stdin"].startswith(b".mode json")
+
+
+def test_live_desk_transport_run_replay_lookup_uses_injected_runner() -> None:
+    captured: dict = {}
+
+    def fake_runner(argv, stdin_bytes):
+        captured["argv"] = argv
+        return _completed(argv, returncode=0, stdout=b"[]")
+
+    transport = LiveDeskTransport(runner=fake_runner)
+    rows = transport.run_replay_lookup(
+        target_zdate=1.0, zoriginated=1, zanswered=1, duration_s=None,
+    )
+    assert rows == []
+    assert captured["argv"][0] == "ssh"
+
+
+def test_live_desk_transport_valid_json_rows_become_exact_dictionaries() -> None:
+    row = _row()
+    stdout = json.dumps([row]).encode("utf-8")
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    rows = transport.run_routine_scan(datetime.now(timezone.utc))
+    assert rows == [row]
+
+
+def test_live_desk_transport_empty_successful_output_is_empty_list() -> None:
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, b""))
+    assert transport.run_routine_scan(datetime.now(timezone.utc)) == []
+    transport_ws = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, b"   \n"))
+    assert transport_ws.run_routine_scan(datetime.now(timezone.utc)) == []
+
+
+def test_live_desk_transport_invalid_json_fails_content_free() -> None:
+    secret_stdout = b"not json at all " + CANARY_PHONE.encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, secret_stdout))
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    assert CANARY_PHONE not in str(exc_info.value)
+    assert "not json at all" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "bad_stdout",
+    [
+        b'{"not": "a list"}',
+        b'"just a string"',
+        b"42",
+    ],
+)
+def test_live_desk_transport_non_list_root_fails_content_free(bad_stdout) -> None:
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, bad_stdout))
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    assert bad_stdout.decode() not in str(exc_info.value)
+
+
+def test_live_desk_transport_non_object_item_fails() -> None:
+    stdout = json.dumps(["not-an-object"]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_missing_field_fails() -> None:
+    row = _row()
+    del row["ZDURATION"]
+    stdout = json.dumps([row]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_extra_field_fails() -> None:
+    row = _row()
+    row["UNEXPECTED"] = "value"
+    stdout = json.dumps([row]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_bad_type_fails() -> None:
+    row = _row()
+    row["ZDATE"] = "not-a-number"
+    stdout = json.dumps([row]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_bool_as_number_fails() -> None:
+    row = _row()
+    row["ZANSWERED"] = True
+    stdout = json.dumps([row]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_missing_address_fails() -> None:
+    row = _row()
+    row["ZADDRESS"] = None
+    stdout = json.dumps([row]).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_more_than_10000_rows_fails() -> None:
+    rows = [_row(zdate=float(i)) for i in range(10_001)]
+    stdout = json.dumps(rows).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    with pytest.raises(DeskTransportError):
+        transport.run_routine_scan(datetime.now(timezone.utc))
+
+
+def test_live_desk_transport_exactly_10000_rows_succeeds() -> None:
+    rows = [_row(zdate=float(i)) for i in range(10_000)]
+    stdout = json.dumps(rows).encode()
+    transport = LiveDeskTransport(runner=lambda argv, stdin: _completed(argv, 0, stdout))
+    result = transport.run_routine_scan(datetime.now(timezone.utc))
+    assert len(result) == 10_000
+
+
+# --- LiveDeskTransport: process failure paths never leak content -------------
+
+def test_live_desk_transport_timeout_fails_without_leaking() -> None:
+    def timeout_runner(argv, stdin_bytes):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=120)
+
+    transport = LiveDeskTransport(runner=timeout_runner)
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    message = str(exc_info.value)
+    assert "ssh" not in message
+    assert "/Users/claysystemshq/.ssh/desk_deploy" not in message
+
+
+def test_live_desk_transport_nonzero_return_code_fails_without_leaking() -> None:
+    secret_stderr = b"permission denied for " + CANARY_PHONE.encode()
+    transport = LiveDeskTransport(
+        runner=lambda argv, stdin: _completed(argv, returncode=1, stdout=b"", stderr=secret_stderr)
+    )
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    assert CANARY_PHONE not in str(exc_info.value)
+    assert "permission denied" not in str(exc_info.value)
+
+
+def test_live_desk_transport_negative_return_code_signal_fails_without_leaking() -> None:
+    transport = LiveDeskTransport(
+        runner=lambda argv, stdin: _completed(argv, returncode=-9, stdout=b"", stderr=b"")
+    )
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    assert "-9" not in str(exc_info.value)
+
+
+def test_live_desk_transport_unexpected_runner_exception_fails_content_free() -> None:
+    def broken_runner(argv, stdin_bytes):
+        raise OSError("ssh binary not found: " + CANARY_PHONE)
+
+    transport = LiveDeskTransport(runner=broken_runner)
+    with pytest.raises(DeskTransportError) as exc_info:
+        transport.run_routine_scan(datetime.now(timezone.utc))
+    assert CANARY_PHONE not in str(exc_info.value)
+
+
+# --- shell=True is structurally unreachable -----------------------------------
+
+def test_shell_true_is_structurally_unreachable() -> None:
+    source = inspect.getsource(chc_module)
+    assert "shell=True" not in source
+    assert "shell = True" not in source
