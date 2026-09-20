@@ -645,6 +645,12 @@ export const en: Translations = {
       automaticUpdatesDesc:
         'Hermes checks for updates automatically in the background and lets you know when one is ready.',
       branchCommit: (branch, commit) => `Branch ${branch} · Commit ${commit}`,
+      buildInfo: 'Build information',
+      runtimeVersion: 'Runtime version',
+      electronBundleVersion: 'Electron bundle version',
+      compatibilityContract: 'Compatibility contract',
+      buildCommit: 'Build commit',
+      valueUnavailable: 'Unavailable',
       never: 'never',
       justNow: 'just now',
       minAgo: count => `${count} min ago`,

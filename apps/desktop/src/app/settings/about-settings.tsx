@@ -5,7 +5,7 @@ import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
-import { AlertTriangle, CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
+import { AlertTriangle, CheckCircle2, ExternalLink, Info, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $desktopVersion,
@@ -15,6 +15,7 @@ import {
   checkUpdates,
   openUpdatesWindow,
   refreshDesktopVersion,
+  REQUIRED_BACKEND_CONTRACT,
   startActiveUpdate
 } from '@/store/updates'
 
@@ -132,6 +133,36 @@ export function AboutSettings() {
             </div>
           </div>
         )}
+      </div>
+
+      <div className="mx-auto mt-4 w-full max-w-2xl">
+        <SectionHeading icon={Info} title={a.buildInfo} />
+        <ListRow
+          action={
+            <span className="font-mono text-sm text-foreground">{version?.appVersion || a.valueUnavailable}</span>
+          }
+          title={a.runtimeVersion}
+        />
+        <ListRow
+          action={
+            <span className="font-mono text-sm text-foreground">
+              {version?.electronBundleVersion || a.valueUnavailable}
+            </span>
+          }
+          title={a.electronBundleVersion}
+        />
+        <ListRow
+          action={<span className="font-mono text-sm text-foreground">{REQUIRED_BACKEND_CONTRACT}</span>}
+          title={a.compatibilityContract}
+        />
+        <ListRow
+          action={
+            <span className="font-mono text-sm text-foreground">
+              {status?.currentSha ? status.currentSha.slice(0, 7) : a.valueUnavailable}
+            </span>
+          }
+          title={a.buildCommit}
+        />
       </div>
 
       <div className="mx-auto mt-4 w-full max-w-2xl">

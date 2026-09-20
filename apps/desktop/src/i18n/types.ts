@@ -536,6 +536,12 @@ export interface Translations {
       automaticUpdates: string
       automaticUpdatesDesc: string
       branchCommit: (branch: string, commit: string) => string
+      buildInfo: string
+      runtimeVersion: string
+      electronBundleVersion: string
+      compatibilityContract: string
+      buildCommit: string
+      valueUnavailable: string
       never: string
       justNow: string
       minAgo: (count: number) => string

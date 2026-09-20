@@ -494,6 +494,10 @@ export interface HermesTerminalExit {
 
 export interface DesktopVersionInfo {
   appVersion: string
+  /** The Electron app package's own version (apps/desktop/package.json
+   *  `version`) — the packaged bundle version, NOT `electronVersion` below
+   *  (which is the Electron framework build it embeds). */
+  electronBundleVersion: string
   electronVersion: string
   nodeVersion: string
   platform: string

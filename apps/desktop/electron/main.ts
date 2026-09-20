@@ -14282,6 +14282,9 @@ ipcMain.handle('hermes:version', async () => {
 
   return {
     appVersion: resolveHermesVersion(),
+    // The Electron app's own packaged version (apps/desktop/package.json),
+    // distinct from process.versions.electron (the Electron framework build).
+    electronBundleVersion: app.getVersion(),
     electronVersion: process.versions.electron,
     nodeVersion: process.versions.node,
     platform: process.platform,
