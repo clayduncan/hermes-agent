@@ -10,11 +10,16 @@ ever inject `FakeDeskTransport`.
 
 Sandbox design (fixed, not a starting point -- widening it requires a new,
 separately authorized plan):
-  * `/usr/bin/sqlite3 -readonly -uri -batch` against `file:...?mode=ro`.
-    Never Python's sqlite3 module against a Desk path.
-  * Wrapped in `sandbox-exec` under `(deny default)(deny file-write*)
-    (deny network*)`, with a fixed five-entry `file-read*` allowlist and a
-    single allowed executable (`/usr/bin/sqlite3`). No mach-lookup, no
+  * `/usr/bin/sqlite3 -readonly -batch` against `file:...?mode=ro`.
+    Never Python's sqlite3 module against a Desk path. `-uri` is not
+    supported on the current Desk sqlite3 build and is never passed.
+  * Wrapped in `/usr/bin/sandbox-exec` under `(deny default)(deny
+    file-write*)(deny network*)`, with the exact CallHistory main/WAL/SHM
+    and `/usr/bin/sqlite3` file-read literals plus a single root-inode
+    `(allow file-read-data (literal "/"))` bootstrap rule (data read on the
+    root directory inode only, not any child path -- required for native
+    Mach-O process bootstrap; it grants no subpath content), and a single
+    allowed executable (`/usr/bin/sqlite3`). No mach-lookup, no
     sysctl-read, no other process.
   * The fixed `.sql` script (never templated -- see the three `.sql` files
     beside this module) is piped fresh over the SSH connection's stdin for
@@ -53,16 +58,24 @@ _CALL_HISTORY_DB_PATH = (
 _CALL_HISTORY_WAL_PATH = _CALL_HISTORY_DB_PATH + "-wal"
 _CALL_HISTORY_SHM_PATH = _CALL_HISTORY_DB_PATH + "-shm"
 _SQLITE3_BIN = "/usr/bin/sqlite3"
-_DYLD_SHARED_CACHE_PATH = "/System/Library/dyld/dyld_shared_cache_arm64e"
+_SANDBOX_EXEC_BIN = "/usr/bin/sandbox-exec"
+_SSH_BIN = "/usr/bin/ssh"
 
-#: The fixed, exact, five-entry file-read allowlist. Final, never widened
+#: Root-inode bootstrap rule required for native Mach-O process bootstrap
+#: on current macOS. Grants file-read-data on the root directory inode
+#: only -- not a subpath, not a regex, no child-path content. This is not
+#: an OS-version-specific literal: unlike a dyld shared cache path (which
+#: has moved under a per-OS Cryptex layout and is no longer a single
+#: literal file at all), the root inode itself is not versioned.
+_ROOT_BOOTSTRAP_LITERAL = "/"
+
+#: The fixed, exact, four-entry file-read allowlist. Final, never widened
 #: from inside this module.
 SANDBOX_FILE_READ_ALLOWLIST: tuple[str, ...] = (
     _CALL_HISTORY_DB_PATH,
     _CALL_HISTORY_WAL_PATH,
     _CALL_HISTORY_SHM_PATH,
     _SQLITE3_BIN,
-    _DYLD_SHARED_CACHE_PATH,
 )
 
 _SQL_DIR = Path(__file__).resolve().parent
@@ -76,6 +89,7 @@ def _sandbox_profile() -> str:
     return (
         "(version 1)(deny default)(deny file-write*)(deny network*)"
         f'(allow process-exec* (literal "{_SQLITE3_BIN}"))'
+        f'(allow file-read-data (literal "{_ROOT_BOOTSTRAP_LITERAL}"))'
         f"(allow file-read* {reads})"
     )
 
@@ -131,12 +145,12 @@ def build_routine_command(
     """
     _validate_numeric("cutoff_apple_epoch", cutoff_apple_epoch)
     remote_cmd = (
-        f"LC_ALL=C sandbox-exec -p '{_sandbox_profile()}' "
-        f"{_SQLITE3_BIN} -readonly -uri -batch "
+        f"LC_ALL=C {_SANDBOX_EXEC_BIN} -p '{_sandbox_profile()}' "
+        f"{_SQLITE3_BIN} -readonly -batch "
         f"'file:{_CALL_HISTORY_DB_PATH}?mode=ro'"
     )
     argv = [
-        "ssh", "-i", ssh_identity,
+        _SSH_BIN, "-i", ssh_identity,
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=10",
@@ -170,12 +184,12 @@ def build_replay_command(
     _validate_numeric("zanswered", zanswered)
 
     remote_cmd = (
-        f"LC_ALL=C sandbox-exec -p '{_sandbox_profile()}' "
-        f"{_SQLITE3_BIN} -readonly -uri -batch "
+        f"LC_ALL=C {_SANDBOX_EXEC_BIN} -p '{_sandbox_profile()}' "
+        f"{_SQLITE3_BIN} -readonly -batch "
         f"'file:{_CALL_HISTORY_DB_PATH}?mode=ro'"
     )
     argv = [
-        "ssh", "-i", ssh_identity,
+        _SSH_BIN, "-i", ssh_identity,
         "-o", "BatchMode=yes",
         "-o", "StrictHostKeyChecking=accept-new",
         "-o", "ConnectTimeout=10",
