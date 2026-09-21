@@ -6,7 +6,9 @@ passthrough that prevents a probe storm during internal polling, sampling
 of healthy telemetry, and the required telemetry fields. No real daemon is
 started and no real network calls or real sleeps happen.
 """
+import json
 import logging
+import os
 import pathlib
 from types import SimpleNamespace
 
@@ -34,6 +36,24 @@ def _reset_state():
 @pytest.fixture(autouse=True)
 def _no_real_sleep(monkeypatch):
     monkeypatch.setattr(health_contract.time, "sleep", lambda seconds: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_circuit_state_path(tmp_path, monkeypatch):
+    """C4: redirect every durable circuit-state write in this file to
+    tmp_path, so no test ever touches the real ~/.hindsight/profiles/
+    directory. Tests that need to read the snapshot back use tmp_path
+    directly (pytest caches the fixture instance by name, so a test
+    requesting tmp_path itself gets the same directory this patches)."""
+    monkeypatch.setattr(
+        health_contract, "_circuit_state_path",
+        lambda profile: tmp_path / f"{profile}.circuit_state.json",
+    )
+
+
+def _read_circuit_state(tmp_path, profile=_PROFILE):
+    path = tmp_path / f"{profile}.circuit_state.json"
+    return json.loads(path.read_text())
 
 
 class _FakeResponse:
@@ -291,16 +311,19 @@ def test_circuit_breaker_backoff_tiers_and_reset(monkeypatch):
     assert circuit.next_allowed_attempt_at == 0.0
 
 
-def test_circuit_stays_latched_open_past_15_minute_window_while_still_dead(monkeypatch):
-    """A second failed automatic attempt latches the circuit open.
-
-    Elapsing the full 15 minute suppression window must not by itself
-    re-authorize a third automatic restart while the daemon is still dead.
-    Only a verified healthy result reopens the path to another attempt.
+def test_circuit_rearms_after_cooldown_while_still_dead(monkeypatch):
+    """B2/B3: a second failed automatic attempt latches circuit_open, but
+    elapsing the 900 second cooldown re-authorizes a third attempt even
+    while circuit_open remains latched true (2.1's fix -- circuit_open is
+    no longer part of the suppression gate). This must repeat: after that
+    re-armed attempt also fails, a fourth is suppressed for another 900
+    seconds and then authorized again, not a single bonus attempt followed
+    by a permanent stall.
     """
     clock = {"t": 1000.0}
     monkeypatch.setattr(health_contract.time, "monotonic", lambda: clock["t"])
     manager = _stub_manager()
+    circuit = health_contract._get_circuit(_PROFILE)
 
     # Incident starts: first dead classification authorizes one attempt.
     _install_steps(monkeypatch, [_connect_error(), _connect_error()])
@@ -330,43 +353,209 @@ def test_circuit_stays_latched_open_past_15_minute_window_while_still_dead(monke
     d4 = health_contract.classify(manager, _PROFILE, _URL)
     assert d4.final_bool is True
     assert d4.reason_code == "circuit_open_suppressed"
-
-    circuit = health_contract._get_circuit(_PROFILE)
     assert circuit.circuit_open is True
 
-    # Advance the full 15 minutes plus a large additional margin while the
-    # daemon remains dead. No third automatic restart may be authorized.
-    clock["t"] += 900 + 3600
+    # B2: past the 900 second cooldown while still dead, a third attempt is
+    # authorized despite circuit_open still being latched true.
+    clock["t"] += 900
     _install_steps(monkeypatch, [_connect_error(), _connect_error()])
     d5 = health_contract.classify(manager, _PROFILE, _URL)
     assert d5.state == health_contract.DEAD
-    assert d5.final_bool is True
-    assert d5.reason_code == "circuit_open_suppressed"
-    assert circuit.attempt_pending is False
-    assert circuit.failure_count == 2
+    assert d5.final_bool is False
+    assert d5.reason_code == "restart_authorized"
+    assert circuit.circuit_open is True  # latch stays set; it's informational now
 
-    # Advancing further still keeps it suppressed -- the latch does not
-    # decay with time.
-    clock["t"] += 100000
+    # That third attempt also fails -> another 900 second suppression.
+    clock["t"] += 31
     _install_steps(monkeypatch, [_connect_error(), _connect_error()])
     d6 = health_contract.classify(manager, _PROFILE, _URL)
     assert d6.final_bool is True
     assert d6.reason_code == "circuit_open_suppressed"
-    assert circuit.failure_count == 2
 
-    # Only a verified healthy result reopens the circuit.
-    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    # Still suppressed short of the full 900 seconds.
+    clock["t"] += 300
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
     d7 = health_contract.classify(manager, _PROFILE, _URL)
-    assert d7.state == health_contract.HEALTHY
-    assert circuit.circuit_open is False
-    assert circuit.failure_count == 0
+    assert d7.final_bool is True
+    assert d7.reason_code == "circuit_open_suppressed"
 
-    # With the circuit reset, a fresh incident can authorize an attempt
-    # again.
+    # B3: a second full 900 second cooldown elapses -> a fourth attempt is
+    # authorized. This is the repeating cadence, not a one-shot re-arm.
+    clock["t"] += 600
     _install_steps(monkeypatch, [_connect_error(), _connect_error()])
     d8 = health_contract.classify(manager, _PROFILE, _URL)
     assert d8.final_bool is False
     assert d8.reason_code == "restart_authorized"
+
+    # Only a verified healthy result clears the latch.
+    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    d9 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d9.state == health_contract.HEALTHY
+    assert circuit.circuit_open is False
+    assert circuit.failure_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Durable circuit-state snapshot (2.2) and flap visibility (C1-C5, H1-H3)
+# ---------------------------------------------------------------------------
+
+
+def test_durable_snapshot_schema_on_authorized_suppressed_and_healthy(monkeypatch, tmp_path):
+    """C1/C2: the snapshot is written with the full schema, correctly typed,
+    on restart_authorized, circuit_open_suppressed, and healthy_recovery,
+    using an atomic write (verified indirectly: the file is always fully
+    parseable JSON immediately after classify() returns)."""
+    clock = {"t": 1000.0}
+    wall_base = 2_000_000_000.0
+    monkeypatch.setattr(health_contract.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(health_contract.time, "time", lambda: wall_base + clock["t"])
+    manager = _stub_manager()
+
+    # restart_authorized
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d1 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d1.reason_code == "restart_authorized"
+    state = _read_circuit_state(tmp_path)
+    assert state["schema_version"] == 1
+    assert state["profile"] == _PROFILE
+    assert state["last_reason_code"] == "restart_authorized"
+    assert state["circuit_open"] is False
+    assert state["listener_present"] is False
+    assert isinstance(state["failure_count"], int)
+    assert isinstance(state["flap_count"], int)
+    assert isinstance(state["next_allowed_attempt_at_epoch"], float)
+    assert isinstance(state["next_allowed_attempt_at_iso"], str)
+    assert isinstance(state["last_classified_at_epoch"], float)
+    assert isinstance(state["last_classified_at_iso"], str)
+    assert state["last_healthy_at_iso"] is None
+    assert state["pid"] == os.getpid()
+
+    # circuit_open_suppressed (first failure tier; not yet circuit_open)
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d2 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d2.reason_code == "circuit_open_suppressed"
+    state = _read_circuit_state(tmp_path)
+    assert state["last_reason_code"] == "circuit_open_suppressed"
+    assert state["circuit_open"] is False
+    assert state["failure_count"] == 1
+    assert state["next_allowed_attempt_at_epoch"] > state["last_classified_at_epoch"]
+
+    # Drive to the second failure -> circuit_open latches true.
+    clock["t"] += 300
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    health_contract.classify(manager, _PROFILE, _URL)  # restart_authorized
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d4 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d4.reason_code == "circuit_open_suppressed"
+    state = _read_circuit_state(tmp_path)
+    assert state["circuit_open"] is True
+    assert state["flap_count"] == 1
+
+    # healthy_recovery: immediate clear in the same write.
+    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    d5 = health_contract.classify(manager, _PROFILE, _URL)
+    assert d5.reason_code == "healthy_recovery"
+    state = _read_circuit_state(tmp_path)
+    assert state["circuit_open"] is False
+    assert state["failure_count"] == 0
+    assert state["last_reason_code"] == "healthy_recovery"
+    assert state["last_healthy_at_iso"] is not None
+
+
+def test_stuck_open_snapshot_persists_until_healthy_probe_clears_it(monkeypatch, tmp_path):
+    """H2/H3: while circuit_open is latched and the cooldown hasn't elapsed,
+    the durable circuit_open field stays true across repeated classify()
+    calls (no flap to false without a genuine healthy probe), and a
+    verified healthy probe clears it in the very same classification cycle
+    that clears the in-memory circuit -- no lag between the two."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(health_contract.time, "monotonic", lambda: clock["t"])
+    manager = _stub_manager()
+    circuit = health_contract._get_circuit(_PROFILE)
+
+    # Latch the circuit open (first + second failure).
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    health_contract.classify(manager, _PROFILE, _URL)
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    health_contract.classify(manager, _PROFILE, _URL)
+    clock["t"] += 300
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    health_contract.classify(manager, _PROFILE, _URL)
+    clock["t"] += 31
+    _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+    d_latch = health_contract.classify(manager, _PROFILE, _URL)
+    assert d_latch.reason_code == "circuit_open_suppressed"
+    assert circuit.circuit_open is True
+    assert _read_circuit_state(tmp_path)["circuit_open"] is True
+
+    # H2: repeated suppressed classifications, still short of the 900s
+    # cooldown, must keep the snapshot's circuit_open true throughout.
+    for _ in range(3):
+        clock["t"] += 5
+        _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+        d = health_contract.classify(manager, _PROFILE, _URL)
+        assert d.reason_code == "circuit_open_suppressed"
+        assert circuit.circuit_open is True
+        assert _read_circuit_state(tmp_path)["circuit_open"] is True
+
+    # H3: a verified healthy probe clears both the in-memory circuit and the
+    # durable snapshot in this same call.
+    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    d_healthy = health_contract.classify(manager, _PROFILE, _URL)
+    assert d_healthy.state == health_contract.HEALTHY
+    assert circuit.circuit_open is False
+    state = _read_circuit_state(tmp_path)
+    assert state["circuit_open"] is False
+    assert state["failure_count"] == 0
+    assert state["last_healthy_at_iso"] is not None
+
+
+def test_flap_count_increments_per_incident_and_never_resets(monkeypatch, tmp_path):
+    """C3: flap_count increments by exactly 1 at each circuit_open
+    False->True transition (one per incident's second failure), and does
+    NOT reset on a healthy recovery -- two independent stuck-open incidents
+    in one process produce flap_count == 2, and the snapshot after the
+    second incident still reflects it."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(health_contract.time, "monotonic", lambda: clock["t"])
+    manager = _stub_manager()
+    circuit = health_contract._get_circuit(_PROFILE)
+
+    def _latch_one_incident():
+        _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+        health_contract.classify(manager, _PROFILE, _URL)  # 1st attempt authorized
+        clock["t"] += 31
+        _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+        health_contract.classify(manager, _PROFILE, _URL)  # 1st failure, 5min suppress
+        clock["t"] += 300
+        _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+        health_contract.classify(manager, _PROFILE, _URL)  # 2nd attempt authorized
+        clock["t"] += 31
+        _install_steps(monkeypatch, [_connect_error(), _connect_error()])
+        health_contract.classify(manager, _PROFILE, _URL)  # 2nd failure -> latches
+
+    _latch_one_incident()
+    assert circuit.circuit_open is True
+    assert circuit.flap_count == 1
+
+    # Recovery via a verified healthy probe must not reset flap_count.
+    _install_steps(monkeypatch, [_FakeResponse(200, _HEALTHY_PAYLOAD)])
+    d_recover = health_contract.classify(manager, _PROFILE, _URL)
+    assert d_recover.state == health_contract.HEALTHY
+    assert circuit.circuit_open is False
+    assert circuit.flap_count == 1
+
+    clock["t"] += 100
+    _latch_one_incident()
+    assert circuit.circuit_open is True
+    assert circuit.flap_count == 2
+
+    state = _read_circuit_state(tmp_path)
+    assert state["flap_count"] == 2
+    assert state["circuit_open"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -15,14 +15,17 @@ and owns the single boolean handed back to
     open. Two confirmed no-listener results, outside any startup activity,
     are required.
 
-A per-profile circuit breaker limits automatic restarts to two attempts per
-incident: a failed first attempt suppresses the next one for 5 minutes, and
-a failed second attempt latches the circuit open, suppressing every further
-automatic attempt regardless of elapsed time. Only a verified healthy
-result (or a fresh process, which starts with a clean in-memory circuit)
-reopens the path to another automatic attempt. This adapter never kills a
-process itself -- the existing upstream exact listener-PID validation
-remains the only termination path.
+A per-profile circuit breaker paces automatic restarts: a failed first
+attempt suppresses the next one for 5 minutes, and a failed second (and
+every subsequent) attempt suppresses the next one for 15 minutes, repeating
+for as long as the profile stays dead. ``circuit_open`` latches true on the
+second failure of an incident and is exposed in the durable per-profile
+snapshot as a flap indicator, but it no longer independently blocks an
+attempt once its own cooldown has elapsed -- only ``next_allowed_attempt_at``
+gates authorization. A verified healthy result (or a fresh process, which
+starts with a clean in-memory circuit) fully clears the latch. This adapter
+never kills a process itself -- the existing upstream exact listener-PID
+validation remains the only termination path.
 
 While upstream's own per-profile start lock is held -- the internal startup
 poll loop in ``DaemonEmbedManager._start_daemon_locked`` calls
@@ -35,12 +38,16 @@ probe-storm log flood during a slow cold start.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -109,12 +116,20 @@ class _ProfileCircuit:
         self.attempt_id = NONE_SENTINEL
         self.last_started_seen_at = 0.0
         self.last_healthy_log_at = 0.0
-        # Latched True after the second failed automatic attempt. Unlike
-        # next_allowed_attempt_at, this never clears on its own once the
-        # suppression window elapses -- only a verified healthy result (or
-        # a new process, which starts with a fresh circuit) reopens the
-        # path to an automatic restart attempt.
+        # Latched True after the second failed automatic attempt of an
+        # incident. Does not clear on its own once the suppression window
+        # elapses -- only a verified healthy result (or a new process,
+        # which starts with a fresh circuit) clears it. No longer gates
+        # attempt authorization by itself (see classify()); it is now a
+        # telemetry/flap-tracking flag surfaced in the durable snapshot.
         self.circuit_open = False
+        # Running count of distinct incidents (False -> True transitions of
+        # circuit_open) observed by this process since start. Never resets
+        # on recovery.
+        self.flap_count = 0
+        # ISO-8601 UTC wall-clock timestamp of the most recent verified
+        # healthy classification, or None if this process has never seen one.
+        self.last_healthy_at_iso: str | None = None
 
 
 _circuits: dict[str, _ProfileCircuit] = {}
@@ -139,6 +154,80 @@ def reset_state() -> None:
         _circuits.clear()
     with _decision_cache_lock:
         _decision_cache.clear()
+
+
+def _circuit_state_path(profile: str) -> Path:
+    """Resolve the durable circuit-state snapshot path for *profile*.
+
+    Tests override this function directly (monkeypatch.setattr), consistent
+    with how reset_state() isolates in-memory circuit state between tests --
+    never write to the real path from a test.
+    """
+    return Path.home() / ".hindsight" / "profiles" / f"{profile}.circuit_state.json"
+
+
+def _iso_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp_name, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _write_circuit_state(
+    profile: str,
+    circuit: "_ProfileCircuit",
+    decision: HealthDecision,
+    now_monotonic: float,
+    wall_ref: float,
+) -> None:
+    """Persist a wall-clock snapshot of *circuit* for external readers (e.g. a watchdog).
+
+    now_monotonic/wall_ref are a paired (time.monotonic(), time.time())
+    reference captured together at the top of classify(), used to convert
+    the monotonic-based next_allowed_attempt_at into a wall-clock epoch
+    without drift from the probe sequence's own elapsed time. A
+    next_allowed_attempt_at of 0.0 (the "no suppression pending" sentinel)
+    maps to epoch 0.0 rather than through the offset, since it isn't a real
+    monotonic timestamp. Best-effort: a write failure is logged and
+    swallowed, never allowed to break the classification decision itself.
+    """
+    wall_now = time.time()
+    with circuit.lock:
+        if circuit.next_allowed_attempt_at <= 0.0:
+            next_allowed_epoch = 0.0
+        else:
+            next_allowed_epoch = wall_ref + (circuit.next_allowed_attempt_at - now_monotonic)
+        payload = {
+            "schema_version": 1,
+            "profile": profile,
+            "circuit_open": circuit.circuit_open,
+            "failure_count": circuit.failure_count,
+            "flap_count": circuit.flap_count,
+            "next_allowed_attempt_at_epoch": next_allowed_epoch,
+            "next_allowed_attempt_at_iso": _iso_utc(next_allowed_epoch),
+            "last_classified_at_epoch": wall_now,
+            "last_classified_at_iso": _iso_utc(wall_now),
+            "last_reason_code": decision.reason_code,
+            "listener_present": decision.listener_present,
+            "last_healthy_at_iso": circuit.last_healthy_at_iso,
+            "pid": os.getpid(),
+        }
+    try:
+        _atomic_write_json(_circuit_state_path(profile), payload)
+    except OSError:
+        logger.warning("Failed to write Hindsight circuit-state snapshot for profile %r", profile)
 
 
 def _fq_exception_class(exc: BaseException) -> str:
@@ -288,6 +377,7 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
     """Run one full classification sequence and update the profile's circuit."""
     circuit = _get_circuit(profile)
     now = time.monotonic()
+    wall_ref = time.time()
 
     probes, seq_state, listener_present = _run_sequence(url)
 
@@ -300,12 +390,14 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
             circuit.next_allowed_attempt_at = 0.0
             circuit.attempt_id = NONE_SENTINEL
             circuit.circuit_open = False
+            circuit.last_healthy_at_iso = _iso_utc(time.time())
         force = recovered or len(probes) > 1
         reason = "healthy_recovery" if force else "healthy"
         decision = HealthDecision(
             state=HEALTHY, final_bool=True, reason_code=reason, probes=probes,
             listener_present=True, startup_attempt_id=attempt_id,
         )
+        _write_circuit_state(profile, circuit, decision, now, wall_ref)
         _maybe_log_healthy(decision, profile, circuit, force=force)
         return decision
 
@@ -341,13 +433,17 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
                 suppress = _FIRST_FAILURE_SUPPRESS_SECONDS
             else:
                 suppress = _SECOND_FAILURE_SUPPRESS_SECONDS
-                # Latch open. Elapsing the suppression window no longer
-                # re-authorizes an automatic attempt on its own -- only a
-                # verified healthy result (or a fresh process) resets this.
+                # Latch open (flap indicator). This flag no longer gates
+                # attempt authorization by itself -- next_allowed_attempt_at
+                # alone does, so authorization re-arms on its own 15-minute
+                # cadence for as long as the profile stays dead. Only a
+                # verified healthy result (or a fresh process) clears it.
+                if not circuit.circuit_open:
+                    circuit.flap_count += 1
                 circuit.circuit_open = True
             circuit.next_allowed_attempt_at = now + suppress
 
-        if circuit.circuit_open or now < circuit.next_allowed_attempt_at:
+        if now < circuit.next_allowed_attempt_at:
             decision = HealthDecision(
                 state=DEAD, final_bool=True, reason_code="circuit_open_suppressed",
                 probes=probes, listener_present=False,
@@ -360,6 +456,7 @@ def classify(manager, profile: str, url: str) -> HealthDecision:
                 state=DEAD, final_bool=False, reason_code="restart_authorized",
                 probes=probes, listener_present=False, startup_attempt_id=circuit.attempt_id,
             )
+    _write_circuit_state(profile, circuit, decision, now, wall_ref)
     _log_final(decision, profile, logging.ERROR)
     return decision
 

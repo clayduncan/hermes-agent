@@ -27,6 +27,18 @@ def _reset_health_contract_state():
     health_contract.reset_state()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_circuit_state_path(tmp_path, monkeypatch):
+    """manager.is_running() here goes through health_contract.classify(),
+    which persists a durable per-profile snapshot (OPS-111). Redirect it to
+    tmp_path so this file's is_running() exercises never write under the
+    real ~/.hindsight/profiles/ directory."""
+    monkeypatch.setattr(
+        health_contract, "_circuit_state_path",
+        lambda profile: tmp_path / f"{profile}.circuit_state.json",
+    )
+
+
 def _stub_manager(url=_TEST_URL):
     return SimpleNamespace(get_url=lambda profile: url)
 

@@ -421,7 +421,7 @@ class TestPostSetup:
         env_text = (hermes_home / ".env").read_text()
         assert "HINDSIGHT_LLM_API_KEY=sk-local-test\n" in env_text
         assert "HINDSIGHT_TIMEOUT=120\n" in env_text
-        assert "HINDSIGHT_IDLE_TIMEOUT=300\n" in env_text
+        assert "HINDSIGHT_IDLE_TIMEOUT=0\n" in env_text
 
         profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
         assert profile_env.exists()
@@ -430,7 +430,7 @@ class TestPostSetup:
             "HINDSIGHT_API_LLM_API_KEY=sk-local-test\n"
             "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
             "HINDSIGHT_API_LOG_LEVEL=info\n"
-            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=300\n"
+            "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=0\n"
         )
 
 
