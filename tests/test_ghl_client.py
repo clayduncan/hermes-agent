@@ -678,3 +678,133 @@ class TestExistingSubAccountsStillWork:
         created = ghl.create_contact({"firstName": "Fresh"}, trigger=TRIGGER)
         assert created == CONTACT_CREATED
         assert transport.writes[0].json_body["locationId"] == "chillcabins-location"
+
+
+# ── OPS-18: contact notes (create/read only) ─────────────────────────────────
+
+NOTE_BODY = "Desk call - 2026-09-21 03:14 PM CDT\n[ops18-event:abc123]"
+NOTE_CREATED = {"id": "note-1", "contactId": "g-1", "body": NOTE_BODY}
+
+
+def route_create_note(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route("POST", f"/contacts/{contact_id}/notes", {"note": NOTE_CREATED})
+    transport.route("GET", f"/contacts/{contact_id}/notes/note-1", {"note": NOTE_CREATED})
+
+
+class TestNoteAuditOrdering:
+    """Same invariant as every other write: the audit intent must land before
+    the destination is ever called, and a failed append blocks the POST."""
+
+    def test_append_raising_blocks_the_create_note_call(
+        self, transport, log_dir, monkeypatch
+    ) -> None:
+        route_create_note(transport)
+        monkeypatch.setattr(
+            write_audit_log,
+            "append_entry",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+        )
+        with pytest.raises(WriteAuditLogError):
+            client(transport, log_dir).create_note("g-1", "note body", trigger=TRIGGER)
+        assert [c for c in transport.writes if "/notes" in c.url] == []
+
+    def test_scope_check_happens_before_any_audit_line_or_call(
+        self, transport, log_dir
+    ) -> None:
+        """A contact outside this client's scope fails before the audit
+        intent is written and before any note endpoint is called."""
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).create_note("g-1", "note body", trigger=TRIGGER)
+        assert transport.paths == [("GET", "/contacts/g-1")]  # only the scope-check GET
+        assert entries(log_dir) == []
+
+    def test_create_note_reads_before_writing_and_reads_back_after(
+        self, transport, log_dir
+    ) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note("g-1", NOTE_BODY, trigger=TRIGGER)
+        assert transport.paths == [
+            ("GET", "/contacts/g-1"),
+            ("POST", "/contacts/g-1/notes"),
+            ("GET", "/contacts/g-1/notes/note-1"),
+        ]
+        outcome = outcome_entry(log_dir)
+        assert outcome["destination"] == "ghl_contacts"
+        assert outcome["operation"] == "create"
+        assert outcome["before"] is None
+        assert outcome["record_id"] == "note-1"
+        assert outcome["after"] == NOTE_CREATED
+
+
+class TestNoteScopeRejection:
+    def test_create_note_rejects_a_missing_contact(self, transport, log_dir) -> None:
+        transport.route("GET", "/contacts/g-404", HttpResponse(status_code=404))
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).create_note("g-404", "note body", trigger=TRIGGER)
+        assert entries(log_dir) == []
+
+    def test_list_notes_rejects_a_contact_from_another_location(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).list_notes("g-1")
+
+    def test_get_note_rejects_a_contact_from_another_location(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).get_note("g-1", "note-1")
+
+
+class TestNoteCreateAndReadBack:
+    def test_create_note_returns_the_created_note(self, transport, log_dir) -> None:
+        route_create_note(transport)
+        created = client(transport, log_dir).create_note("g-1", NOTE_BODY, trigger=TRIGGER)
+        assert created == NOTE_CREATED
+
+    def test_list_notes_returns_the_notes_list(self, transport, log_dir) -> None:
+        in_scope = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": in_scope})
+        transport.route("GET", "/contacts/g-1/notes", {"notes": [NOTE_CREATED]})
+        notes = client(transport, log_dir).list_notes("g-1")
+        assert notes == [NOTE_CREATED]
+
+    def test_get_note_returns_the_single_note(self, transport, log_dir) -> None:
+        in_scope = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": in_scope})
+        transport.route("GET", "/contacts/g-1/notes/note-1", {"note": NOTE_CREATED})
+        note = client(transport, log_dir).get_note("g-1", "note-1")
+        assert note == NOTE_CREATED
+
+    def test_list_notes_and_get_note_write_no_audit_line(self, transport, log_dir) -> None:
+        in_scope = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": in_scope})
+        transport.route("GET", "/contacts/g-1/notes", {"notes": [NOTE_CREATED]})
+        transport.route("GET", "/contacts/g-1/notes/note-1", {"note": NOTE_CREATED})
+        c = client(transport, log_dir)
+        c.list_notes("g-1")
+        c.get_note("g-1", "note-1")
+        assert entries(log_dir) == []
+
+    def test_empty_body_is_refused_before_the_gate(self, transport, log_dir) -> None:
+        in_scope = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": in_scope})
+        with pytest.raises(ValueError, match="non-empty body"):
+            client(transport, log_dir).create_note("g-1", "  ", trigger=TRIGGER)
+        assert entries(log_dir) == []
+        assert [c for c in transport.writes if "/notes" in c.url] == []
+
+
+class TestNoUpdateOrDeleteNoteCapability:
+    def test_the_client_exposes_no_note_mutation_beyond_create(self, transport, log_dir) -> None:
+        ghl = client(transport, log_dir)
+        assert not hasattr(ghl, "update_note")
+        assert not hasattr(ghl, "delete_note")

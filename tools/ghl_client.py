@@ -150,6 +150,13 @@ def _unwrap_contact(payload: Any) -> Any:
     return payload
 
 
+def _unwrap_note(payload: Any) -> Any:
+    """GHL wraps a single note as ``{"note": {...}}``."""
+    if isinstance(payload, dict) and "note" in payload:
+        return payload["note"]
+    return payload
+
+
 class GoHighLevelWriteClient:
     """Audited contact writes against one GoHighLevel sub-account."""
 
@@ -471,6 +478,78 @@ class GoHighLevelWriteClient:
         after, after_fetch_failed = self._fetch_after(contact_id)
         authorized.record_outcome(after=after, after_fetch_failed=after_fetch_failed)
         return result
+
+    # ── Contact notes (create/read only, no update/delete capability) ───────
+
+    def _require_contact_in_scope(self, contact_id: str) -> Any:
+        """The shared boundary every note read/write goes through first.
+
+        A wrong or missing contact fails here, before any audit intent or
+        destination call, same fail-closed shape as the location-scope
+        checks above.
+        """
+        contact = self.get_contact_in_scope(contact_id)
+        if contact is None:
+            raise ScopeViolationError(
+                f"Refusing a note operation on contact {contact_id!r}: not found "
+                f"in this client's scope (account {self.account_key!r}, location "
+                f"{self.location_id!r}). No GHL request was attempted and no "
+                "audit record was written."
+            )
+        return contact
+
+    def list_notes(self, contact_id: str) -> list[Any]:
+        """``GET /contacts/{id}/notes``. A read, no audit line."""
+        self._require_contact_in_scope(contact_id)
+        result = self._call("GET", f"/contacts/{contact_id}/notes")
+        notes = result.get("notes") if isinstance(result, dict) else None
+        return notes if isinstance(notes, list) else []
+
+    def get_note(self, contact_id: str, note_id: str) -> Any:
+        """``GET /contacts/{id}/notes/{noteId}``. A read, no audit line."""
+        self._require_contact_in_scope(contact_id)
+        return _unwrap_note(self._call("GET", f"/contacts/{contact_id}/notes/{note_id}"))
+
+    def create_note(self, contact_id: str, body: str, *, trigger: str) -> Any:
+        """``POST /contacts/{id}/notes``. Audited as a ``create``.
+
+        Contact scope is enforced before the audit intent and before any
+        destination call. There is deliberately no ``update_note``/
+        ``delete_note``: this build introduces create/read only for contact
+        notes.
+        """
+        self._require_contact_in_scope(contact_id)
+        require_trigger(trigger)
+        if not body or not str(body).strip():
+            raise ValueError(
+                "create_note() requires a non-empty body. No audit line was "
+                "written and no destination API was called."
+            )
+        authorized = self._authorize(
+            operation="create", record_id=None, before=None, trigger=trigger
+        )
+        created = _unwrap_note(
+            self._call("POST", f"/contacts/{contact_id}/notes", json_body={"body": body})
+        )
+
+        note_id = created.get("id") if isinstance(created, dict) else None
+        if note_id:
+            after, after_fetch_failed = self._fetch_note_after(contact_id, note_id)
+        else:
+            after, after_fetch_failed = None, True
+        authorized.record_outcome(
+            record_id=note_id, after=after, after_fetch_failed=after_fetch_failed
+        )
+        return created
+
+    def _fetch_note_after(self, contact_id: str, note_id: str) -> tuple[Any, bool]:
+        try:
+            return (
+                _unwrap_note(self._call("GET", f"/contacts/{contact_id}/notes/{note_id}")),
+                False,
+            )
+        except (HttpRequestError, OSError):
+            return None, True
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

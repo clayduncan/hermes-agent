@@ -116,6 +116,10 @@ OUTCOME_DENY_PAUSED = "deny_paused"
 OUTCOME_DENY_RETIRED = "deny_retired"
 OUTCOME_UNEXPECTED_DECISION = "unexpected_decision"
 
+# --- OPS-18 GHL note mirror state (crash-safe idempotency, keyed by ledger event_id) ---
+NOTE_MIRROR_STATUS_PENDING = "pending"
+NOTE_MIRROR_STATUS_COMPLETE = "complete"
+
 # --- Manual-run / action-approval token TTLs (mirrors registry.py precedent) ---
 CONFIRMATION_TTL_SECONDS = 300
 ACTION_APPROVAL_TTL_SECONDS = 300
@@ -215,6 +219,18 @@ CREATE TABLE IF NOT EXISTS action_approval_tokens (
     expires_at         TEXT NOT NULL,
     used_at            TEXT,
     state              TEXT NOT NULL DEFAULT 'issued'
+);
+
+CREATE TABLE IF NOT EXISTS note_mirror (
+    event_id         TEXT NOT NULL PRIMARY KEY,
+    contact_id       TEXT NOT NULL,
+    note_id          TEXT,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    content_hash     TEXT,
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    last_attempt_at  TEXT
 );
 """
 
@@ -333,6 +349,33 @@ def _row_to_pending_review(row: sqlite3.Row) -> PendingReviewRow:
         updated_at=row["updated_at"],
         display_name=row["display_name"],
         masked_labels=masked_labels,
+    )
+
+
+@dataclass
+class NoteMirrorRow:
+    event_id: str
+    contact_id: str
+    note_id: str | None
+    status: str
+    content_hash: str | None
+    attempts: int
+    created_at: str
+    updated_at: str
+    last_attempt_at: str | None
+
+
+def _row_to_note_mirror(row: sqlite3.Row) -> NoteMirrorRow:
+    return NoteMirrorRow(
+        event_id=row["event_id"],
+        contact_id=row["contact_id"],
+        note_id=row["note_id"],
+        status=row["status"],
+        content_hash=row["content_hash"],
+        attempts=row["attempts"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        last_attempt_at=row["last_attempt_at"],
     )
 
 
@@ -854,6 +897,77 @@ class IngestionStateDb:
                 )
                 changed = conn.execute("SELECT changes()").fetchone()[0]
         return changed == 1
+
+    # --- note_mirror (OPS-18 GHL note mirror crash-safe idempotency) -----------
+
+    def get_note_mirror(self, event_id: str) -> NoteMirrorRow | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM note_mirror WHERE event_id=?", (event_id,)
+            ).fetchone()
+        return _row_to_note_mirror(row) if row else None
+
+    def record_note_mirror_attempt(
+        self, event_id: str, *, contact_id: str, content_hash: str
+    ) -> None:
+        """Record that a mirror attempt is starting for *event_id*.
+
+        INSERT OR IGNORE creates the row on the first attempt; the follow-up
+        UPDATE bumps ``attempts``/``last_attempt_at`` on every call, including
+        retries after a crash. Never touches an already-``complete`` row, so
+        a stray re-attempt after recovery cannot regress its state.
+        """
+        now = self._now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN")
+                try:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO note_mirror
+                           (event_id, contact_id, note_id, status, content_hash,
+                            attempts, created_at, updated_at, last_attempt_at)
+                           VALUES (?,?,NULL,?,?,0,?,?,?)""",
+                        (
+                            event_id, contact_id, NOTE_MIRROR_STATUS_PENDING,
+                            content_hash, now, now, now,
+                        ),
+                    )
+                    conn.execute(
+                        """UPDATE note_mirror
+                           SET attempts=attempts+1, content_hash=?,
+                               last_attempt_at=?, updated_at=?
+                           WHERE event_id=? AND status != ?""",
+                        (content_hash, now, now, event_id, NOTE_MIRROR_STATUS_COMPLETE),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+
+    def mark_note_mirror_complete(
+        self, event_id: str, *, contact_id: str, note_id: str, content_hash: str
+    ) -> None:
+        """Idempotent: safe to call again for an event already marked complete
+        (e.g. a retry that re-discovers the same note by marker)."""
+        now = self._now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO note_mirror
+                       (event_id, contact_id, note_id, status, content_hash,
+                        attempts, created_at, updated_at, last_attempt_at)
+                       VALUES (?,?,?,?,?,1,?,?,?)
+                       ON CONFLICT(event_id) DO UPDATE SET
+                           contact_id=excluded.contact_id,
+                           note_id=excluded.note_id,
+                           status=excluded.status,
+                           content_hash=excluded.content_hash,
+                           updated_at=excluded.updated_at""",
+                    (
+                        event_id, contact_id, note_id, NOTE_MIRROR_STATUS_COMPLETE,
+                        content_hash, now, now, now,
+                    ),
+                )
 
 
 # ---------------------------------------------------------------------------
