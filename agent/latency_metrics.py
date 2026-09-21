@@ -23,15 +23,31 @@ the small ``note_*`` helper functions below, which look up that recorder
 and update it. See AGENTS.md's "Prompt Caching Must Not Break" section -
 this module reads agent state defensively (``getattr`` everywhere) and
 never mutates provider payloads, messages, or tool schemas.
+
+The turn ordinal (``agent._latency_turn_ordinal``) is normally just an
+instance counter - correct as long as one ``AIAgent`` instance lives for
+the whole conversation (the native gateway's per-session ``_agent_cache``).
+Some surfaces (the API server's ``/v1/*`` handlers) construct a fresh
+``AIAgent`` per HTTP request, so an instance-only counter would report
+ordinal 1 forever. ``_SessionOrdinalRegistry`` below is a bounded,
+thread-safe, process-local map from the existing ``gateway_session_key``
+seam (``agent._gateway_session_key`` - the same stable per-conversation key
+``_last_resolved_model`` already keys off in ``gateway/platforms/
+api_server.py``) to the last-seen ordinal, so a brand-new instance for an
+already-active conversation continues counting instead of restarting at 1.
+The key is used only as an in-memory dict key - it is never placed in a
+latency record, log line, or any other output.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 LATENCY_LOGGER_NAME = "agent.latency"
 
@@ -273,10 +289,99 @@ def emit_turn_latency(record: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
+_ORDINAL_REGISTRY_MAX_KEYS = 4096
+_ORDINAL_REGISTRY_TTL_SECONDS = 6 * 60 * 60  # 6h - bounds memory only; never persisted/logged.
+
+
+class _SessionOrdinalRegistry:
+    """Bounded, thread-safe LRU+TTL map of session-key -> last-seen turn ordinal.
+
+    Lets a fresh ``AIAgent`` instance for an already-active conversation
+    (e.g. one created per API request) continue the ordinal sequence a
+    prior instance for the SAME conversation left off, without ever
+    persisting or emitting the key itself. Process-local only: a process
+    restart, idle eviction, or the bound being exceeded resets the counter
+    for that conversation, which is an accepted, documented limitation for
+    a diagnostic-only metric (see module docstring).
+    """
+
+    def __init__(self, max_keys: int = _ORDINAL_REGISTRY_MAX_KEYS,
+                 ttl_seconds: float = _ORDINAL_REGISTRY_TTL_SECONDS) -> None:
+        self._store: "OrderedDict[str, Tuple[int, float]]" = OrderedDict()
+        self._lock = threading.Lock()
+        self._max_keys = max_keys
+        self._ttl_seconds = ttl_seconds
+
+    def _purge_expired_locked(self, now: float) -> None:
+        expired = [k for k, (_, ts) in self._store.items() if now - ts > self._ttl_seconds]
+        for k in expired:
+            self._store.pop(k, None)
+
+    def bump(self, key: str, known_ordinal: int) -> int:
+        """Advance the registry's ordinal for ``key`` past ``known_ordinal``.
+
+        ``known_ordinal`` is whatever this call site already believes the
+        last ordinal was (0 if this ``AIAgent`` instance has not tracked a
+        turn yet). The registry is authoritative across instances, so the
+        new ordinal is ``max(registry_value, known_ordinal) + 1`` - this
+        keeps a cache-evicted-and-recreated instance from ever regressing
+        or double-counting, and is a pure no-op (matches the pre-existing
+        instance-only counter exactly) when only one instance ever touches
+        a given key. Never raises.
+
+        The size bound is enforced by evicting the least-recently-bumped
+        key(s) AFTER the current key is (re-)inserted as most-recently-used
+        - so the key being bumped right now is never the one evicted.
+        """
+        try:
+            now = time.monotonic()
+            with self._lock:
+                self._purge_expired_locked(now)
+                prev, _ts = self._store.pop(key, (0, 0.0))
+                ordinal = max(prev, known_ordinal) + 1
+                self._store[key] = (ordinal, now)
+                while len(self._store) > self._max_keys:
+                    self._store.popitem(last=False)
+                return ordinal
+        except Exception:
+            return known_ordinal + 1
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+
+_session_ordinal_registry = _SessionOrdinalRegistry()
+
+
+def _ordinal_session_key(agent: Any) -> Optional[str]:
+    """Best-effort stable per-conversation key for the ordinal registry.
+
+    Returns ``agent._gateway_session_key`` when present - the same seam
+    ``api_server.py`` already uses to key its (unbounded, but session-count-
+    scale) ``_last_resolved_model`` cache. Deliberately does NOT fall back
+    to ``session_id``: the API server mints a fresh UUID ``session_id`` per
+    stateless request, and keying on that would grow the registry with a
+    one-shot entry per request instead of collapsing onto one entry per
+    conversation.
+    """
+    try:
+        key = getattr(agent, "_gateway_session_key", None)
+        if isinstance(key, str) and key:
+            return key
+    except Exception:
+        pass
+    return None
+
+
 def start_turn_latency(agent: Any) -> None:
     """Begin tracking a new turn. Called once at the top of ``run_conversation``."""
     try:
-        ordinal = int(getattr(agent, "_latency_turn_ordinal", 0) or 0) + 1
+        known_ordinal = int(getattr(agent, "_latency_turn_ordinal", 0) or 0)
+        session_key = _ordinal_session_key(agent)
+        if session_key:
+            ordinal = _session_ordinal_registry.bump(session_key, known_ordinal)
+        else:
+            ordinal = known_ordinal + 1
         agent._latency_turn_ordinal = ordinal
         surface = normalize_surface(getattr(agent, "platform", None))
         agent._latency_turn = TurnLatencyRecorder(surface=surface, turn_ordinal=ordinal)
