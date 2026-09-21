@@ -229,6 +229,57 @@ class TestGuiMode:
         assert "gateway event" not in content
 
 
+class TestLatencySink:
+    """setup_logging() wires a dedicated, session-id-free latency.jsonl sink.
+
+    Latency L0 requires that per-turn timing records never carry a session
+    id — but the shared agent.log format string includes
+    ``%(session_tag)s`` for every other logger. Records still propagate
+    normally (the shared async queue/listener only dispatches records that
+    reach root — see _register_queued_handler); what keeps latency records
+    session-tag-free is (a) latency.jsonl's own plain "%(message)s"
+    formatter and (b) agent.log's handler explicitly excluding the
+    "agent.latency" component so the catch-all copy never exists.
+    """
+
+    def test_latency_sink_created_unconditionally(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+
+        handlers = [
+            h for h in hermes_logging.rotating_file_handlers()
+            if isinstance(h, RotatingFileHandler)
+            and "latency.jsonl" in getattr(h, "baseFilename", "")
+        ]
+        assert len(handlers) == 1
+        assert handlers[0].backupCount == 5
+
+    def test_latency_record_never_carries_session_tag(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        hermes_logging.set_session_context("super-secret-session-id-123")
+        try:
+            logging.getLogger("agent.latency").info('{"surface":"cli"}')
+        finally:
+            hermes_logging.clear_session_context()
+
+        hermes_logging.flush_log_queue()
+
+        latency_log = hermes_home / "logs" / "latency.jsonl"
+        assert latency_log.exists()
+        content = latency_log.read_text()
+        assert "super-secret-session-id-123" not in content
+        assert content.strip() == '{"surface":"cli"}'
+
+    def test_latency_records_do_not_leak_into_agent_log(self, hermes_home):
+        hermes_logging.setup_logging(hermes_home=hermes_home, mode="cli")
+        logging.getLogger("agent.latency").info('{"surface":"cli"}')
+
+        hermes_logging.flush_log_queue()
+
+        agent_log = hermes_home / "logs" / "agent.log"
+        if agent_log.exists():
+            assert '{"surface":"cli"}' not in agent_log.read_text()
+
+
 class TestSessionContext:
     """set_session_context / clear_session_context + _SessionFilter."""
 

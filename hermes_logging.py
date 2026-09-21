@@ -231,6 +231,22 @@ class _ComponentFilter(logging.Filter):
         return record.name.startswith(self._prefixes)
 
 
+class _ExcludeComponentFilter(logging.Filter):
+    """Block records whose logger name starts with one of *prefixes*.
+
+    The inverse of :class:`_ComponentFilter` — used to keep a
+    session-tagged catch-all sink (``agent.log``) from also carrying
+    records meant for a content-free sink (``latency.jsonl``).
+    """
+
+    def __init__(self, prefixes: Sequence[str]) -> None:
+        super().__init__()
+        self._prefixes = tuple(prefixes)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return not record.name.startswith(self._prefixes)
+
+
 # Logger name prefixes that belong to each component.
 # Used by _ComponentFilter and exposed for ``hermes logs --component``.
 COMPONENT_PREFIXES = {
@@ -318,6 +334,12 @@ def setup_logging(
     root = logging.getLogger()
 
     # --- agent.log (INFO+) — the main activity log -------------------------
+    # Excludes "agent.latency" records: the shared queue/listener dispatches
+    # every record to every registered handler regardless of which logger
+    # nominally "owns" the handler (see _register_queued_handler), so this
+    # exclusion is what keeps the session-tagged _LOG_FORMAT off latency
+    # records — not propagation, which must stay on for those records to
+    # reach the queue at all (see latency.jsonl below).
     _add_rotating_handler(
         root,
         log_dir / "agent.log",
@@ -325,6 +347,7 @@ def setup_logging(
         max_bytes=max_bytes,
         backup_count=backups,
         formatter=RedactingFormatter(_LOG_FORMAT),
+        log_filter=_ExcludeComponentFilter(("agent.latency",)),
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -335,6 +358,20 @@ def setup_logging(
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
         formatter=RedactingFormatter(_LOG_FORMAT),
+    )
+
+    # --- latency.jsonl (content-free per-turn latency telemetry) -----------
+    # Filtered to ONLY "agent.latency" records, plain "%(message)s" format
+    # (no %(session_tag)s — see agent/latency_metrics.py, which never logs
+    # anything but a content-free JSON object here).
+    _add_rotating_handler(
+        root,
+        log_dir / "latency.jsonl",
+        level=logging.INFO,
+        max_bytes=5 * 1024 * 1024,
+        backup_count=5,
+        formatter=logging.Formatter("%(message)s"),
+        log_filter=_ComponentFilter(("agent.latency",)),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------

@@ -8393,6 +8393,7 @@ class AIAgent:
         )
         from agent import relay_runtime
         from agent.conversation_loop import run_conversation
+        from agent.latency_metrics import finalize_turn_latency, start_turn_latency
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -8402,6 +8403,7 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
+        start_turn_latency(self)
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {
@@ -8843,6 +8845,7 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    finalize_turn_latency(self, relay_outcome)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
