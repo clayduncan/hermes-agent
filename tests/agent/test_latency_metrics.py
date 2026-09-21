@@ -404,6 +404,120 @@ def test_note_context_tokens_does_not_mutate_api_payload():
     assert payload == before
 
 
+# ---------------------------------------------------------------------------
+# 9. Cross-instance ordinal persistence (the API-server defect this pass
+#    fixes): a fresh AIAgent per HTTP request must not reset ordinal/band to
+#    1 forever. The session key is an in-memory dict key ONLY - it must
+#    never reach a latency record, a log line, or the plain-text report.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fresh_ordinal_registry(monkeypatch):
+    """Isolate the module-level registry singleton for one test."""
+    registry = lat._SessionOrdinalRegistry()
+    monkeypatch.setattr(lat, "_session_ordinal_registry", registry)
+    return registry
+
+
+def test_ordinal_persists_across_fresh_instances_same_session_key(fresh_ordinal_registry):
+    agent1 = SimpleNamespace(platform="api_server", _gateway_session_key="api-abc123")
+    lat.start_turn_latency(agent1)
+    assert agent1._latency_turn_ordinal == 1
+    lat.finalize_turn_latency(agent1, "success")
+
+    # A brand-new AIAgent instance (as api_server.py constructs per request)
+    # for the SAME session key must continue, not restart at 1.
+    agent2 = SimpleNamespace(platform="api_server", _gateway_session_key="api-abc123")
+    lat.start_turn_latency(agent2)
+    assert agent2._latency_turn_ordinal == 2
+    record = lat.finalize_turn_latency(agent2, "success")
+    assert record["turn_ordinal"] == 2
+    assert record["turn_band"] == "1-5"
+
+
+def test_ordinal_independent_across_different_session_keys(fresh_ordinal_registry):
+    agent_a1 = SimpleNamespace(platform="api_server", _gateway_session_key="api-session-a")
+    lat.start_turn_latency(agent_a1)
+    lat.finalize_turn_latency(agent_a1, "success")
+    agent_a2 = SimpleNamespace(platform="api_server", _gateway_session_key="api-session-a")
+    lat.start_turn_latency(agent_a2)
+    assert agent_a2._latency_turn_ordinal == 2
+
+    # A different session key starts its own sequence from 1, unaffected by
+    # session "a"'s activity.
+    agent_b1 = SimpleNamespace(platform="api_server", _gateway_session_key="api-session-b")
+    lat.start_turn_latency(agent_b1)
+    assert agent_b1._latency_turn_ordinal == 1
+
+
+def test_ordinal_registry_survives_instance_eviction_and_recreation(fresh_ordinal_registry):
+    """Mirrors the native gateway's bounded ``_agent_cache``: if a long-lived
+    instance is evicted and rebuilt mid-conversation, the new instance must
+    continue the sequence rather than regress to 1."""
+    agent = SimpleNamespace(platform="gateway", _gateway_session_key="agent:main:telegram:dm:1")
+    for _ in range(5):
+        lat.start_turn_latency(agent)
+        lat.finalize_turn_latency(agent, "success")
+    assert agent._latency_turn_ordinal == 5
+
+    # Cache eviction: a fresh instance object for the same session key.
+    rebuilt_agent = SimpleNamespace(platform="gateway", _gateway_session_key="agent:main:telegram:dm:1")
+    lat.start_turn_latency(rebuilt_agent)
+    assert rebuilt_agent._latency_turn_ordinal == 6
+
+
+def test_ordinal_without_session_key_keeps_pre_existing_instance_only_behavior(fresh_ordinal_registry):
+    """No ``gateway_session_key`` (CLI/TUI/cron/subagent, or an anonymous API
+    request) must behave exactly as before this fix: a pure per-instance
+    counter, with the registry never consulted."""
+    agent = SimpleNamespace(platform="cli", _gateway_session_key=None)
+    lat.start_turn_latency(agent)
+    assert agent._latency_turn_ordinal == 1
+    lat.finalize_turn_latency(agent, "success")
+    lat.start_turn_latency(agent)
+    assert agent._latency_turn_ordinal == 2
+    assert len(fresh_ordinal_registry) == 0
+
+
+def test_ordinal_registry_bounded_eviction():
+    registry = lat._SessionOrdinalRegistry(max_keys=3, ttl_seconds=3600)
+    for i in range(5):
+        registry.bump(f"session-{i}", 0)
+    # Only the 3 most recently touched keys survive the bound.
+    assert len(registry) == 3
+    assert registry.bump("session-4", 0) == 2  # session-4 already present at 1
+    assert registry.bump("session-0", 0) == 1  # session-0 was evicted, restarts
+
+
+def test_ordinal_registry_bounded_by_ttl(monkeypatch):
+    registry = lat._SessionOrdinalRegistry(max_keys=100, ttl_seconds=10)
+    fake_now = [1000.0]
+    monkeypatch.setattr(lat.time, "monotonic", lambda: fake_now[0])
+    assert registry.bump("session-x", 0) == 1
+    fake_now[0] += 20  # older than the 10s TTL
+    # A stale entry is purged, not carried forward, so this restarts at 1.
+    assert registry.bump("session-x", 0) == 1
+
+
+def test_session_key_never_enters_latency_record_or_report(fresh_ordinal_registry, caplog):
+    secret_key = "api-super-secret-session-key-should-never-leak"
+    agent = SimpleNamespace(platform="api_server", _gateway_session_key=secret_key)
+
+    with caplog.at_level(logging.INFO, logger=lat.LATENCY_LOGGER_NAME):
+        lat.start_turn_latency(agent)
+        record = lat.finalize_turn_latency(agent, "success")
+
+    assert secret_key not in json.dumps(record)
+    for r in caplog.records:
+        assert secret_key not in r.message
+
+    agg = lat.aggregate_latency([record])
+    report = lat.format_report(agg)
+    assert secret_key not in report
+    assert secret_key not in json.dumps(agg)
+
+
 def test_compression_signal_only_reported_when_this_turn_recorded_it():
     compressor = SimpleNamespace(_last_compression_telemetry={"total_duration_ms": 42.0})
     agent = SimpleNamespace(
