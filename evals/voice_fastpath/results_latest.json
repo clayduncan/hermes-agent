@@ -1,0 +1,375 @@
+{
+  "schema_version": 1,
+  "prompt_char_len": 54,
+  "platform": "zippy_voice",
+  "generated_at": "2026-09-21T20:14:45Z",
+  "reps": [
+    {
+      "label": "A_gpt-5.6-sol_medium_baseline",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "medium",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 7114.2,
+      "first_content_ms": null,
+      "total_duration_ms": 15055.1,
+      "correct": false
+    },
+    {
+      "label": "A_gpt-5.6-sol_medium_baseline",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "medium",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 3544.6,
+      "first_content_ms": null,
+      "total_duration_ms": 10650.3,
+      "correct": false
+    },
+    {
+      "label": "A_gpt-5.6-sol_medium_baseline",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "medium",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 4097.4,
+      "first_content_ms": null,
+      "total_duration_ms": 10516.5,
+      "correct": false
+    },
+    {
+      "label": "B_gpt-5.6-sol_low",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 4151.7,
+      "first_content_ms": null,
+      "total_duration_ms": 8679.7,
+      "correct": false
+    },
+    {
+      "label": "B_gpt-5.6-sol_low",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 3450.8,
+      "first_content_ms": null,
+      "total_duration_ms": 7017.4,
+      "correct": false
+    },
+    {
+      "label": "B_gpt-5.6-sol_low",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 4541.9,
+      "first_content_ms": null,
+      "total_duration_ms": 9657.7,
+      "correct": false
+    },
+    {
+      "label": "B_gpt-5.6-sol_minimal",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "minimal",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 3741.4,
+      "first_content_ms": null,
+      "total_duration_ms": 7972.4,
+      "correct": false
+    },
+    {
+      "label": "B_gpt-5.6-sol_minimal",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "minimal",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 3332.3,
+      "first_content_ms": null,
+      "total_duration_ms": 7916.9,
+      "correct": true
+    },
+    {
+      "label": "B_gpt-5.6-sol_minimal",
+      "model": "gpt-5.6-sol",
+      "provider": "openai-codex",
+      "reasoning_effort": "minimal",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 5227.0,
+      "first_content_ms": null,
+      "total_duration_ms": 8778.5,
+      "correct": false
+    },
+    {
+      "label": "C_gemini-3-flash-preview_none",
+      "model": "gemini-3-flash-preview",
+      "provider": "gemini",
+      "reasoning_effort": "none",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 2663.5,
+      "first_content_ms": null,
+      "total_duration_ms": 9338.9,
+      "correct": true
+    },
+    {
+      "label": "C_gemini-3-flash-preview_none",
+      "model": "gemini-3-flash-preview",
+      "provider": "gemini",
+      "reasoning_effort": "none",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 6385.1,
+      "first_content_ms": null,
+      "total_duration_ms": 10167.6,
+      "correct": true
+    },
+    {
+      "label": "C_gemini-3-flash-preview_none",
+      "model": "gemini-3-flash-preview",
+      "provider": "gemini",
+      "reasoning_effort": "none",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 5413.5,
+      "first_content_ms": null,
+      "total_duration_ms": 9725.6,
+      "correct": true
+    },
+    {
+      "label": "D_claude-sonnet-4.6_low",
+      "model": "claude-sonnet-4.6",
+      "provider": "anthropic",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 2969.8,
+      "first_content_ms": null,
+      "total_duration_ms": 6884.3,
+      "correct": true
+    },
+    {
+      "label": "D_claude-sonnet-4.6_low",
+      "model": "claude-sonnet-4.6",
+      "provider": "anthropic",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 2238.9,
+      "first_content_ms": null,
+      "total_duration_ms": 6391.4,
+      "correct": true
+    },
+    {
+      "label": "D_claude-sonnet-4.6_low",
+      "model": "claude-sonnet-4.6",
+      "provider": "anthropic",
+      "reasoning_effort": "low",
+      "hindsight_healthy": true,
+      "ok": true,
+      "error": null,
+      "tool_count": 1,
+      "tool_names": [
+        "session_search"
+      ],
+      "first_model_action_ms": 2362.0,
+      "first_content_ms": null,
+      "total_duration_ms": 6277.4,
+      "correct": true
+    }
+  ],
+  "summary": [
+    {
+      "label": "A_gpt-5.6-sol_medium_baseline",
+      "reps": 3,
+      "valid_reps": 3,
+      "invalid_reason_counts": {
+        "error": 0,
+        "hindsight_unhealthy": 0
+      },
+      "total_duration_ms": {
+        "p50": 10650.3,
+        "p95": 14614.619999999999,
+        "mean": 12074.0
+      },
+      "first_model_action_ms": {
+        "p50": 4097.4,
+        "p95": 6812.5199999999995,
+        "mean": 4918.7
+      },
+      "avg_tool_count": 1.0,
+      "correct_reps": 0,
+      "correct_of_reps": "0/3"
+    },
+    {
+      "label": "B_gpt-5.6-sol_low",
+      "reps": 3,
+      "valid_reps": 3,
+      "invalid_reason_counts": {
+        "error": 0,
+        "hindsight_unhealthy": 0
+      },
+      "total_duration_ms": {
+        "p50": 8679.7,
+        "p95": 9559.900000000001,
+        "mean": 8451.6
+      },
+      "first_model_action_ms": {
+        "p50": 4151.7,
+        "p95": 4502.879999999999,
+        "mean": 4048.1
+      },
+      "avg_tool_count": 1.0,
+      "correct_reps": 0,
+      "correct_of_reps": "0/3"
+    },
+    {
+      "label": "B_gpt-5.6-sol_minimal",
+      "reps": 3,
+      "valid_reps": 3,
+      "invalid_reason_counts": {
+        "error": 0,
+        "hindsight_unhealthy": 0
+      },
+      "total_duration_ms": {
+        "p50": 7972.4,
+        "p95": 8697.89,
+        "mean": 8222.6
+      },
+      "first_model_action_ms": {
+        "p50": 3741.4,
+        "p95": 5078.44,
+        "mean": 4100.2
+      },
+      "avg_tool_count": 1.0,
+      "correct_reps": 1,
+      "correct_of_reps": "1/3"
+    },
+    {
+      "label": "C_gemini-3-flash-preview_none",
+      "reps": 3,
+      "valid_reps": 3,
+      "invalid_reason_counts": {
+        "error": 0,
+        "hindsight_unhealthy": 0
+      },
+      "total_duration_ms": {
+        "p50": 9725.6,
+        "p95": 10123.4,
+        "mean": 9744.0
+      },
+      "first_model_action_ms": {
+        "p50": 5413.5,
+        "p95": 6287.9400000000005,
+        "mean": 4820.7
+      },
+      "avg_tool_count": 1.0,
+      "correct_reps": 3,
+      "correct_of_reps": "3/3"
+    },
+    {
+      "label": "D_claude-sonnet-4.6_low",
+      "reps": 3,
+      "valid_reps": 3,
+      "invalid_reason_counts": {
+        "error": 0,
+        "hindsight_unhealthy": 0
+      },
+      "total_duration_ms": {
+        "p50": 6391.4,
+        "p95": 6835.01,
+        "mean": 6517.7
+      },
+      "first_model_action_ms": {
+        "p50": 2362.0,
+        "p95": 2909.02,
+        "mean": 2523.6
+      },
+      "avg_tool_count": 1.0,
+      "correct_reps": 3,
+      "correct_of_reps": "3/3"
+    }
+  ]
+}
