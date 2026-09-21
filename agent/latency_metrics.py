@@ -1,7 +1,7 @@
 """Content-free per-turn latency instrumentation.
 
 Records how long a conversational turn takes to reach first model output,
-first audible TTS output, and full completion — without ever touching
+first audible TTS output, and full completion - without ever touching
 prompt/response/tool content, system prompt bytes, memory, URLs,
 credentials, or any user/channel/session identifier.
 
@@ -20,7 +20,7 @@ call to ``AIAgent.run_conversation``) and stashed on the agent instance as
 ``agent._latency_turn``. Call sites in ``run_agent.py`` /
 ``agent/conversation_loop.py`` / ``gateway/streaming_tts_consumer.py`` call
 the small ``note_*`` helper functions below, which look up that recorder
-and update it. See AGENTS.md's "Prompt Caching Must Not Break" section —
+and update it. See AGENTS.md's "Prompt Caching Must Not Break" section -
 this module reads agent state defensively (``getattr`` everywhere) and
 never mutates provider payloads, messages, or tool schemas.
 """
@@ -37,7 +37,7 @@ LATENCY_LOGGER_NAME = "agent.latency"
 
 SCHEMA_VERSION = 1
 
-# Allowlisted turn outcomes — no free-form error strings ever enter the record.
+# Allowlisted turn outcomes - no free-form error strings ever enter the record.
 TERMINAL_OUTCOMES = frozenset({
     "success",
     "failed",
@@ -68,7 +68,7 @@ logger = logging.getLogger(LATENCY_LOGGER_NAME)
 def normalize_surface(platform: Optional[str]) -> str:
     """Map an arbitrary ``agent.platform`` value onto the fixed surface allowlist.
 
-    Never returns anything outside :data:`ALLOWED_SURFACES` — the return
+    Never returns anything outside :data:`ALLOWED_SURFACES` - the return
     value is always one of a handful of static strings, regardless of what
     garbage is passed in.
     """
@@ -118,7 +118,7 @@ def _round_ms(value: Optional[float]) -> Optional[float]:
 class TurnLatencyRecorder:
     """Accumulates content-free timing for a single conversational turn.
 
-    Every ``note_*`` method is fail-open — it swallows all exceptions so a
+    Every ``note_*`` method is fail-open - it swallows all exceptions so a
     bug in instrumentation can never interrupt the turn it is observing.
     """
 
@@ -266,7 +266,7 @@ def emit_turn_latency(record: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Agent-facing glue — small, defensive functions that look up the recorder
+# Agent-facing glue - small, defensive functions that look up the recorder
 # stashed on the agent instance. All are no-ops (never raise) when no turn
 # is currently being tracked, so every call site can invoke these
 # unconditionally with no surrounding try/except.
@@ -334,7 +334,7 @@ def finalize_turn_latency(agent: Any, outcome: str) -> Optional[Dict[str, Any]]:
     """End tracking for the current turn, emit the record, and return it.
 
     Reads the (already-existing, unmodified-by-us) compression telemetry
-    signal off the agent — ``_last_compression_attempt_recorded`` is reset
+    signal off the agent - ``_last_compression_attempt_recorded`` is reset
     to ``False`` at the top of every turn by ``conversation_loop.py``, so a
     ``True`` reading here always reflects THIS turn's compression activity.
     """
@@ -363,7 +363,7 @@ def finalize_turn_latency(agent: Any, outcome: str) -> Optional[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
-# Local aggregation (SCOPE B) — no third-party telemetry, no new database.
+# Local aggregation (SCOPE B) - no third-party telemetry, no new database.
 # Reads the same rotating ``latency.jsonl`` (+ rotated backups) that
 # ``hermes_logging.setup_logging()`` wires up, entirely locally.
 # ---------------------------------------------------------------------------
@@ -391,7 +391,7 @@ def _latency_log_paths(log_dir) -> List[Any]:
 def read_latency_records(log_dir) -> Iterator[Dict[str, Any]]:
     """Yield parsed latency records in chronological order. Never raises.
 
-    Malformed lines (partial writes, rotation races) are silently skipped —
+    Malformed lines (partial writes, rotation races) are silently skipped -
     this is a best-effort local diagnostic, not a durable ledger.
     """
     for path in _latency_log_paths(log_dir):
@@ -502,7 +502,7 @@ def aggregate_from_hermes_home(hermes_home=None) -> Dict[str, Any]:
 def format_report(aggregate: Dict[str, Any]) -> str:
     """Render an :func:`aggregate_latency` result as a plain-text table."""
     lines: List[str] = []
-    lines.append("Latency L0 — per-turn timing (content-free)")
+    lines.append("Latency L0 - per-turn timing (content-free)")
     lines.append("")
     lines.append("By surface/turn-band:")
     for key in sorted(aggregate.get("groups", {})):
@@ -527,7 +527,7 @@ def format_report(aggregate: Dict[str, Any]) -> str:
             f"min={s['min']:.0f} max={s['max']:.0f}"
         )
     lines.append("")
-    lines.append("Acceptance comparison — TTFT p95, turns 1-10 vs turns 15-25:")
+    lines.append("Acceptance comparison - TTFT p95, turns 1-10 vs turns 15-25:")
     cmp = aggregate.get("acceptance_comparison", {})
     for label in ("ttft_ms_turns_1_10", "ttft_ms_turns_15_25"):
         s = cmp.get(label, {})

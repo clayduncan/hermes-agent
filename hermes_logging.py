@@ -234,7 +234,7 @@ class _ComponentFilter(logging.Filter):
 class _ExcludeComponentFilter(logging.Filter):
     """Block records whose logger name starts with one of *prefixes*.
 
-    The inverse of :class:`_ComponentFilter` — used to keep a
+    The inverse of :class:`_ComponentFilter` - used to keep a
     session-tagged catch-all sink (``agent.log``) from also carrying
     records meant for a content-free sink (``latency.jsonl``).
     """
@@ -338,7 +338,7 @@ def setup_logging(
     # every record to every registered handler regardless of which logger
     # nominally "owns" the handler (see _register_queued_handler), so this
     # exclusion is what keeps the session-tagged _LOG_FORMAT off latency
-    # records — not propagation, which must stay on for those records to
+    # records - not propagation, which must stay on for those records to
     # reach the queue at all (see latency.jsonl below).
     _add_rotating_handler(
         root,
@@ -362,7 +362,7 @@ def setup_logging(
 
     # --- latency.jsonl (content-free per-turn latency telemetry) -----------
     # Filtered to ONLY "agent.latency" records, plain "%(message)s" format
-    # (no %(session_tag)s — see agent/latency_metrics.py, which never logs
+    # (no %(session_tag)s - see agent/latency_metrics.py, which never logs
     # anything but a content-free JSON object here).
     _add_rotating_handler(
         root,
