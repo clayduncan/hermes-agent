@@ -2,7 +2,7 @@
 
 Latency L0: these instrumentation records must never carry prompt/response/
 tool content, system prompt text, memory, URLs, credentials, or any
-user/channel/session identifier — only bounded, allowlisted scalars and
+user/channel/session identifier - only bounded, allowlisted scalars and
 monotonic-derived durations. See AGENTS.md and the Latency L0 task brief.
 """
 
@@ -19,7 +19,7 @@ from agent import latency_metrics as lat
 
 
 # ---------------------------------------------------------------------------
-# Fake monotonic clock — deterministic TTFT / duration math.
+# Fake monotonic clock - deterministic TTFT / duration math.
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +112,7 @@ def test_finalize_never_raises_even_with_corrupted_state():
     record = rec.finalize("success")
     assert record["schema_version"] == lat.SCHEMA_VERSION
     assert record["outcome"] == "instrumentation_error"
-    json.dumps(record)  # never breaks the turn — always serializable
+    json.dumps(record)  # never breaks the turn - always serializable
 
 
 # ---------------------------------------------------------------------------
@@ -290,7 +290,7 @@ def test_read_latency_records_missing_dir_is_safe(tmp_path):
 
 # ---------------------------------------------------------------------------
 # 7. No prompt/tool/session/user string can enter the schema or the
-#    rendered JSON line — only allowlisted enums, numbers, booleans, None.
+#    rendered JSON line - only allowlisted enums, numbers, booleans, None.
 # ---------------------------------------------------------------------------
 
 
@@ -313,7 +313,7 @@ def test_record_schema_has_no_free_form_strings():
         elif key == "turn_band":
             assert value in {"1-5", "6-10", "11-20", "21+", "unknown"}
         elif key == "ts":
-            # ISO-8601 wall-clock timestamp, for ordering only — never
+            # ISO-8601 wall-clock timestamp, for ordering only - never
             # content, never an identifier.
             assert "T" in value and value.endswith("Z")
         else:
@@ -322,7 +322,7 @@ def test_record_schema_has_no_free_form_strings():
 
 def test_surface_injection_attempt_is_neutralized():
     """A platform string crafted to look like a session/user id must never
-    survive into the record — normalize_surface collapses it to an enum."""
+    survive into the record - normalize_surface collapses it to an enum."""
     hostile_platform = "telegram:chat_id=123456789:user=alice@example.com"
     surface = lat.normalize_surface(hostile_platform)
     assert surface == "gateway"
@@ -375,12 +375,12 @@ def test_start_and_finalize_turn_latency_roundtrip(fake_clock):
     assert record["surface"] == "cli"
     assert record["context_tokens_estimate"] == 500
     assert record["ttft_ms"] == pytest.approx(200.0)
-    # The recorder is cleared after finalize — a second call is a no-op.
+    # The recorder is cleared after finalize - a second call is a no-op.
     assert agent._latency_turn is None
     assert lat.finalize_turn_latency(agent, "success") is None
 
     # A second turn on the SAME (gateway-cached) agent instance increments
-    # the ephemeral, in-process turn ordinal — never a persistent id.
+    # the ephemeral, in-process turn ordinal - never a persistent id.
     lat.start_turn_latency(agent)
     assert agent._latency_turn_ordinal == 2
 

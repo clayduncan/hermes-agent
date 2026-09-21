@@ -5,7 +5,7 @@ Reads ``<HERMES_HOME>/logs/latency.jsonl`` (+ rotated backups) written by
 ``agent/latency_metrics.py`` and prints count/p50/p95/min/max for TTFT and
 first-PCM latency, grouped by surface and bounded turn-index band, plus the
 turns-1-10-vs-15-25 comparison called for by the Latency L0 acceptance
-criteria. Purely local — no network calls, no third-party telemetry.
+criteria. Purely local - no network calls, no third-party telemetry.
 
 Usage:
     python scripts/latency_report.py [--hermes-home PATH]

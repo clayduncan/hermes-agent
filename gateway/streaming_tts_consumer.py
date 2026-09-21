@@ -73,7 +73,7 @@ class StreamingTTSConsumer:
         self._tts_config = tts_config
         self._loop = loop
         self._metadata = metadata
-        # Content-free latency instrumentation only — a no-arg callback
+        # Content-free latency instrumentation only - a no-arg callback
         # fired once, the first time PCM audio is actually written for this
         # turn. See agent/latency_metrics.py note_first_pcm(). Optional and
         # best-effort: never gates or delays playback.
