@@ -64,6 +64,7 @@ class StreamingTTSConsumer:
         *,
         metadata: Optional[Dict[str, Any]] = None,
         audio_format: Optional[AudioFormat] = None,
+        on_first_pcm: Optional[Any] = None,
     ) -> None:
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
 
@@ -72,6 +73,11 @@ class StreamingTTSConsumer:
         self._tts_config = tts_config
         self._loop = loop
         self._metadata = metadata
+        # Content-free latency instrumentation only — a no-arg callback
+        # fired once, the first time PCM audio is actually written for this
+        # turn. See agent/latency_metrics.py note_first_pcm(). Optional and
+        # best-effort: never gates or delays playback.
+        self._on_first_pcm = on_first_pcm
 
         # Resolve the streaming provider once. If unavailable, the consumer is
         # inactive and the gateway falls back to whole-file TTS.
@@ -336,6 +342,15 @@ class StreamingTTSConsumer:
             if not was_audible:
                 self._handle.audible = True
                 self._suppress_whole_file = True
+                _on_first_pcm = getattr(self, "_on_first_pcm", None)
+                if _on_first_pcm is not None:
+                    try:
+                        _on_first_pcm()
+                    except Exception:
+                        logger.debug(
+                            "streaming TTS on_first_pcm callback failed",
+                            exc_info=True,
+                        )
 
     async def _iter_stream_chunks(self, text: str):
         """Yield provider PCM chunks one at a time without blocking the loop."""

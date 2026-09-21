@@ -38,6 +38,13 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
+from agent.latency_metrics import (
+    note_cache_usage,
+    note_context_tokens,
+    note_first_delta,
+    note_model_call_end,
+    note_provider_call_start,
+)
 from agent.message_metadata import append_message
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -2728,6 +2735,7 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        _lat_call_start_mono = time.monotonic()
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -2981,6 +2989,10 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
+                def _on_first_delta():
+                    _stop_spinner()
+                    note_first_delta(agent, _lat_call_start_mono)
+
                 _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
@@ -3026,7 +3038,7 @@ def run_conversation(
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs, on_first_delta=_on_first_delta
                         )
                     from agent import relay_llm
 
@@ -3052,6 +3064,12 @@ def run_conversation(
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
+
+                from agent.chat_completion_helpers import (
+                    estimate_request_context_tokens as _lat_estimate_context_tokens,
+                )
+                note_provider_call_start(agent, _lat_call_start_mono)
+                note_context_tokens(agent, _lat_estimate_context_tokens(api_kwargs))
 
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
@@ -3108,7 +3126,8 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+                note_model_call_end(agent, _lat_call_start_mono)
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:
@@ -4099,6 +4118,11 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+                    note_cache_usage(
+                        agent,
+                        canonical_usage.cache_read_tokens,
+                        canonical_usage.cache_write_tokens,
+                    )
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

@@ -28547,6 +28547,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
         ):
             try:
+                from agent.latency_metrics import note_first_pcm
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer
                 from tools.tts_tool import _load_tts_config
                 _tts_cfg = _load_tts_config()
@@ -28557,6 +28558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     tts_config=_tts_cfg,
                     loop=_gateway_loop,
                     metadata=_status_thread_metadata,
+                    on_first_pcm=lambda: note_first_pcm(agent_holder[0]),
                 )
                 if _stts_consumer.active:
                     streaming_tts_consumer_holder[0] = _stts_consumer
