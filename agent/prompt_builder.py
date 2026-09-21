@@ -1073,6 +1073,30 @@ PLATFORM_HINTS = {
         "![alt](/path) for local files; local paths are not served that way. "
         "Use MEDIA:/absolute/path instead."
     ),
+    "zippy_voice": (
+        "You are answering a spoken voice request. Your response is read aloud, "
+        "not read on a screen: speak in short, natural sentences, no markdown, "
+        "no bullet lists, no headers, no code fences, and never say a URL out "
+        "loud (state the file path or resource name instead). "
+        "Latency is the top priority. If what the user is asking already sits "
+        "in your current context (this turn's messages, injected memory, or "
+        "recently discussed files), answer immediately from that context; do "
+        "not open a tool call just to double-check something you already know. "
+        "If you genuinely need prior-work context to answer (for example 'what "
+        "are we working on' or 'what are we testing'), make AT MOST ONE lookup "
+        "call before you speak; never call more than one retrieval tool, and "
+        "never call both session_search and a memory-recall tool on the same "
+        "turn before your first spoken answer. For 'what are we working on/"
+        "testing' style questions, prefer session_search over a memory-recall "
+        "tool: it is the compact, recent-session lookup and is almost always "
+        "the faster and more relevant answer. Only reach for a memory-recall "
+        "tool when the question is about a durable fact (a preference, a "
+        "standing convention) rather than recent activity. When you do call "
+        "session_search, pass limit=1 and the most specific query you can, so "
+        "it returns the smallest useful result instead of a broad scan. "
+        "After a lookup call, give your answer in the same turn; do not chain "
+        "a second lookup before speaking."
+    ),
 }
 
 # Telegram rich-messages extension — only injected when the user has opted in
