@@ -19,12 +19,16 @@ OPS-18 note: registering these ingestion tools does not enable live
 ingestion by itself. The Desk production transport (`LiveDeskTransport`) is
 now wired for confirm_call_log_ingest's `desk_call` source: a fixed-path,
 fixed-identity, one-shot SSH read is possible once Clay accepts this build
-and enables the plugin. Plaud remains explicitly unconfigured pending
-OPS-110 -- every Plaud source fetch attempt still goes through
-`_UnconfiguredTransport` and fails safely and locally, with no socket ever
-opened. The manual-run gate (prepare/confirm/accept, single-use 300s
-tokens, cron rejection) still governs every source read: prepare_call_log_ingest
-never reads a source, and only confirm_call_log_ingest, after consuming its
+and enables the plugin. Plaud stays out of every run entirely, by explicit
+fixed configuration (`_ENABLED_SOURCES` below), pending OPS-110: the
+IngestionRunner never calls into Plaud at all for a disabled source, so
+there is no cursor read, initialization, fetch, or error to tolerate. The
+PlaudCollector is still constructed over `_UnconfiguredTransport` as
+defense in depth, so even a future wiring mistake fails safely and locally
+with no socket ever opened. The manual-run gate (prepare/confirm/accept,
+single-use 300s tokens, cron rejection) still governs every source read:
+prepare_call_log_ingest never reads a source and truthfully reports only
+the enabled sources, and only confirm_call_log_ingest, after consuming its
 single-use token, can invoke the Desk transport -- never a scheduler, never
 a background process. The Pending Call Reviews surface is otherwise fully
 functional against local state.
@@ -35,6 +39,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from .ingestion_state_db import SOURCE_DESK_CALL
+
 log = logging.getLogger(__name__)
 
 _PLUGIN_NAME = "team_duncan_contacts"
@@ -42,6 +48,13 @@ _PLUGIN_NAME = "team_duncan_contacts"
 # Module-level ledger instance, set by register() at plugin load time.
 # Internal Python API only; not agent-facing.
 activity_ledger = None
+
+# Fixed internal configuration, not agent/model input: which ingestion
+# sources this production build runs. Plaud stays disabled until OPS-110 --
+# not merely fail-closed on read, but never attempted at all. Single source
+# of truth for both the IngestionRunner and prepare_call_log_ingest's
+# reported `sources`, so they cannot drift from each other.
+_ENABLED_SOURCES: tuple[str, ...] = (SOURCE_DESK_CALL,)
 
 
 def _load_location_id() -> str:
@@ -137,8 +150,10 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
         identity_key = load_or_create_identity_key(data_dir)
 
         # Desk: production transport, fixed identity/target, manual-run gate
-        # only (see confirm_call_log_ingest). Plaud: fail-closed pending
-        # OPS-110; not part of this build's scope.
+        # only (see confirm_call_log_ingest). Plaud: disabled via
+        # enabled_sources below, pending OPS-110 -- _run_plaud is never
+        # called, so this collector is never read from even though it's
+        # constructed fail-closed as defense in depth.
         plaud_collector = PlaudCollector(_UnconfiguredTransport())
         desk_collector = CallHistoryCollector(LiveDeskTransport(), identity_key)
         notifier = TelegramPrimaryEmailFallbackNotifier(
@@ -152,6 +167,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
             plaud_collector=plaud_collector,
             desk_collector=desk_collector,
             notifier=notifier,
+            enabled_sources=frozenset(_ENABLED_SOURCES),
         )
         return runner, state_db
 
@@ -264,7 +280,9 @@ def register(ctx) -> None:
         name="prepare_call_log_ingest",
         toolset=_PLUGIN_NAME,
         schema=PREPARE_CALL_LOG_INGEST_SCHEMA,
-        handler=make_prepare_call_log_ingest_handler(ingestion_state_db),
+        handler=make_prepare_call_log_ingest_handler(
+            ingestion_state_db, enabled_sources=_ENABLED_SOURCES
+        ),
         description=PREPARE_CALL_LOG_INGEST_SCHEMA["function"]["description"],
     )
     ctx.register_tool(
@@ -286,6 +304,7 @@ def register(ctx) -> None:
         "team_duncan_contacts: registered OPS-18 Pending Call Reviews and "
         "call-log ingestion manual-run gate tools. Desk production transport "
         "configured (fixed identity/target, manual-run gate only, no "
-        "scheduler). Plaud transport not configured and fails safely, "
-        "pending OPS-110."
+        "scheduler). Enabled ingestion sources: %s. Plaud is disabled "
+        "pending OPS-110 and is never attempted this run.",
+        list(_ENABLED_SOURCES),
     )
