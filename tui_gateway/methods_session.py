@@ -449,6 +449,12 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
+                live_sid, live_session = live
+                override_err = _apply_live_resume_overrides(
+                    rid, live_sid, live_session, params
+                )
+                if override_err is not None:
+                    return override_err
                 return _ok(rid, _reuse_live_payload(*live))
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
@@ -478,6 +484,7 @@ def _(rid, params: dict) -> dict:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             cwd = profile_resume_cwd or _default_session_cwd()
+            lazy_overrides = _apply_explicit_resume_overrides({}, params)
             record = _deferred_session_record(
                 target,
                 cols=cols,
@@ -488,6 +495,8 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                model_override=lazy_overrides.get("model_override"),
+                resume_runtime_overrides=lazy_overrides or None,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -516,7 +525,12 @@ def _(rid, params: dict) -> dict:
                     "message_count": len(display_history) if omit_messages else len(messages),
                     "messages": messages,
                     "messages_omitted": omit_messages,
-                    "info": _lazy_resume_info(cwd, profile=profile),
+                    "info": _lazy_resume_info(
+                        cwd,
+                        model=(lazy_overrides.get("model_override") or {}).get("model") or "",
+                        provider=lazy_overrides.get("provider_override") or "",
+                        profile=profile,
+                    ),
                     "inflight": None,
                     "running": child_running,
                     "session_key": target,
@@ -542,7 +556,9 @@ def _(rid, params: dict) -> dict:
             source = _resolve_session_source(str(params.get("source") or "").strip() or None)
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             _enable_gateway_prompts()
-            overrides = _stored_session_runtime_overrides(found) or {}
+            overrides = _apply_explicit_resume_overrides(
+                _stored_session_runtime_overrides(found) or {}, params
+            )
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
@@ -637,7 +653,9 @@ def _(rid, params: dict) -> dict:
             # Restore the model/provider/reasoning/tier this chat last used so the
             # deferred build (and the info below) match the eager path — without them
             # the build drops the provider ("No LLM provider configured").
-            overrides = _stored_session_runtime_overrides(found) or {}
+            overrides = _apply_explicit_resume_overrides(
+                _stored_session_runtime_overrides(found) or {}, params
+            )
             model_override = overrides.get("model_override") or {}
             cwd = profile_resume_cwd or _default_session_cwd()
             record = _deferred_session_record(
@@ -730,7 +748,9 @@ def _(rid, params: dict) -> dict:
                 # resolve to the profile too. Runtime identity is restored from the
                 # stored session row so switching chats does not inherit whatever
                 # global model another chat last selected.
-                stored_runtime_overrides = _stored_session_runtime_overrides(found)
+                stored_runtime_overrides = _apply_explicit_resume_overrides(
+                    _stored_session_runtime_overrides(found), params
+                )
                 agent = _make_agent(
                     sid,
                     target,

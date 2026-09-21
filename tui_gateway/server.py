@@ -4216,6 +4216,173 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
+def _apply_explicit_resume_overrides(stored: dict, params: dict) -> dict:
+    """Merge ``session.resume``'s OPTIONAL per-call ``model``/``provider``/
+    ``reasoning_effort``/``fast`` params on top of a resumed session's stored
+    runtime identity (``stored``, typically ``_stored_session_runtime_overrides``'s
+    result).
+
+    Precedence: explicit call param > the chat's previously-used identity >
+    profile default. Mirrors ``session.create``'s per-session override
+    contract (never writes global config), but a resume has a real prior
+    value worth falling back to, so an omitted or invalid param preserves
+    ``stored`` instead of blanking to "inherit profile".
+
+    Returns a NEW dict; ``stored`` is never mutated in place. When none of
+    the three knobs are present in ``params``, the returned dict has the same
+    content as ``stored`` — every existing caller that doesn't pass these
+    params gets byte-identical behavior to before this override mechanism
+    existed.
+    """
+    overrides = dict(stored or {})
+
+    model = str(params.get("model") or "").strip()
+    if model:
+        provider = str(params.get("provider") or "").strip() or None
+        overrides["model_override"] = {"model": model, "provider": provider}
+        if provider:
+            overrides["provider_override"] = provider
+
+    if effort := str(params.get("reasoning_effort") or "").strip():
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(effort)
+        except Exception:
+            parsed = None
+        # Fail safe: an invalid value leaves whatever reasoning identity the
+        # chat already had (stored or inherited) untouched.
+        if parsed is not None:
+            overrides["reasoning_config_override"] = parsed
+
+    if "fast" in params:
+        overrides["service_tier_override"] = (
+            "priority" if is_truthy_value(params.get("fast")) else ""
+        )
+
+    return overrides
+
+
+def _apply_live_resume_overrides(rid, sid: str, session: dict, params: dict):
+    """Apply ``session.resume``'s OPTIONAL model/provider/reasoning_effort/fast
+    overrides to a session the resume fast path found ALREADY LIVE.
+
+    Reuses the exact in-place primitives ``config.set`` already uses for a
+    live ``/model``, ``/reasoning``, or ``/fast`` change (``_apply_model_switch``,
+    ``agent.reasoning_config``, ``agent.service_tier``) — never a system-prompt
+    rebuild or toolset swap, so prompt caching survives (AGENTS.md: never
+    reload memories or rebuild the system prompt mid-conversation). ``source``
+    cannot be changed on an already-live session: the platform-hint block is
+    baked into the system prompt at build time and is meant to be byte-stable
+    for the conversation's life, so a differing ``source`` is rejected rather
+    than silently ignored or unsafely applied.
+
+    Returns an error envelope (``_err(...)``) to short-circuit the resume, or
+    ``None`` when the caller should proceed with the normal live-reuse
+    payload — including the common case where no override params were given
+    at all (a pure no-op).
+    """
+    requested_source = str(params.get("source") or "").strip()
+    if requested_source and requested_source != str(session.get("source") or "").strip():
+        return _err(
+            rid,
+            4131,
+            "cannot change session source on a live session; source is fixed "
+            "for the life of a conversation",
+        )
+
+    has_override = bool(
+        str(params.get("model") or "").strip()
+        or str(params.get("reasoning_effort") or "").strip()
+    ) or "fast" in params
+    if not has_override:
+        return None
+
+    agent = session.get("agent")
+
+    if effort := str(params.get("reasoning_effort") or "").strip():
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(effort)
+        except Exception:
+            parsed = None
+        if parsed is not None:
+            session["create_reasoning_override"] = parsed
+            if agent is not None:
+                agent.reasoning_config = parsed
+
+    if "fast" in params:
+        nv = "fast" if is_truthy_value(params.get("fast")) else "normal"
+        fast_overrides = None
+        if nv == "fast":
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            target_model = getattr(agent, "model", None) if agent is not None else None
+            if not target_model:
+                session_override = session.get("model_override") or {}
+                target_model = (
+                    session_override.get("model")
+                    if isinstance(session_override, dict)
+                    else None
+                ) or _resolve_model()
+            fast_overrides = (
+                resolve_fast_mode_overrides(target_model) if target_model else None
+            )
+        session["create_service_tier_override"] = "priority" if nv == "fast" else ""
+        if agent is not None:
+            agent.service_tier = "priority" if nv == "fast" else None
+            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
+            current_overrides.pop("service_tier", None)
+            current_overrides.pop("speed", None)
+            if nv == "fast" and fast_overrides:
+                current_overrides.update(fast_overrides)
+            agent.request_overrides = current_overrides
+
+    model = str(params.get("model") or "").strip()
+    if model:
+        provider = str(params.get("provider") or "").strip()
+        try:
+            from hermes_cli.model_switch import ModelSwitchRequest
+
+            parsed_flags = ModelSwitchRequest(
+                raw=model, target=model, explicit_provider=provider
+            )
+            if session.get("running"):
+                # Mirrors config.set's live /model guard: an in-place swap
+                # can't run while a turn streams, so stash it for
+                # _apply_pending_model_switch to apply at the next turn start.
+                session["pending_model_switch"] = {
+                    "raw": model,
+                    "confirm_expensive_model": True,
+                    "display_model": model,
+                    "display_provider": provider,
+                }
+            else:
+                # persist_override=False is load-bearing: without it,
+                # resolve_persist_behavior() can fall through to
+                # model.persist_switch_by_default and silently write
+                # config.yaml globally. confirm_expensive_model=True matches
+                # session.create's contract — an explicit override always
+                # wins, no interactive confirmation gate.
+                _apply_model_switch(
+                    sid,
+                    session,
+                    model,
+                    confirm_expensive_model=True,
+                    pin_session_override=True,
+                    parsed_flags=parsed_flags,
+                    persist_override=False,
+                )
+        except Exception as exc:
+            return _err(rid, 5000, f"resume failed: {exc}")
+
+    if agent is not None:
+        _persist_live_session_runtime(session)
+    _emit("session.info", sid, _fallback_session_info(session))
+    return None
+
+
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
