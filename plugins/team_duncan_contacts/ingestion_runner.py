@@ -58,6 +58,8 @@ from .notifications import (
     build_multiple_match_payload,
     build_plaud_zero_match_payload,
 )
+from .note_mirror import OK_OUTCOMES as _NOTE_MIRROR_OK_OUTCOMES
+from .note_mirror import contact_detail_url
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +117,10 @@ class RunSummary:
     oldest_pending_at: str | None = None
     failed_review_count: int = 0
     oldest_failed_at: str | None = None
+    notes_created: int = 0
+    notes_recovered: int = 0
+    note_errors: int = 0
+    note_references: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,6 +135,10 @@ class RunSummary:
             "oldest_pending_at": self.oldest_pending_at,
             "failed_review_count": self.failed_review_count,
             "oldest_failed_at": self.oldest_failed_at,
+            "notes_created": self.notes_created,
+            "notes_recovered": self.notes_recovered,
+            "note_errors": self.note_errors,
+            "note_references": list(self.note_references),
         }
 
 
@@ -144,6 +154,7 @@ class IngestionRunner:
         notifier: Notifier,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         enabled_sources: frozenset[str] | None = None,
+        note_mirror: Any | None = None,
     ) -> None:
         """*enabled_sources* is a fixed internal configuration decided at
         construction time by the plugin factory -- never agent/model input.
@@ -151,7 +162,16 @@ class IngestionRunner:
         direct construction (as in most tests) is unaffected. A source not
         in *enabled_sources* is never read, fetched, or cursor-initialized:
         `run()` skips its `_run_*` step entirely, and due notification
-        retries for that source are skipped too."""
+        retries for that source are skipped too.
+
+        *note_mirror* is the OPS-18 GHL note mirror (see note_mirror.py).
+        When omitted (the default -- matching every pre-existing direct
+        construction, mostly in tests), no note is ever written and every
+        admitted/override-admitted event behaves exactly as before this
+        feature existed. It is only ever consulted for SOURCE_DESK_CALL
+        events -- Plaud stays excluded from the mirror the same way it stays
+        excluded from ingestion, pending OPS-110.
+        """
         self._registry = registry
         self._activity_ledger = activity_ledger
         self._state_db = state_db
@@ -162,6 +182,7 @@ class IngestionRunner:
         self._enabled_sources = (
             frozenset(enabled_sources) if enabled_sources is not None else ALL_SOURCES
         )
+        self._note_mirror = note_mirror
 
     # --- Ingestion ------------------------------------------------------------
 
@@ -295,8 +316,11 @@ class IngestionRunner:
             raw_handle = None
             if ledger_result.outcome == "admitted":
                 summary.admitted += 1
-            else:
-                summary.discarded += 1
+                return self._mirror_note_for_admission(
+                    source, ledger_result, result.ghl_contact_id, event_ts,
+                    duration_s, direction, answered, summary,
+                )
+            summary.discarded += 1
             return True
 
         if decision == "deny_pre_activation":
@@ -306,7 +330,10 @@ class IngestionRunner:
             raw_handle = None
             if ledger_result.outcome == "override_admitted":
                 summary.override_admitted += 1
-                return True
+                return self._mirror_note_for_admission(
+                    source, ledger_result, result.ghl_contact_id, event_ts,
+                    duration_s, direction, answered, summary,
+                )
 
             masked_meta = result.masked_metadata
             ins = self._state_db.insert_pending_review(
@@ -379,6 +406,53 @@ class IngestionRunner:
         raw_handle = None
         self._state_db.insert_processed_outcome(source, source_event_id, OUTCOME_UNEXPECTED_DECISION)
         summary.discarded += 1
+        return True
+
+    def _mirror_note_for_admission(
+        self,
+        source: str,
+        ledger_result: Any,
+        contact_id: str | None,
+        event_ts: datetime,
+        duration_s: int | None,
+        direction: str | None,
+        answered: int | None,
+        summary: RunSummary,
+    ) -> bool:
+        """Mirror one newly admitted/override-admitted event to a GHL contact
+        note. Desk-only -- Plaud stays excluded from the mirror the same way
+        it stays excluded from ingestion, pending OPS-110 -- and a no-op when
+        no note_mirror was wired in (every pre-existing caller/test). Returns
+        False (holding the cursor at this record) iff the mirror did not
+        reach a marker-verified state; the failure is also counted so it is
+        visible in the run summary."""
+        if source != SOURCE_DESK_CALL or self._note_mirror is None:
+            return True
+        outcome = self._note_mirror.mirror_event(
+            event_id=ledger_result.event_id,
+            contact_id=contact_id,
+            occurred_at=event_ts,
+            direction=direction,
+            answered=answered,
+            duration_s=duration_s,
+            trigger=f"OPS-18 desk_call note mirror for ledger event {ledger_result.event_id}",
+        )
+        if outcome.outcome not in _NOTE_MIRROR_OK_OUTCOMES:
+            summary.note_errors += 1
+            summary.errors += 1
+            return False
+        if outcome.outcome == "created":
+            summary.notes_created += 1
+        elif outcome.outcome == "recovered":
+            summary.notes_recovered += 1
+        if outcome.outcome in ("created", "recovered"):
+            summary.note_references.append(
+                {
+                    "note_id": outcome.note_id,
+                    "contact_id": contact_id,
+                    "contact_url": contact_detail_url(TEAM_DUNCAN_LOCATION_ID, contact_id),
+                }
+            )
         return True
 
     # --- Notification retry (manual-run only; no background process) ----------
@@ -655,6 +729,23 @@ class IngestionRunner:
         row = self._state_db.advance_pending_review_stage(
             pending_review_id, STATUS_REPLAYED, actor="clay"
         )
+
+        if row.source == SOURCE_DESK_CALL and self._note_mirror is not None:
+            outcome = self._note_mirror.mirror_event(
+                event_id=ledger_result.event_id,
+                contact_id=contact_id,
+                occurred_at=event_ts,
+                direction=row.direction,
+                answered=row.answered,
+                duration_s=row.duration_s,
+                trigger=f"OPS-18 desk_call note mirror for ledger event {ledger_result.event_id}",
+            )
+            if outcome.outcome not in _NOTE_MIRROR_OK_OUTCOMES:
+                return self._state_db.advance_pending_review_stage(
+                    pending_review_id, STATUS_FAILED, actor="system",
+                    failure_stage="note_mirror", failure_detail=outcome.outcome,
+                )
+
         return self._state_db.advance_pending_review_stage(
             pending_review_id, STATUS_COMPLETE, actor="clay"
         )

@@ -27,11 +27,13 @@ from plugins.team_duncan_contacts.ingestion_runner import ActionNotApprovedError
 from plugins.team_duncan_contacts.ingestion_state_db import (
     ACTION_GRANT_OVERRIDE,
     IngestionStateDb,
+    STATUS_COMPLETE,
     STATUS_CONTACT_SELECTED,
     STATUS_DUPLICATE_RESOLUTION_REQUIRED,
     STATUS_FAILED,
     STATUS_PENDING_REVIEW,
 )
+from plugins.team_duncan_contacts.note_mirror import NoteMirror
 from plugins.team_duncan_contacts.registry import ContactRegistry
 from tools.ghl_client import TEAM_DUNCAN_LOCATION_ID
 
@@ -92,6 +94,32 @@ class FakeNotifier:
         return self.deliver
 
 
+class FakeNoteGhlClient:
+    """No live network: a fake GHL note surface for OPS-18 note-mirror tests."""
+
+    def __init__(self, fail_create_for: set | None = None) -> None:
+        self.notes: dict[str, list[dict]] = {}
+        self.create_calls = 0
+        self._fail_create_for = fail_create_for or set()
+
+    def list_notes(self, contact_id):
+        return list(self.notes.get(contact_id, []))
+
+    def create_note(self, contact_id, body, *, trigger):
+        if contact_id in self._fail_create_for:
+            raise RuntimeError("simulated GHL outage")
+        self.create_calls += 1
+        note = {"id": f"note-{self.create_calls}", "body": body, "contactId": contact_id}
+        self.notes.setdefault(contact_id, []).append(note)
+        return note
+
+    def get_note(self, contact_id, note_id):
+        for n in self.notes.get(contact_id, []):
+            if n["id"] == note_id:
+                return n
+        return None
+
+
 def _desk_row(zdate, zaddress, zduration=60, zoriginated=1, zanswered=1):
     return {"ZDATE": zdate, "ZADDRESS": zaddress, "ZDURATION": zduration,
             "ZORIGINATED": zoriginated, "ZANSWERED": zanswered}
@@ -140,7 +168,7 @@ def _activate(registry: ContactRegistry, phone: str, contact_id: str, first="Al"
 
 def _make_runner(registry, activity_ledger, state_db, clock, *,
                   plaud_records=None, desk_rows=None, deliver=True,
-                  activity_ledger_override=None):
+                  activity_ledger_override=None, note_mirror=None):
     plaud_collector = PlaudCollector(FakePlaudTransport(plaud_records or []))
     desk_collector = CallHistoryCollector(FakeDeskTransport(desk_rows or []), IDENTITY_KEY)
     notifier = FakeNotifier(deliver=deliver)
@@ -152,6 +180,7 @@ def _make_runner(registry, activity_ledger, state_db, clock, *,
         desk_collector=desk_collector,
         notifier=notifier,
         clock=clock,
+        note_mirror=note_mirror,
     )
     return runner, notifier
 
@@ -398,7 +427,12 @@ def test_run_summary_fields_present_even_when_empty(registry, activity_ledger, s
         "run_id", "admitted", "override_admitted", "discarded", "pending_review",
         "errors", "critical_errors", "pending_review_count", "oldest_pending_at",
         "failed_review_count", "oldest_failed_at",
+        "notes_created", "notes_recovered", "note_errors", "note_references",
     }
+    assert d["notes_created"] == 0
+    assert d["notes_recovered"] == 0
+    assert d["note_errors"] == 0
+    assert d["note_references"] == []
 
 
 # --- Paused / retired: processed outcome, never notified ---------------------
@@ -551,3 +585,140 @@ def test_crash_and_resume_does_not_duplicate_ledger_rows(tmp_path, clock) -> Non
 
     history = ledger.query_full_history(contact_b)
     assert len(history) == 1
+
+
+# --- OPS-18 GHL note mirror: Desk-only wiring, cursor hold, summary refs ----
+
+def test_admitted_desk_event_mirrors_exactly_one_note_with_a_summary_reference(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    contact_a = _activate(registry, CANARY_PHONE_A, "c-a")
+    zdate = utc_to_apple_epoch(clock.now)
+    ghl = FakeNoteGhlClient()
+    note_mirror = NoteMirror(ghl, state_db)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)], note_mirror=note_mirror,
+    )
+    summary = runner.run()
+    assert summary.admitted == 1
+    assert summary.notes_created == 1
+    assert summary.notes_recovered == 0
+    assert summary.note_errors == 0
+    assert ghl.create_calls == 1
+    assert len(summary.note_references) == 1
+    ref = summary.note_references[0]
+    assert ref["contact_id"] == contact_a
+    assert ref["note_id"] == "note-1"
+    assert contact_a in ref["contact_url"]
+    assert TEAM_DUNCAN_LOCATION_ID in ref["contact_url"]
+
+
+def test_note_mirror_failure_holds_the_desk_cursor_and_is_visible_in_summary(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    contact_a = _activate(registry, CANARY_PHONE_A, "c-a")
+    zdate = utc_to_apple_epoch(clock.now)
+    ghl = FakeNoteGhlClient(fail_create_for={contact_a})
+    note_mirror = NoteMirror(ghl, state_db)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)], note_mirror=note_mirror,
+    )
+    summary = runner.run()
+    assert summary.admitted == 1  # the ledger remains the source of truth
+    assert summary.note_errors == 1
+    assert summary.errors == 1
+    assert summary.notes_created == 0
+    assert state_db.get_cursor("desk_call") is None
+    assert len(activity_ledger.query_events(contact_a)) == 1
+
+    # Once GHL recovers, a rerun advances the cursor and mirrors the note,
+    # without duplicating the ledger row (ledger idempotency on replay).
+    ghl._fail_create_for.clear()
+    summary2 = runner.run()
+    assert summary2.notes_created == 1
+    assert state_db.get_cursor("desk_call") is not None
+    assert len(activity_ledger.query_events(contact_a)) == 1
+
+
+def test_plaud_admission_never_reaches_the_note_mirror(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    ghl = FakeNoteGhlClient()
+    note_mirror = NoteMirror(ghl, state_db)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        plaud_records=[_plaud_record("rec-1", CANARY_PHONE_A)], note_mirror=note_mirror,
+    )
+    summary = runner.run()
+    assert summary.admitted == 1
+    assert ghl.create_calls == 0
+    assert summary.notes_created == 0
+    assert summary.note_references == []
+
+
+def test_grant_and_replay_mirrors_exactly_one_note(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    contact_id = _activate(registry, CANARY_PHONE_A, "c-a")
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    ghl = FakeNoteGhlClient()
+    note_mirror = NoteMirror(ghl, state_db)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)], note_mirror=note_mirror,
+    )
+    runner.run()
+    rows = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)
+    pending_id = rows[0].id
+    token = state_db.issue_action_approval_token(pending_id, ACTION_GRANT_OVERRIDE)
+    updated = runner.grant_and_replay(pending_id, token, contact_id, approval_reason="test grant")
+    assert updated.status == STATUS_COMPLETE
+    assert ghl.create_calls == 1
+
+
+def test_grant_and_replay_note_mirror_failure_fails_closed(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    contact_id = _activate(registry, CANARY_PHONE_A, "c-a")
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    ghl = FakeNoteGhlClient(fail_create_for={contact_id})
+    note_mirror = NoteMirror(ghl, state_db)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)], note_mirror=note_mirror,
+    )
+    runner.run()
+    rows = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)
+    pending_id = rows[0].id
+    token = state_db.issue_action_approval_token(pending_id, ACTION_GRANT_OVERRIDE)
+    updated = runner.grant_and_replay(pending_id, token, contact_id, approval_reason="test grant")
+    assert updated.status == STATUS_FAILED
+    assert updated.failure_stage == "note_mirror"
+    # The ledger admission itself is not undone by a note-mirror failure.
+    assert len(activity_ledger.query_events(contact_id)) == 1
+
+
+def test_no_note_mirror_wired_behaves_exactly_as_before_this_feature(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    """The default (note_mirror=None, every pre-existing direct construction)
+    must be a complete no-op for notes: admission behavior is unaffected and
+    the summary always carries the (zero) note fields."""
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    zdate = utc_to_apple_epoch(clock.now)
+    runner, _ = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)],
+    )
+    summary = runner.run()
+    assert summary.admitted == 1
+    assert summary.notes_created == 0
+    assert summary.notes_recovered == 0
+    assert summary.note_errors == 0
+    assert summary.note_references == []
+    assert state_db.get_cursor("desk_call") is not None

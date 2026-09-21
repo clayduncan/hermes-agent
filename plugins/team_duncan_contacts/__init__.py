@@ -132,6 +132,20 @@ class _UnconfiguredNotifier:
         return False
 
 
+def _build_note_mirror_ghl_client(hermes_home: Path):
+    """Construct the audited GHL writer the note mirror uses to create notes.
+
+    Goes through ``tools.ghl_client.scoped_client()`` with the fixed Team
+    Duncan constants directly (not a config-derived value): this fails
+    before any network attempt on a scope mismatch, and since both
+    arguments are the module's own fixed binding, that failure is a static
+    impossibility here rather than something config.yaml could trigger.
+    """
+    from tools.ghl_client import TEAM_DUNCAN_ACCOUNT_KEY, TEAM_DUNCAN_LOCATION_ID, scoped_client
+
+    return scoped_client(TEAM_DUNCAN_ACCOUNT_KEY, TEAM_DUNCAN_LOCATION_ID, hermes_home=hermes_home)
+
+
 def _build_ingestion_runner_factory(hermes_home: Path, registry):
     """Return a zero-arg factory producing a fresh (IngestionRunner, state_db)
     pair. Deferred construction keeps plugin load itself free of any DB or
@@ -142,6 +156,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
         from .collectors.plaud_collector import PlaudCollector
         from .ingestion_state_db import IngestionStateDb, load_or_create_identity_key
         from .ingestion_runner import IngestionRunner
+        from .note_mirror import NoteMirror
         from .notifications import TelegramPrimaryEmailFallbackNotifier
 
         data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
@@ -159,6 +174,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
         notifier = TelegramPrimaryEmailFallbackNotifier(
             _UnconfiguredNotifier(), _UnconfiguredNotifier()
         )
+        note_mirror = NoteMirror(_build_note_mirror_ghl_client(hermes_home), state_db)
 
         runner = IngestionRunner(
             registry=registry,
@@ -168,6 +184,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
             desk_collector=desk_collector,
             notifier=notifier,
             enabled_sources=frozenset(_ENABLED_SOURCES),
+            note_mirror=note_mirror,
         )
         return runner, state_db
 
