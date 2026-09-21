@@ -153,6 +153,25 @@ def test_prepare_issues_token_with_backlog_preview(state_db) -> None:
     assert result["pending_review_backlog"] == 0
 
 
+def test_prepare_defaults_to_both_sources_for_backward_compatibility(state_db) -> None:
+    """Direct construction without enabled_sources (pre-existing behavior
+    for every caller that predates the source-isolation contract) keeps
+    reporting both sources."""
+    handler = make_prepare_call_log_ingest_handler(state_db)
+    result = json.loads(handler({}))
+    assert result["sources"] == ["plaud", "desk_call"]
+
+
+def test_prepare_reports_only_configured_enabled_sources(state_db) -> None:
+    """Per Clay's source-isolation correction: when the caller configures
+    Desk-only (as the production factory now does), prepare_call_log_ingest
+    must truthfully report only desk_call -- never claim Plaud."""
+    handler = make_prepare_call_log_ingest_handler(state_db, enabled_sources=("desk_call",))
+    result = json.loads(handler({}))
+    assert result["sources"] == ["desk_call"]
+    assert "plaud" not in result["sources"]
+
+
 def test_prepare_rejects_when_unaccepted_run_outstanding(state_db, runner_factory) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
     confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)

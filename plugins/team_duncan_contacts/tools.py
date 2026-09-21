@@ -19,6 +19,7 @@ import logging
 import os
 from typing import Any
 
+from .ingestion_state_db import SOURCE_DESK_CALL, SOURCE_PLAUD
 from .ingestion_state_db import list_pending_call_reviews as _list_pending_call_reviews
 
 log = logging.getLogger(__name__)
@@ -222,10 +223,12 @@ PREPARE_CALL_LOG_INGEST_SCHEMA: dict[str, Any] = {
         "name": "prepare_call_log_ingest",
         "description": (
             "Prepare a one-time confirmation token for a manual call-log "
-            "ingestion run (Plaud + Desk CallHistory). Triggers no source "
-            "read. Rejected outside an interactive Clay-confirmed session "
-            "(never runs from cron or a background context). Only one run "
-            "may be outstanding at a time."
+            "ingestion run over this build's enabled sources only (see the "
+            "returned `sources` list for the exact set -- currently Desk "
+            "CallHistory; Plaud is disabled pending OPS-110 and is never "
+            "read). Triggers no source read. Rejected outside an "
+            "interactive Clay-confirmed session (never runs from cron or a "
+            "background context). Only one run may be outstanding at a time."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -279,7 +282,15 @@ ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA: dict[str, Any] = {
 }
 
 
-def make_prepare_call_log_ingest_handler(state_db):
+def make_prepare_call_log_ingest_handler(
+    state_db, enabled_sources: tuple[str, ...] = (SOURCE_PLAUD, SOURCE_DESK_CALL)
+):
+    """*enabled_sources* is fixed internal configuration supplied by the
+    plugin factory at registration time, not model input -- it must match
+    the same set passed to the IngestionRunner so this tool's reported
+    `sources` never claims a source the run itself will not touch. Defaults
+    to both sources for backward compatibility with direct construction."""
+
     def prepare_call_log_ingest(args: dict[str, Any], **_: Any) -> str:
         if _is_cron_session():
             return json.dumps(
@@ -308,7 +319,7 @@ def make_prepare_call_log_ingest_handler(state_db):
                     "status": "ready_for_confirmation",
                     "token": token,
                     "token_expires_at": expires_at,
-                    "sources": ["plaud", "desk_call"],
+                    "sources": list(enabled_sources),
                     "desk_lookback_days": CALL_HISTORY_LOOKBACK_DAYS,
                     "pending_review_backlog": state_db.count_unresolved_pending_review(),
                     "message": "Confirm with confirm_call_log_ingest within 5 minutes to run.",

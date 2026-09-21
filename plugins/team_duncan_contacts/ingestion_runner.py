@@ -61,6 +61,8 @@ from .notifications import (
 
 log = logging.getLogger(__name__)
 
+ALL_SOURCES: frozenset[str] = frozenset({SOURCE_PLAUD, SOURCE_DESK_CALL})
+
 
 class WrongLocationError(RuntimeError):
     """A resolved event named a location other than Team Duncan's. Critical:
@@ -141,7 +143,15 @@ class IngestionRunner:
         desk_collector: CallHistoryCollector,
         notifier: Notifier,
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        enabled_sources: frozenset[str] | None = None,
     ) -> None:
+        """*enabled_sources* is a fixed internal configuration decided at
+        construction time by the plugin factory -- never agent/model input.
+        Defaults to both sources (pre-existing behavior) when omitted, so
+        direct construction (as in most tests) is unaffected. A source not
+        in *enabled_sources* is never read, fetched, or cursor-initialized:
+        `run()` skips its `_run_*` step entirely, and due notification
+        retries for that source are skipped too."""
         self._registry = registry
         self._activity_ledger = activity_ledger
         self._state_db = state_db
@@ -149,20 +159,27 @@ class IngestionRunner:
         self._desk = desk_collector
         self._notifier = notifier
         self._clock = clock
+        self._enabled_sources = (
+            frozenset(enabled_sources) if enabled_sources is not None else ALL_SOURCES
+        )
 
     # --- Ingestion ------------------------------------------------------------
 
     def run(self, *, token: str | None = None) -> RunSummary:
-        """Fetch new records from both sources, route them, advance cursors
-        contiguously, then attempt any due notification retries. Never
-        advances a cursor past a failed event. Records this run's summary
-        (with a run_id) iff *token* is given -- the manual-run gate always
-        supplies one; direct unit tests of routing logic may omit it."""
+        """Fetch new records from each enabled source, route them, advance
+        cursors contiguously, then attempt any due notification retries for
+        enabled sources. Never advances a cursor past a failed event.
+        Records this run's summary (with a run_id) iff *token* is given --
+        the manual-run gate always supplies one; direct unit tests of
+        routing logic may omit it. A disabled source is skipped outright:
+        no cursor read, initialization, fetch, or error increment for it."""
         started_at = self._clock()
         summary = RunSummary(run_id=None)
 
-        self._run_plaud(summary)
-        self._run_desk(summary)
+        if SOURCE_PLAUD in self._enabled_sources:
+            self._run_plaud(summary)
+        if SOURCE_DESK_CALL in self._enabled_sources:
+            self._run_desk(summary)
         self._process_due_retries()
 
         summary.pending_review_count = self._state_db.count_unresolved_pending_review()
@@ -187,14 +204,14 @@ class IngestionRunner:
 
     def _run_plaud(self, summary: RunSummary) -> None:
         checkpoint = self._state_db.get_cursor(SOURCE_PLAUD)
-        if checkpoint is None:
-            checkpoint = self._plaud.initialize_cursor()
-            self._state_db.set_cursor(SOURCE_PLAUD, checkpoint)
         try:
+            if checkpoint is None:
+                checkpoint = self._plaud.initialize_cursor()
+                self._state_db.set_cursor(SOURCE_PLAUD, checkpoint)
             records = self._plaud.fetch_new(checkpoint)
         except Exception as exc:
             log.error(
-                "Plaud fetch failed [%s]; source not advanced this run.",
+                "Plaud source failed [%s]; source not advanced this run.",
                 type(exc).__name__,
             )
             summary.errors += 1
@@ -368,6 +385,8 @@ class IngestionRunner:
 
     def _process_due_retries(self) -> None:
         for row in self._state_db.due_for_notification_retry():
+            if row.source not in self._enabled_sources:
+                continue
             payload = self._rebuild_retry_payload(row)
             if payload is None:
                 continue
