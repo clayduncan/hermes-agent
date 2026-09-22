@@ -191,6 +191,52 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
     return _factory
 
 
+def _build_plaud_summary_runner_factory(hermes_home: Path, registry, ghl_reader):
+    """Return a zero-arg factory producing a fresh (PlaudSummaryRunner,
+    state_db) pair (OPS-110). Wholly separate from
+    ``_build_ingestion_runner_factory`` above: its own LivePlaudTransport
+    instance (metadata + transcript, the two roles it plays), its own
+    CallHistoryCollector instance for correlation/sealed re-fetch, and its
+    own note writer -- this factory never touches ``_ENABLED_SOURCES`` or
+    the Desk-only IngestionRunner's wiring.
+    """
+
+    def _factory():
+        from .collectors.call_history_collector import CallHistoryCollector, LiveDeskTransport
+        from .collectors.live_plaud_transport import LivePlaudTransport
+        from .collectors.plaud_collector import PlaudCollector
+        from .ingestion_state_db import IngestionStateDb, load_or_create_identity_key
+        from .plaud_note_writer import PlaudSummaryNoteWriter
+        from .plaud_summary_runner import PlaudSummaryRunner
+
+        data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        state_db = IngestionStateDb(data_dir / "ingestion_state.db")
+        identity_key = load_or_create_identity_key(data_dir)
+
+        live_plaud = LivePlaudTransport()
+        plaud_collector = PlaudCollector(live_plaud)
+        desk_collector = CallHistoryCollector(LiveDeskTransport(), identity_key)
+        note_writer = PlaudSummaryNoteWriter(
+            _build_note_mirror_ghl_client(hermes_home), state_db
+        )
+
+        runner = PlaudSummaryRunner(
+            registry=registry,
+            activity_ledger=activity_ledger,
+            state_db=state_db,
+            plaud_collector=plaud_collector,
+            transcript_transport=live_plaud,
+            desk_collector=desk_collector,
+            ghl_reader=ghl_reader,
+            note_writer=note_writer,
+            hermes_home=Path(hermes_home),
+        )
+        return runner, state_db
+
+    return _factory
+
+
 def register(ctx) -> None:
     """Plugin entry point: called by the Hermes plugin loader."""
     location_id = _load_location_id()
@@ -324,4 +370,38 @@ def register(ctx) -> None:
         "scheduler). Enabled ingestion sources: %s. Plaud is disabled "
         "pending OPS-110 and is never attempted this run.",
         list(_ENABLED_SOURCES),
+    )
+
+    # --- OPS-110: Plaud call-summary manual-run gate ---
+    from .tools import (
+        CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA,
+        PREPARE_PLAUD_SUMMARY_RUN_SCHEMA,
+        make_confirm_plaud_summary_run_handler,
+        make_prepare_plaud_summary_run_handler,
+    )
+
+    plaud_summary_runner_factory = _build_plaud_summary_runner_factory(
+        hermes_home, registry, ghl_reader
+    )
+
+    ctx.register_tool(
+        name="prepare_plaud_summary_run",
+        toolset=_PLUGIN_NAME,
+        schema=PREPARE_PLAUD_SUMMARY_RUN_SCHEMA,
+        handler=make_prepare_plaud_summary_run_handler(ingestion_state_db),
+        description=PREPARE_PLAUD_SUMMARY_RUN_SCHEMA["function"]["description"],
+    )
+    ctx.register_tool(
+        name="confirm_plaud_summary_run",
+        toolset=_PLUGIN_NAME,
+        schema=CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA,
+        handler=make_confirm_plaud_summary_run_handler(plaud_summary_runner_factory),
+        description=CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA["function"]["description"],
+    )
+
+    log.info(
+        "team_duncan_contacts: registered OPS-110 Plaud call-summary "
+        "manual-run gate tools (metadata correlation, activation gating, "
+        "transcript fetch, Claude Code summarization, GHL note "
+        "create-or-update)."
     )

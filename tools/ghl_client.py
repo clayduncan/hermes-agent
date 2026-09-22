@@ -518,14 +518,15 @@ class GoHighLevelWriteClient:
         trigger: str,
         color: str | None = None,
         pinned: bool = False,
+        title: str | None = None,
     ) -> Any:
         """``POST /contacts/{id}/notes``. Audited as a ``create``.
 
         Contact scope is enforced before the audit intent and before any
         destination call. There is deliberately no ``delete_note``: this
         build never removes a contact note. A new note has no prior state
-        to preserve, so *pinned* defaults to ``False``; *color* is written
-        only when given.
+        to preserve, so *pinned* defaults to ``False``; *color* and *title*
+        are written only when given.
         """
         self._require_contact_in_scope(contact_id)
         require_trigger(trigger)
@@ -537,6 +538,8 @@ class GoHighLevelWriteClient:
         payload: dict[str, Any] = {"body": body, "pinned": pinned}
         if color is not None:
             payload["color"] = color
+        if title is not None:
+            payload["title"] = title
         authorized = self._authorize(
             operation="create", record_id=None, before=None, trigger=trigger
         )

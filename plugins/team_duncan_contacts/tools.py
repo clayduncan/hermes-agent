@@ -389,3 +389,114 @@ def make_accept_call_log_ingest_run_handler(state_db):
             return json.dumps({"status": "error", "message": "An internal error occurred."})
 
     return accept_call_log_ingest_run
+
+
+# ---------------------------------------------------------------------------
+# OPS-110: manual-run gate for Plaud call-summary generation
+#
+# A deliberately separate, self-contained gate from the OPS-18 call-log
+# ingestion one above: its own single-use token (issued from the same
+# generic ingestion_confirmations table, but never cross-checked against
+# call-log ingestion's own run bookkeeping), and no awaiting-acceptance
+# step -- confirm_plaud_summary_run performs the run and returns its
+# summary directly, rather than requiring a further accept call.
+# ---------------------------------------------------------------------------
+
+PREPARE_PLAUD_SUMMARY_RUN_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "prepare_plaud_summary_run",
+        "description": (
+            "Prepare a one-time confirmation token for a manual Plaud "
+            "call-summary run (OPS-110): metadata-only correlation of Plaud "
+            "recordings against immutable Desk calls, activation gating, "
+            "transcript fetch, Claude Code summarization, and a GHL note "
+            "create-or-update. Triggers no source read. Rejected outside "
+            "an interactive Clay-confirmed session (never runs from cron "
+            "or a background context)."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "confirm_plaud_summary_run",
+        "description": (
+            "Confirm a manual Plaud call-summary run using the token from "
+            "prepare_plaud_summary_run. Consumes the single-use token "
+            "(5-minute TTL) and performs the full run. Returns a sanitized "
+            "run summary (matched/unmatched/ambiguous/skipped/notes_written/"
+            "errors counts only). Rejected outside an interactive "
+            "Clay-confirmed session."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "The opaque token returned by prepare_plaud_summary_run.",
+                }
+            },
+            "required": ["token"],
+        },
+    },
+}
+
+
+def make_prepare_plaud_summary_run_handler(state_db):
+    def prepare_plaud_summary_run(args: dict[str, Any], **_: Any) -> str:
+        if _is_cron_session():
+            return json.dumps(
+                {"status": "rejected", "reason": "cron_context",
+                 "message": "Plaud call-summary runs cannot be triggered from a cron/background context."}
+            )
+        try:
+            token, expires_at = state_db.issue_confirmation_token()
+            return json.dumps(
+                {
+                    "status": "ready_for_confirmation",
+                    "token": token,
+                    "token_expires_at": expires_at,
+                    "message": "Confirm with confirm_plaud_summary_run within 5 minutes to run.",
+                }
+            )
+        except Exception as exc:
+            log.error("prepare_plaud_summary_run internal error [%s]", type(exc).__name__)
+            return json.dumps({"status": "error", "message": "An internal error occurred."})
+
+    return prepare_plaud_summary_run
+
+
+def make_confirm_plaud_summary_run_handler(runner_factory):
+    """*runner_factory* returns a fresh (PlaudSummaryRunner, state_db) pair
+    each call, so nothing here holds a live transport or subprocess
+    reference at plugin load time."""
+
+    def confirm_plaud_summary_run(args: dict[str, Any], **_: Any) -> str:
+        if _is_cron_session():
+            return json.dumps(
+                {"status": "rejected", "reason": "cron_context",
+                 "message": "Plaud call-summary runs cannot be triggered from a cron/background context."}
+            )
+        token = str(args.get("token") or "")
+        try:
+            runner, state_db = runner_factory()
+            if not state_db.consume_confirmation_token(token):
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "reason": "token_not_found_or_expired",
+                        "message": "Confirmation token not found, expired, or already used.",
+                    }
+                )
+            summary = runner.run(token=token)
+            result = summary.to_dict()
+            result["status"] = "completed"
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except Exception as exc:
+            log.error("confirm_plaud_summary_run internal error [%s]", type(exc).__name__)
+            return json.dumps({"status": "error", "message": "An internal error occurred."})
+
+    return confirm_plaud_summary_run

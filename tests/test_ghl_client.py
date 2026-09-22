@@ -971,6 +971,24 @@ class TestCreateNoteColorAndPinned:
             "body": NOTE_BODY, "pinned": True, "color": CALL_NOTE_COLOR,
         }
 
+    def test_create_note_title_is_omitted_by_default(self, transport, log_dir) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note("g-1", NOTE_BODY, trigger=TRIGGER)
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert "title" not in post.json_body
+
+    def test_create_note_writes_the_given_title(self, transport, log_dir) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", NOTE_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR,
+            title="Incoming call · Answered · 21 min 46 sec",
+        )
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert post.json_body == {
+            "body": NOTE_BODY, "pinned": False, "color": CALL_NOTE_COLOR,
+            "title": "Incoming call · Answered · 21 min 46 sec",
+        }
+
 
 class TestUpdateNotePreservesUnrelatedFields:
     """update_note() must never clear userId/title/pinned/color the caller

@@ -120,6 +120,19 @@ OUTCOME_UNEXPECTED_DECISION = "unexpected_decision"
 NOTE_MIRROR_STATUS_PENDING = "pending"
 NOTE_MIRROR_STATUS_COMPLETE = "complete"
 
+# --- OPS-110 Plaud summary state (match/transcript/summary tracking) ---
+PLAUD_MATCH_STATUS_MATCHED = "matched"
+PLAUD_MATCH_STATUS_UNMATCHED = "unmatched"
+PLAUD_MATCH_STATUS_AMBIGUOUS = "ambiguous"
+
+PLAUD_TRANSCRIPT_STATUS_NOT_FETCHED = "not_fetched"
+PLAUD_TRANSCRIPT_STATUS_FETCHED = "fetched"
+PLAUD_TRANSCRIPT_STATUS_FAILED = "failed"
+
+PLAUD_SUMMARY_STATUS_NOT_STARTED = "not_started"
+PLAUD_SUMMARY_STATUS_COMPLETE = "complete"
+PLAUD_SUMMARY_STATUS_FAILED = "failed"
+
 # --- Manual-run / action-approval token TTLs (mirrors registry.py precedent) ---
 CONFIRMATION_TTL_SECONDS = 300
 ACTION_APPROVAL_TTL_SECONDS = 300
@@ -232,6 +245,22 @@ CREATE TABLE IF NOT EXISTS note_mirror (
     updated_at       TEXT NOT NULL,
     last_attempt_at  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS plaud_summary_state (
+    id                     TEXT NOT NULL PRIMARY KEY,
+    plaud_recording_id     TEXT NOT NULL,
+    desk_source_event_id   TEXT,
+    contact_id             TEXT,
+    match_status           TEXT NOT NULL,
+    transcript_status      TEXT NOT NULL DEFAULT 'not_fetched',
+    summary_status         TEXT NOT NULL DEFAULT 'not_started',
+    claude_output_hash     TEXT,
+    note_id                TEXT,
+    error_class            TEXT,
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL,
+    UNIQUE (plaud_recording_id)
+);
 """
 
 
@@ -249,6 +278,10 @@ def pending_review_id(source: str, source_event_id: str) -> str:
 
 def processed_outcome_id(source: str, source_event_id: str) -> str:
     return hashlib.sha256(f"{source}|{source_event_id}".encode()).hexdigest()
+
+
+def plaud_summary_state_id(plaud_recording_id: str) -> str:
+    return hashlib.sha256(f"plaud_summary|{plaud_recording_id}".encode()).hexdigest()
 
 
 def creation_idempotency_key(source: str, source_event_id: str) -> str:
@@ -376,6 +409,39 @@ def _row_to_note_mirror(row: sqlite3.Row) -> NoteMirrorRow:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_attempt_at=row["last_attempt_at"],
+    )
+
+
+@dataclass
+class PlaudSummaryStateRow:
+    id: str
+    plaud_recording_id: str
+    desk_source_event_id: str | None
+    contact_id: str | None
+    match_status: str
+    transcript_status: str
+    summary_status: str
+    claude_output_hash: str | None
+    note_id: str | None
+    error_class: str | None
+    created_at: str
+    updated_at: str
+
+
+def _row_to_plaud_summary_state(row: sqlite3.Row) -> PlaudSummaryStateRow:
+    return PlaudSummaryStateRow(
+        id=row["id"],
+        plaud_recording_id=row["plaud_recording_id"],
+        desk_source_event_id=row["desk_source_event_id"],
+        contact_id=row["contact_id"],
+        match_status=row["match_status"],
+        transcript_status=row["transcript_status"],
+        summary_status=row["summary_status"],
+        claude_output_hash=row["claude_output_hash"],
+        note_id=row["note_id"],
+        error_class=row["error_class"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 
@@ -968,6 +1034,93 @@ class IngestionStateDb:
                         content_hash, now, now, now,
                     ),
                 )
+
+    # --- plaud_summary_state (OPS-110 match/transcript/summary tracking) -------
+
+    def get_plaud_summary_state(self, plaud_recording_id: str) -> PlaudSummaryStateRow | None:
+        rid = plaud_summary_state_id(plaud_recording_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM plaud_summary_state WHERE id=?", (rid,)
+            ).fetchone()
+        return _row_to_plaud_summary_state(row) if row else None
+
+    def upsert_plaud_summary_state(
+        self,
+        plaud_recording_id: str,
+        *,
+        match_status: str,
+        desk_source_event_id: str | None = None,
+        contact_id: str | None = None,
+        transcript_status: str | None = None,
+        summary_status: str | None = None,
+        claude_output_hash: str | None = None,
+        note_id: str | None = None,
+        error_class: str | None = None,
+    ) -> PlaudSummaryStateRow:
+        """Forward-progressing per-Plaud-recording status row, keyed only by
+        plaud_recording_id (idempotent on replay/overlap: the same
+        recording always resolves to the same row).
+
+        Every field left as None on an existing row preserves whatever was
+        already recorded (or the fixed initial default, for a brand-new
+        row); a value given overwrites. The one exception is
+        *error_class*: it is always set exactly as given (including None,
+        which clears it) -- a later successful stage is expected to pass
+        error_class=None to clear a prior stage's failure.
+
+        Never a raw handle, transcript, or summary body column -- only IDs,
+        statuses, hashes, and this one content-free error classification.
+        """
+        rid = plaud_summary_state_id(plaud_recording_id)
+        now = self._now_iso()
+        with self._lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN")
+                try:
+                    row = conn.execute(
+                        "SELECT id FROM plaud_summary_state WHERE id=?", (rid,)
+                    ).fetchone()
+                    if row is None:
+                        conn.execute(
+                            """INSERT INTO plaud_summary_state
+                               (id, plaud_recording_id, desk_source_event_id,
+                                contact_id, match_status, transcript_status,
+                                summary_status, claude_output_hash, note_id,
+                                error_class, created_at, updated_at)
+                               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (
+                                rid, plaud_recording_id, desk_source_event_id,
+                                contact_id, match_status,
+                                transcript_status or PLAUD_TRANSCRIPT_STATUS_NOT_FETCHED,
+                                summary_status or PLAUD_SUMMARY_STATUS_NOT_STARTED,
+                                claude_output_hash, note_id, error_class, now, now,
+                            ),
+                        )
+                    else:
+                        conn.execute(
+                            """UPDATE plaud_summary_state
+                               SET desk_source_event_id=COALESCE(?, desk_source_event_id),
+                                   contact_id=COALESCE(?, contact_id),
+                                   match_status=?,
+                                   transcript_status=COALESCE(?, transcript_status),
+                                   summary_status=COALESCE(?, summary_status),
+                                   claude_output_hash=COALESCE(?, claude_output_hash),
+                                   note_id=COALESCE(?, note_id),
+                                   error_class=?,
+                                   updated_at=?
+                               WHERE id=?""",
+                            (
+                                desk_source_event_id, contact_id, match_status,
+                                transcript_status, summary_status, claude_output_hash,
+                                note_id, error_class, now, rid,
+                            ),
+                        )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+        return self.get_plaud_summary_state(plaud_recording_id)
 
 
 # ---------------------------------------------------------------------------
