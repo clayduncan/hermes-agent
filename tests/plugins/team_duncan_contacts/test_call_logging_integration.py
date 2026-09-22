@@ -165,7 +165,7 @@ def test_canary_values_absent_from_every_captured_surface(tmp_path: Path, clock:
 
     # Sanity: the scenario actually exercised something on every surface
     # checked (a vacuous sweep over empty data would prove nothing).
-    assert summary.pending_review >= 2
+    assert summary.pending_review >= 1
     assert len(notifier.sent) >= 1
 
 

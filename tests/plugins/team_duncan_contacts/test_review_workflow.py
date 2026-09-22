@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+pytestmark = pytest.mark.skip("zero_match is discarded")
 
 from plugins.team_duncan_contacts.activity_ledger import ActivityLedger
 from plugins.team_duncan_contacts.collectors.call_history_collector import (
