@@ -1,9 +1,18 @@
 """team_duncan_contacts plugin: Clay-approved contact activation registry.
 
-Registers agent-facing tools: prepare_activation, confirm_activation, and
-(OPS-18) list_pending_call_reviews, prepare_call_log_ingest,
-confirm_call_log_ingest, accept_call_log_ingest_run.
+Registers agent-facing tools: prepare_activation, confirm_activation,
+set_imessage_activation, and (OPS-18) list_pending_call_reviews,
+prepare_call_log_ingest, confirm_call_log_ingest, accept_call_log_ingest_run.
 See plugins/team_duncan_contacts/registry.py for core invariants.
+
+set_imessage_activation (OPS-75) is a reversible on/off switch for the local
+iMessage Note lane only, driven by plain-language commands like "activate
+[name]'s iMessages". It has no GHL mutation capability: it never touches
+GHL Do Not Disturb settings, tags, campaigns, workflows, or any marketing
+delivery mechanism, and never adds a GHL tag. It reuses the existing
+activation registry's pause_contact/resume_contact/prepare_activation/
+confirm_activation methods and the same read-only GHL reader as
+prepare_activation; it opens no new GHL access path.
 
 Installation: add ``team_duncan_contacts`` to ``plugins.enabled`` in config.yaml.
 Do NOT enable in the live profile until the post-build review steps are complete.
@@ -253,8 +262,10 @@ def register(ctx) -> None:
     from .tools import (
         PREPARE_ACTIVATION_SCHEMA,
         CONFIRM_ACTIVATION_SCHEMA,
+        SET_IMESSAGE_ACTIVATION_SCHEMA,
         make_prepare_handler,
         make_confirm_handler,
+        make_set_imessage_activation_handler,
     )
 
     hermes_home = get_hermes_home()
@@ -310,9 +321,22 @@ def register(ctx) -> None:
         description=CONFIRM_ACTIVATION_SCHEMA["function"]["description"],
     )
 
+    set_imessage_activation_handler = make_set_imessage_activation_handler(
+        registry, ghl_reader
+    )
+    ctx.register_tool(
+        name="set_imessage_activation",
+        toolset=_PLUGIN_NAME,
+        schema=SET_IMESSAGE_ACTIVATION_SCHEMA,
+        handler=set_imessage_activation_handler,
+        description=SET_IMESSAGE_ACTIVATION_SCHEMA["function"]["description"],
+    )
+
     log.info(
-        "team_duncan_contacts: registered prepare_activation and confirm_activation "
-        "tools for location %s.",
+        "team_duncan_contacts: registered prepare_activation, confirm_activation, "
+        "and set_imessage_activation tools for location %s. "
+        "set_imessage_activation has no GHL mutation capability and never "
+        "touches DND, tags, campaigns, workflows, or marketing delivery.",
         location_id,
     )
 

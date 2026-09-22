@@ -418,6 +418,58 @@ class ConfirmResult:
         return sanitize_output(d)
 
 
+class SetActivationResult:
+    """Agent-facing result for set_imessage_activation.
+
+    Carries only display data already known to be safe for output (display
+    name, exact contact/location IDs, lifecycle state, activated_at): never
+    a raw handle.
+    """
+
+    def __init__(
+        self,
+        *,
+        status: str,
+        action: str,
+        contact_name: str | None = None,
+        contact_id: str | None = None,
+        location_id: str | None = None,
+        lifecycle_state: str | None = None,
+        activated_at: str | None = None,
+        reason: str | None = None,
+        message: str,
+    ) -> None:
+        self.status = status
+        self.action = action
+        self.contact_name = contact_name
+        self.contact_id = contact_id
+        self.location_id = location_id
+        self.lifecycle_state = lifecycle_state
+        self.activated_at = activated_at
+        self.reason = reason
+        self.message = message
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "status": self.status,
+            "action": self.action,
+            "message": self.message,
+        }
+        if self.contact_name is not None:
+            d["contact_name"] = self.contact_name
+        if self.contact_id is not None:
+            d["contact_id"] = self.contact_id
+        if self.location_id is not None:
+            d["location_id"] = self.location_id
+        if self.lifecycle_state is not None:
+            d["lifecycle_state"] = self.lifecycle_state
+        if self.activated_at is not None:
+            d["activated_at"] = self.activated_at
+        if self.reason is not None:
+            d["reason"] = self.reason
+        return sanitize_output(d)
+
+
 class ResolveResult:
     """Internal resolver result (not agent-facing)."""
 
@@ -642,6 +694,35 @@ class ContactRegistry:
         return state
 
     # --- Public API ---
+
+    def find_local_contact(
+        self, name_or_id: str
+    ) -> tuple[str, str | None, dict[str, Any] | None]:
+        """Look up a contact already present in this registry.
+
+        Matches by exact contact ID or exact case-insensitive display name
+        only. Performs no GHL read. Returns (status, contact_id, contact
+        record) where status is one of "found", "ambiguous", "not_found".
+        """
+        with self._lock:
+            state = self._load_state_raw()
+            contacts = state.get("contacts", {})
+
+            if name_or_id in contacts:
+                return "found", name_or_id, dict(contacts[name_or_id])
+
+            query_lower = name_or_id.strip().lower()
+            matches = [
+                (cid, c)
+                for cid, c in contacts.items()
+                if (c.get("display_name") or "").strip().lower() == query_lower
+            ]
+            if len(matches) == 1:
+                cid, c = matches[0]
+                return "found", cid, dict(c)
+            if len(matches) > 1:
+                return "ambiguous", None, None
+            return "not_found", None, None
 
     def prepare_activation(
         self,
@@ -895,6 +976,194 @@ class ContactRegistry:
                     "unavailable through the registry."
                 ),
             )
+
+    def set_imessage_activation(
+        self,
+        action: str,
+        name_or_id: str,
+        ghl_reader: GhlContactReader,
+        actor: str = "clay",
+    ) -> SetActivationResult:
+        """Turn the local iMessage Note lane on ("activate") or off
+        ("deactivate") for a Team Duncan contact.
+
+        This is a reversible control over the local registry lane only: it
+        never touches GHL Do Not Disturb settings, tags, campaigns,
+        workflows, or any marketing delivery mechanism, and never adds a
+        GHL tag. The only GHL access on this path is the same read-only
+        `ghl_reader` used by prepare_activation, and only for a contact this
+        registry does not already know about.
+
+        `deactivate` always maps to pause_contact, never retire_contact.
+        `activate` on an absent contact reuses the existing
+        prepare_activation + confirm_activation path; the caller's explicit
+        command is the authorization for that confirmation, so no further
+        conversational confirmation step happens here.
+        """
+        if action not in ("activate", "deactivate"):
+            return SetActivationResult(
+                status="invalid_input",
+                action=action,
+                reason="invalid_action",
+                message="action must be 'activate' or 'deactivate'.",
+            )
+
+        try:
+            query = validate_agent_name_or_id(name_or_id)
+        except InvalidInputError as exc:
+            return SetActivationResult(
+                status="invalid_input",
+                action=action,
+                reason="invalid_input",
+                message=str(exc),
+            )
+
+        lookup_status, contact_id, contact = self.find_local_contact(query)
+
+        if lookup_status == "ambiguous":
+            return SetActivationResult(
+                status="ambiguous",
+                action=action,
+                reason="ambiguous_name",
+                message=(
+                    "More than one registered contact matches that name "
+                    "exactly. Provide the exact GoHighLevel contact ID to "
+                    "disambiguate. No state was changed."
+                ),
+            )
+
+        if lookup_status == "found":
+            assert contact is not None and contact_id is not None
+            lifecycle = contact["state"]
+            display_name = contact["display_name"]
+            location_id = contact["location_id"]
+            activated_at = contact["activated_at"]
+
+            if action == "deactivate":
+                if lifecycle == "retired":
+                    return SetActivationResult(
+                        status="retired_contact",
+                        action=action,
+                        contact_name=display_name,
+                        contact_id=contact_id,
+                        location_id=location_id,
+                        lifecycle_state=lifecycle,
+                        activated_at=activated_at,
+                        reason="retired",
+                        message=(
+                            "This contact is retired and cannot be "
+                            "deactivated or reactivated in this build. "
+                            "No state was changed."
+                        ),
+                    )
+                if lifecycle == "paused":
+                    return SetActivationResult(
+                        status="already_paused",
+                        action=action,
+                        contact_name=display_name,
+                        contact_id=contact_id,
+                        location_id=location_id,
+                        lifecycle_state=lifecycle,
+                        activated_at=activated_at,
+                        message="iMessages are already deactivated for this contact.",
+                    )
+                self.pause_contact(contact_id, actor, "imessage deactivation command")
+                return SetActivationResult(
+                    status="deactivated",
+                    action=action,
+                    contact_name=display_name,
+                    contact_id=contact_id,
+                    location_id=location_id,
+                    lifecycle_state="paused",
+                    activated_at=activated_at,
+                    message="iMessages deactivated for this contact.",
+                )
+
+            # action == "activate"
+            if lifecycle == "retired":
+                return SetActivationResult(
+                    status="retired_contact",
+                    action=action,
+                    contact_name=display_name,
+                    contact_id=contact_id,
+                    location_id=location_id,
+                    lifecycle_state=lifecycle,
+                    activated_at=activated_at,
+                    reason="retired",
+                    message=(
+                        "This contact is retired and cannot be reactivated "
+                        "in this build. No state was changed."
+                    ),
+                )
+            if lifecycle == "active":
+                return SetActivationResult(
+                    status="already_active",
+                    action=action,
+                    contact_name=display_name,
+                    contact_id=contact_id,
+                    location_id=location_id,
+                    lifecycle_state=lifecycle,
+                    activated_at=activated_at,
+                    message="iMessages are already active for this contact.",
+                )
+            self.resume_contact(contact_id, actor, "imessage activation command")
+            return SetActivationResult(
+                status="resumed",
+                action=action,
+                contact_name=display_name,
+                contact_id=contact_id,
+                location_id=location_id,
+                lifecycle_state="active",
+                activated_at=activated_at,
+                message=(
+                    "iMessages reactivated for this contact. The original "
+                    "activation cutoff is preserved."
+                ),
+            )
+
+        # lookup_status == "not_found": absent from the local registry.
+        if action == "deactivate":
+            return SetActivationResult(
+                status="not_activated",
+                action=action,
+                message=(
+                    "This contact has not been activated. There is nothing "
+                    "to deactivate. No state was changed."
+                ),
+            )
+
+        # activate + absent: reuse the existing prepare_activation +
+        # confirm_activation path against the read-only GHL reader.
+        prep = self.prepare_activation(query, ghl_reader)
+        if prep.status != "ready_for_confirmation":
+            return SetActivationResult(
+                status=prep.status,
+                action=action,
+                contact_name=prep.contact_name,
+                contact_id=prep.contact_id,
+                location_id=prep.location_id,
+                reason=prep.reason,
+                message=prep.message,
+            )
+
+        confirm = self.confirm_activation(prep.token)
+        if confirm.status == "activated":
+            status = "activated"
+        elif confirm.status == "already_activated":
+            status = "already_active"
+        else:
+            status = confirm.status
+        return SetActivationResult(
+            status=status,
+            action=action,
+            contact_name=confirm.contact_name,
+            contact_id=confirm.contact_id,
+            location_id=confirm.location_id,
+            lifecycle_state="active" if status in ("activated", "already_active") else None,
+            activated_at=confirm.activated_at,
+            reason=confirm.reason,
+            message=confirm.message,
+        )
 
     def resolve_event(
         self,

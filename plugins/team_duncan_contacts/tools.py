@@ -147,6 +147,85 @@ def make_confirm_handler(registry):
     return confirm_activation
 
 
+SET_IMESSAGE_ACTIVATION_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "set_imessage_activation",
+        "description": (
+            "Turn the local iMessage Note lane on or off for a Team Duncan "
+            "contact, for plain-language commands like 'activate "
+            "[name]'s iMessages' and 'deactivate [name]'s iMessages'. "
+            "This tool has no GoHighLevel mutation capability: it never "
+            "touches GHL Do Not Disturb settings, tags, campaigns, "
+            "workflows, or any marketing delivery mechanism, and never adds "
+            "a GHL tag. 'deactivate' pauses the contact; it never retires "
+            "one, and is safely idempotent if already paused. 'activate' "
+            "on a paused contact resumes it, preserving the original "
+            "activation cutoff; on a contact never seen before, it reuses "
+            "prepare_activation and confirm_activation against the "
+            "read-only GHL reader (the calling command is itself the "
+            "explicit authorization, so no further confirmation step is "
+            "needed here). Accepts only a contact's full name or exact "
+            "GoHighLevel contact ID, never a phone number, email address, "
+            "Apple ID, or messaging handle. Ambiguous names fail with no "
+            "state change; raw handles never appear in the response."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["activate", "deactivate"],
+                    "description": (
+                        "Whether to turn the contact's local iMessage Note "
+                        "lane on ('activate') or off ('deactivate')."
+                    ),
+                },
+                "name_or_id": {
+                    "type": "string",
+                    "description": (
+                        "The contact's full name (e.g. 'Jane Smith') or their "
+                        "exact GoHighLevel contact ID. "
+                        "Do NOT provide a phone number, email address, iMessage "
+                        "handle, Apple ID, or any other communication handle: "
+                        "those are rejected."
+                    ),
+                },
+            },
+            "required": ["action", "name_or_id"],
+        },
+    },
+}
+
+
+def make_set_imessage_activation_handler(registry, ghl_reader):
+    """Return a handler closure that captures the registry and GHL reader.
+
+    No GHL mutation capability: every path here goes through the registry's
+    local pause_contact/resume_contact/prepare_activation/confirm_activation
+    methods, all of which touch only the injected read-only `ghl_reader`.
+    This tool never calls a GHL write client and never touches DND, tags,
+    campaigns, workflows, or marketing delivery.
+    """
+
+    def set_imessage_activation(args: dict[str, Any], **_: Any) -> str:
+        action = str(args.get("action") or "")
+        name_or_id = str(args.get("name_or_id") or "")
+        try:
+            result = registry.set_imessage_activation(action, name_or_id, ghl_reader)
+            return json.dumps(result.to_dict(), ensure_ascii=False)
+        except Exception as exc:
+            log.error("set_imessage_activation internal error [%s]", type(exc).__name__)
+            return json.dumps(
+                {
+                    "status": "error",
+                    "message": "An internal error occurred. No state was written.",
+                }
+            )
+
+    return set_imessage_activation
+
+
 # ---------------------------------------------------------------------------
 # OPS-18: Pending Call Reviews (read-only)
 # ---------------------------------------------------------------------------
