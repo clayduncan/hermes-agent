@@ -157,6 +157,28 @@ def _unwrap_note(payload: Any) -> Any:
     return payload
 
 
+#: Fixed, non-sensitive placeholder written into the audit outcome's
+#: ``after["body"]`` in place of a note's real text when a caller opts in
+#: via ``create_note(..., redact_body_in_audit=True)``. Never derived from
+#: the note text itself, so it carries no sensitive content.
+REDACTED_NOTE_BODY_MARKER = "REDACTED: note body withheld from write-audit log"
+
+
+def _redact_note_body_for_audit(after: Any) -> Any:
+    """A copy of *after* with only its ``body`` replaced by a fixed marker.
+
+    Used solely to build the value passed to ``record_outcome`` for a
+    redacted-body write; every other field (id, title, color, contactId,
+    dateAdded, etc.) is left exactly as fetched, and the mapping *after*
+    itself is never mutated.
+    """
+    if not isinstance(after, dict):
+        return after
+    sanitized = dict(after)
+    sanitized["body"] = REDACTED_NOTE_BODY_MARKER
+    return sanitized
+
+
 class GoHighLevelWriteClient:
     """Audited contact writes against one GoHighLevel sub-account."""
 
@@ -519,6 +541,7 @@ class GoHighLevelWriteClient:
         color: str | None = None,
         pinned: bool = False,
         title: str | None = None,
+        redact_body_in_audit: bool = False,
     ) -> Any:
         """``POST /contacts/{id}/notes``. Audited as a ``create``.
 
@@ -527,6 +550,14 @@ class GoHighLevelWriteClient:
         build never removes a contact note. A new note has no prior state
         to preserve, so *pinned* defaults to ``False``; *color* and *title*
         are written only when given.
+
+        *redact_body_in_audit*, when ``True``, replaces only the audit
+        outcome's ``after["body"]`` with :data:`REDACTED_NOTE_BODY_MARKER`
+        before it is recorded. The real POST body and the read-back
+        returned to the caller are unaffected -- both keep the exact note
+        text. Defaults to ``False`` so every existing caller (the OPS-18
+        call-note lane) is byte-behavior unchanged; only the OPS-75
+        iMessage lane opts in.
         """
         self._require_contact_in_scope(contact_id)
         require_trigger(trigger)
@@ -552,8 +583,9 @@ class GoHighLevelWriteClient:
             after, after_fetch_failed = self._fetch_note_after(contact_id, note_id)
         else:
             after, after_fetch_failed = None, True
+        audit_after = _redact_note_body_for_audit(after) if redact_body_in_audit else after
         authorized.record_outcome(
-            record_id=note_id, after=after, after_fetch_failed=after_fetch_failed
+            record_id=note_id, after=audit_after, after_fetch_failed=after_fetch_failed
         )
         return created
 
@@ -655,6 +687,7 @@ __all__ = [
     "GHL_API_VERSION",
     "GoHighLevelWriteClient",
     "HttpRequestError",
+    "REDACTED_NOTE_BODY_MARKER",
     "ScopeViolationError",
     "TEAM_DUNCAN_ACCOUNT_KEY",
     "TEAM_DUNCAN_LOCATION_ID",

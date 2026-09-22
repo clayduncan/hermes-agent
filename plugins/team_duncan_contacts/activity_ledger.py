@@ -99,6 +99,7 @@ class RecordResult:
     outcome: str  # 'admitted' | 'override_admitted' | 'discarded'
     event_id: str | None = None
     decision: str | None = None  # resolve_event decision when discarded
+    genuine_insert: bool = False
 
 
 @dataclass
@@ -225,7 +226,11 @@ class ActivityLedger:
                             ingested_at, safe_provenance,
                         ),
                     )
-            return RecordResult(outcome="admitted", event_id=eid, decision=decision)
+                    changed = conn.execute("SELECT changes()").fetchone()[0]
+            return RecordResult(
+                outcome="admitted", event_id=eid, decision=decision,
+                genuine_insert=changed == 1,
+            )
 
         if decision == "deny_pre_activation":
             contact_id = result.ghl_contact_id
@@ -269,8 +274,10 @@ class ActivityLedger:
                             ingested_at, oid, safe_provenance,
                         ),
                     )
+                    changed = conn.execute("SELECT changes()").fetchone()[0]
             return RecordResult(
-                outcome="override_admitted", event_id=eid, decision=decision
+                outcome="override_admitted", event_id=eid, decision=decision,
+                genuine_insert=changed == 1,
             )
 
         # All other decisions: discard with no row written

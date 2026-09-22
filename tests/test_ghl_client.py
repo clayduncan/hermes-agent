@@ -19,6 +19,7 @@ from tools.ghl_client import (
     GHL_ACCOUNT_KEYS,
     GHL_API_BASE_URL,
     GHL_API_VERSION,
+    REDACTED_NOTE_BODY_MARKER,
     ScopeViolationError,
     TEAM_DUNCAN_ACCOUNT_KEY,
     TEAM_DUNCAN_LOCATION_ID,
@@ -1050,3 +1051,134 @@ class TestUpdateNotePreservesUnrelatedFields:
             "pinned": False,
             "color": CALL_NOTE_COLOR,
         }
+
+
+# ── OPS-75 privacy correction: create_note(redact_body_in_audit=True) ────────
+
+
+SENTINEL = "SENTINEL-imsg-3f9a1c7e"
+SENTINEL_NOTE_ID = "note-imsg-1"
+SENTINEL_NOTE = {
+    "id": SENTINEL_NOTE_ID,
+    "contactId": "g-1",
+    "body": SENTINEL,
+    "title": "iMessage · Received",
+    "color": "#8E8E93",
+}
+
+
+def route_create_sentinel_note(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route("POST", f"/contacts/{contact_id}/notes", {"note": SENTINEL_NOTE})
+    transport.route(
+        "GET", f"/contacts/{contact_id}/notes/{SENTINEL_NOTE_ID}", {"note": SENTINEL_NOTE}
+    )
+
+
+def raw_log_bytes(log_dir: Path) -> bytes:
+    if not log_dir.is_dir():
+        return b""
+    return b"".join(p.read_bytes() for p in sorted(log_dir.glob("*.jsonl")))
+
+
+class TestCreateNoteAuditRedaction:
+    """OPS-75 privacy correction: create_note(..., redact_body_in_audit=True)
+    keeps the real POST body and the read-back exact, but writes a fixed
+    marker in place of the body on the audit *outcome* line -- never the
+    message text itself, never derived from it."""
+
+    def test_sentinel_reaches_the_real_post_body(self, transport, log_dir) -> None:
+        route_create_sentinel_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert post.json_body["body"] == SENTINEL
+
+    def test_sentinel_present_in_native_read_back(self, transport, log_dir) -> None:
+        route_create_sentinel_note(transport)
+        c = client(transport, log_dir)
+        created = c.create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        assert created["body"] == SENTINEL
+        readback = c.get_note("g-1", SENTINEL_NOTE_ID)
+        assert readback["body"] == SENTINEL
+
+    def test_sentinel_never_appears_in_audit_log_bytes(self, transport, log_dir) -> None:
+        route_create_sentinel_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        raw = raw_log_bytes(log_dir)
+        assert raw, "expected audit lines to have been written"
+        assert SENTINEL.encode("utf-8") not in raw
+
+    def test_audit_outcome_after_body_is_the_fixed_marker(self, transport, log_dir) -> None:
+        route_create_sentinel_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["after"]["body"] == REDACTED_NOTE_BODY_MARKER
+        assert REDACTED_NOTE_BODY_MARKER != SENTINEL
+
+    def test_audit_outcome_preserves_id_title_and_color_metadata(
+        self, transport, log_dir
+    ) -> None:
+        route_create_sentinel_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["record_id"] == SENTINEL_NOTE_ID
+        assert outcome["after"]["id"] == SENTINEL_NOTE_ID
+        assert outcome["after"]["title"] == SENTINEL_NOTE["title"]
+        assert outcome["after"]["color"] == SENTINEL_NOTE["color"]
+        assert outcome["after"]["contactId"] == SENTINEL_NOTE["contactId"]
+
+    def test_redaction_does_not_affect_the_object_returned_to_the_caller(
+        self, transport, log_dir
+    ) -> None:
+        route_create_sentinel_note(transport)
+        created = client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        assert created == SENTINEL_NOTE
+        assert created["body"] == SENTINEL
+
+    def test_default_false_preserves_existing_call_note_audit_behavior(
+        self, transport, log_dir
+    ) -> None:
+        """Default (no redact_body_in_audit kwarg) must record the real body
+        in the audit outcome -- the exact OPS-18 call-note behavior this
+        build must not change."""
+        route_create_note(transport)
+        client(transport, log_dir).create_note("g-1", NOTE_BODY, trigger=TRIGGER)
+        outcome = outcome_entry(log_dir)
+        assert outcome["after"] == NOTE_CREATED
+        assert outcome["after"]["body"] == NOTE_BODY
+
+    def test_explicit_false_is_the_same_as_omitting_the_kwarg(
+        self, transport, log_dir
+    ) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", NOTE_BODY, trigger=TRIGGER, redact_body_in_audit=False,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["after"] == NOTE_CREATED
+
+    def test_intent_line_never_carries_the_note_body_at_all(
+        self, transport, log_dir
+    ) -> None:
+        """create_note's intent line has before=None regardless of
+        redact_body_in_audit -- there is no prior note to leak."""
+        route_create_sentinel_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        intent = [e for e in entries(log_dir) if e["audit_phase"] == "intent"]
+        assert len(intent) == 1
+        assert intent[0]["before"] is None
