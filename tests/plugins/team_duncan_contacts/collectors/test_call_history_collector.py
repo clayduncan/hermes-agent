@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
 
@@ -193,6 +194,199 @@ def test_replay_command_no_duration_variant_never_hardcodes_answered() -> None:
     assert ".parameter set :zanswered 0" in text
 
 
+# --- ZDATE tolerance band: recovers numeric drift, never widens matching ----
+#
+# Real-proof scenario (OPS-110 live-proof correction): SQLite stores
+# ZDATE=811365870.02960682; converting that to an ISO-microsecond timestamp
+# and back for a replay request yields ~811365870.029607. Exact equality
+# defeated the re-fetch even though the expected immutable source-event id
+# was separately verified after candidate reconstruction. These tests run
+# the actual `.sql` files (read from disk, same as production) through
+# Python's sqlite3 module against a synthetic in-memory ZCALLRECORD table --
+# a test fixture, not a Desk path, so this does not conflict with the
+# production rule against Python's sqlite3 module touching the real Desk.
+
+_STORED_ZDATE = 811365870.02960682
+_REQUESTED_ZDATE = 811365870.029607  # ISO-microsecond round-trip drift
+
+
+def _make_call_history_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE ZCALLRECORD ("
+        "ZDATE REAL, ZADDRESS TEXT, ZDURATION REAL, "
+        "ZORIGINATED INTEGER, ZANSWERED INTEGER)"
+    )
+    return conn
+
+
+def _insert_call(
+    conn: sqlite3.Connection,
+    zdate: float,
+    *,
+    zaddress: str = CANARY_PHONE,
+    zduration: float = 90,
+    zoriginated: int = 1,
+    zanswered: int = 1,
+) -> None:
+    conn.execute(
+        "INSERT INTO ZCALLRECORD (ZDATE, ZADDRESS, ZDURATION, ZORIGINATED, ZANSWERED) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (zdate, zaddress, zduration, zoriginated, zanswered),
+    )
+    conn.commit()
+
+
+def _run_replay_sql(
+    conn: sqlite3.Connection,
+    sql_path,
+    *,
+    zdate_low: float,
+    zdate_high: float,
+    zoriginated: int = 1,
+    zanswered: int = 1,
+    duration_low: float | None = None,
+    duration_high: float | None = None,
+) -> list[dict]:
+    params: dict[str, float | int] = {
+        "zdate_low": zdate_low, "zdate_high": zdate_high,
+        "zoriginated": zoriginated, "zanswered": zanswered,
+    }
+    if duration_low is not None:
+        params["duration_low"] = duration_low
+        params["duration_high"] = duration_high
+    cur = conn.execute(sql_path.read_text(encoding="utf-8"), params)
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def test_replay_command_binds_zdate_tolerance_band_not_exact_equality() -> None:
+    argv, stdin = build_replay_command(
+        ssh_identity="i", ssh_target="t", target_zdate=_REQUESTED_ZDATE,
+        zoriginated=1, zanswered=1, duration_s=90,
+    )
+    text = stdin.decode()
+    assert "ZDATE BETWEEN" in text
+    assert "ZDATE = :target_zdate" not in text
+    assert ":target_zdate" not in text
+    assert ".parameter set :zdate_low" in text
+    assert ".parameter set :zdate_high" in text
+
+
+def test_replay_command_zdate_bounds_are_target_plus_minus_one_millisecond() -> None:
+    _argv, stdin = build_replay_command(
+        ssh_identity="i", ssh_target="t", target_zdate=_REQUESTED_ZDATE,
+        zoriginated=1, zanswered=1, duration_s=None,
+    )
+    text = stdin.decode()
+    low_line = next(l for l in text.splitlines() if l.startswith(".parameter set :zdate_low"))
+    high_line = next(l for l in text.splitlines() if l.startswith(".parameter set :zdate_high"))
+    zdate_low = float(low_line.rsplit(" ", 1)[1])
+    zdate_high = float(high_line.rsplit(" ", 1)[1])
+    assert zdate_low == pytest.approx(_REQUESTED_ZDATE - 0.001, abs=1e-9)
+    assert zdate_high == pytest.approx(_REQUESTED_ZDATE + 0.001, abs=1e-9)
+
+
+def test_zdate_tolerance_recovers_stored_vs_iso_roundtrip_drift() -> None:
+    """Reproduces the live-proof scenario exactly: stored 811365870.02960682
+    vs a requested/replayed 811365870.029607 after an ISO-microsecond
+    round trip. Exact equality would return zero rows; the tolerance band
+    recovers the match."""
+    assert _STORED_ZDATE != _REQUESTED_ZDATE
+    assert abs(_STORED_ZDATE - _REQUESTED_ZDATE) < 0.001
+
+    conn = _make_call_history_db()
+    _insert_call(conn, _STORED_ZDATE, zduration=90)
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_WITH_DURATION_SQL_PATH,
+        zdate_low=_REQUESTED_ZDATE - 0.001, zdate_high=_REQUESTED_ZDATE + 0.001,
+        duration_low=88, duration_high=92,
+    )
+    assert len(rows) == 1
+    assert rows[0]["ZDATE"] == pytest.approx(_STORED_ZDATE)
+
+
+def test_zdate_tolerance_recovers_drift_for_no_duration_variant() -> None:
+    conn = _make_call_history_db()
+    _insert_call(conn, _STORED_ZDATE, zoriginated=0, zanswered=0)
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_NO_DURATION_SQL_PATH,
+        zdate_low=_REQUESTED_ZDATE - 0.001, zdate_high=_REQUESTED_ZDATE + 0.001,
+        zoriginated=0, zanswered=0,
+    )
+    assert len(rows) == 1
+
+
+def test_zdate_tolerance_boundaries_are_inclusive() -> None:
+    target = 811365870.0
+    tol = 0.001
+    conn = _make_call_history_db()
+    _insert_call(conn, target - tol, zaddress="+15550000001", zduration=90)
+    _insert_call(conn, target + tol, zaddress="+15550000002", zduration=90)
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_WITH_DURATION_SQL_PATH,
+        zdate_low=target - tol, zdate_high=target + tol,
+        duration_low=88, duration_high=92,
+    )
+    assert {r["ZADDRESS"] for r in rows} == {"+15550000001", "+15550000002"}
+
+
+def test_zdate_outside_tolerance_band_is_rejected() -> None:
+    target = 811365870.0
+    tol = 0.001
+    conn = _make_call_history_db()
+    # Just outside the band on both sides.
+    _insert_call(conn, target - tol - 0.0005, zaddress="+15550000003", zduration=90)
+    _insert_call(conn, target + tol + 0.0005, zaddress="+15550000004", zduration=90)
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_WITH_DURATION_SQL_PATH,
+        zdate_low=target - tol, zdate_high=target + tol,
+        duration_low=88, duration_high=92,
+    )
+    assert rows == []
+
+
+def test_zdate_tolerance_keeps_direction_answered_and_duration_filters() -> None:
+    """The widened ZDATE band must not loosen the other filters."""
+    target = 811365870.0
+    tol = 0.001
+    conn = _make_call_history_db()
+    _insert_call(conn, target, zaddress="+15550000005", zduration=90, zoriginated=0, zanswered=1)
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_WITH_DURATION_SQL_PATH,
+        zdate_low=target - tol, zdate_high=target + tol,
+        zoriginated=1, zanswered=1,  # wrong direction for the inserted row
+        duration_low=88, duration_high=92,
+    )
+    assert rows == []
+
+    rows = _run_replay_sql(
+        conn, chc_module._REPLAY_WITH_DURATION_SQL_PATH,
+        zdate_low=target - tol, zdate_high=target + tol,
+        zoriginated=0, zanswered=1,
+        duration_low=200, duration_high=204,  # outside duration tolerance
+    )
+    assert rows == []
+
+
+def test_fetch_exact_event_ambiguous_within_zdate_tolerance_band_fails_closed() -> None:
+    """Even when the drifted target_zdate is recovered by the tolerance
+    band, two indistinguishable replay candidates must still fail closed --
+    the tolerance only recovers numeric representation drift; it never
+    selects among multiple candidates."""
+    row_a = _row(zdate=_STORED_ZDATE, zaddress=CANARY_PHONE, zduration=90)
+    row_b = dict(row_a)
+    expected_id = compute_desk_source_event_id(IDENTITY_KEY, _STORED_ZDATE, CANARY_PHONE, 90)
+
+    transport = FakeDeskTransport([], replay_rows=[row_a, row_b])
+    collector = CallHistoryCollector(transport, IDENTITY_KEY)
+    with pytest.raises(AmbiguousReplayError):
+        collector.fetch_exact_event(
+            target_zdate=_REQUESTED_ZDATE, zoriginated=1, zanswered=1, duration_s=90,
+            expected_source_event_id=expected_id,
+        )
+
+
 # --- source_event_id: stable, non-reversible --------------------------------
 
 def test_desk_source_event_id_is_stable_for_identical_inputs() -> None:
@@ -325,7 +519,8 @@ def test_replay_stdin_begins_with_mode_json_and_preserves_parameters() -> None:
     )
     text = stdin.decode()
     assert text.startswith(".mode json")
-    assert ".parameter set :target_zdate" in text
+    assert ".parameter set :zdate_low" in text
+    assert ".parameter set :zdate_high" in text
     assert ".parameter set :duration_low" in text
     assert ".parameter set :duration_high" in text
     assert ".parameter set :zoriginated" in text
