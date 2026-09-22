@@ -50,6 +50,15 @@ CALL_HISTORY_LOOKBACK_DAYS = 7
 #: Small fixed tolerance band absorbing minor source-side duration rounding.
 _DURATION_TOLERANCE_SECONDS = 2
 
+#: Small fixed tolerance band (1ms) absorbing float/IEEE-754 and
+#: datetime-microsecond round-trip drift on ZDATE (e.g. converting an
+#: Apple-epoch float to an ISO-microsecond timestamp and back). Not a
+#: call-level heuristic window -- far narrower than any real gap between
+#: distinct calls. `fetch_exact_event` still verifies the returned row's
+#: recomputed source_event_id exactly, so this only recovers numeric
+#: representation drift; it never selects among multiple distinct calls.
+_ZDATE_TOLERANCE_SECONDS = 0.001
+
 APPLE_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
 
 _CALL_HISTORY_DB_PATH = (
@@ -183,6 +192,9 @@ def build_replay_command(
     _validate_numeric("zoriginated", zoriginated)
     _validate_numeric("zanswered", zanswered)
 
+    zdate_low = target_zdate - _ZDATE_TOLERANCE_SECONDS
+    zdate_high = target_zdate + _ZDATE_TOLERANCE_SECONDS
+
     remote_cmd = (
         f"LC_ALL=C {_SANDBOX_EXEC_BIN} -p '{_sandbox_profile()}' "
         f"{_SQLITE3_BIN} -readonly -batch "
@@ -199,7 +211,8 @@ def build_replay_command(
     if duration_s is None:
         stdin_text = (
             ".mode json\n"
-            f".parameter set :target_zdate {target_zdate!r}\n"
+            f".parameter set :zdate_low {zdate_low!r}\n"
+            f".parameter set :zdate_high {zdate_high!r}\n"
             f".parameter set :zoriginated {int(zoriginated)!r}\n"
             f".parameter set :zanswered {int(zanswered)!r}\n"
             + _REPLAY_NO_DURATION_SQL_PATH.read_text(encoding="utf-8")
@@ -210,7 +223,8 @@ def build_replay_command(
         duration_high = duration_s + _DURATION_TOLERANCE_SECONDS
         stdin_text = (
             ".mode json\n"
-            f".parameter set :target_zdate {target_zdate!r}\n"
+            f".parameter set :zdate_low {zdate_low!r}\n"
+            f".parameter set :zdate_high {zdate_high!r}\n"
             f".parameter set :duration_low {duration_low!r}\n"
             f".parameter set :duration_high {duration_high!r}\n"
             f".parameter set :zoriginated {int(zoriginated)!r}\n"
