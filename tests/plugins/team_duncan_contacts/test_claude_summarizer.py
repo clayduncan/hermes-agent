@@ -23,6 +23,7 @@ from plugins.team_duncan_contacts.claude_summarizer import (
     SummarizerError,
     run_claude_summary,
 )
+from plugins.team_duncan_contacts import claude_summarizer as claude_summarizer_module
 
 VALID_PAYLOAD: dict[str, Any] = {
     "contact_type": "agent_partner",
@@ -36,8 +37,13 @@ VALID_PAYLOAD: dict[str, Any] = {
 }
 
 
+def _extract_prompt(argv: list[str]) -> str:
+    assert "-p" in argv, "argv must pass the prompt via -p"
+    return argv[argv.index("-p") + 1]
+
+
 def _extract_output_path(argv: list[str]) -> Path:
-    prompt = argv[-1]
+    prompt = _extract_prompt(argv)
     match = re.search(r"(\S+/output\.json)", prompt)
     assert match, "fixed prompt must reference the output.json path"
     return Path(match.group(1))
@@ -265,6 +271,151 @@ class TestStrictSchemaValidation:
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(raw_output=json.dumps(["not", "a", "dict"])))
         assert exc_info.value.error_class == "invalid_json_shape"
+
+
+class TestNonInteractivePermissionGrant:
+    """Non-interactive claude-max has no permission to write the fixed
+    output path unless explicitly granted -- but only the exact, minimal
+    grant the fixed prompt needs, never anything broader."""
+
+    def test_argv_grants_exactly_read_write_non_interactively(self) -> None:
+        runner = RecordingRunner(VALID_PAYLOAD)
+        _run(runner)
+        prompt = _extract_prompt(runner.argv)
+        assert runner.argv == [
+            runner.argv[0],
+            "-p",
+            prompt,
+            "--dangerously-skip-permissions",
+            "--allowedTools",
+            "Read,Write",
+        ]
+
+    def test_no_other_tools_are_granted(self) -> None:
+        runner = RecordingRunner(VALID_PAYLOAD)
+        _run(runner)
+        allowed_index = runner.argv.index("--allowedTools")
+        allowed_value = runner.argv[allowed_index + 1]
+        assert allowed_value == "Read,Write"
+        assert "Bash" not in runner.argv
+        assert "Edit" not in runner.argv
+        for forbidden in ("Bash", "Edit", "WebFetch", "WebSearch", "computer_use"):
+            assert forbidden not in allowed_value
+
+    def test_argv_is_never_shelled_out(self) -> None:
+        # _default_runner must invoke subprocess.run with a fixed argv list
+        # and shell=False (the default) -- never a shell string.
+        import inspect
+
+        source = inspect.getsource(claude_summarizer_module._default_runner)
+        assert "shell=True" not in source
+
+
+class TestOutputPathContainment:
+    def test_output_path_escaping_temp_dir_fails_closed(self, monkeypatch, tmp_path) -> None:
+        fake_tmpdir = tmp_path / "ops110-plaud-fake"
+        fake_tmpdir.mkdir()
+        monkeypatch.setattr(
+            claude_summarizer_module.tempfile, "mkdtemp", lambda prefix: str(fake_tmpdir)
+        )
+
+        real_resolve = Path.resolve
+
+        def _fake_resolve(self, *args, **kwargs):
+            if self.name == "output.json":
+                return Path("/elsewhere/output.json")
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", _fake_resolve)
+
+        runner = RecordingRunner(VALID_PAYLOAD)
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(runner)
+        assert exc_info.value.error_class == "unsafe_temp_path"
+        assert runner.argv is None, "subprocess must never launch when the path check fails"
+
+    def test_transcript_and_context_paths_also_checked(self, monkeypatch, tmp_path) -> None:
+        fake_tmpdir = tmp_path / "ops110-plaud-fake-2"
+        fake_tmpdir.mkdir()
+        monkeypatch.setattr(
+            claude_summarizer_module.tempfile, "mkdtemp", lambda prefix: str(fake_tmpdir)
+        )
+
+        real_resolve = Path.resolve
+
+        def _fake_resolve(self, *args, **kwargs):
+            if self.name == "transcript.json":
+                return Path("/elsewhere/transcript.json")
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", _fake_resolve)
+
+        runner = RecordingRunner(VALID_PAYLOAD)
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(runner)
+        assert exc_info.value.error_class == "unsafe_temp_path"
+        assert runner.argv is None
+
+    def test_happy_path_output_resolves_inside_temp_dir(self) -> None:
+        runner = RecordingRunner(VALID_PAYLOAD)
+        _run(runner)
+        output_path = _extract_output_path(runner.argv)
+        assert output_path.parent == runner.tmpdir
+
+
+class TestRealShapedSubprocessIntegration:
+    """Exercises the real, unmocked _default_runner -- a genuine local
+    subprocess.run call against a fake claude-max stand-in -- reproducing
+    the shape of production execution rather than an injected callable."""
+
+    def test_default_runner_spawns_real_subprocess_and_parses_written_output(
+        self, tmp_path
+    ) -> None:
+        hermes_home = tmp_path / "hermes-home"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True)
+        fake_claude_max = bin_dir / "claude-max"
+        argv_marker = tmp_path / "argv_seen.txt"
+        fake_claude_max.write_text(
+            "#!/bin/sh\n"
+            'echo "$@" > "' + str(argv_marker) + '"\n'
+            'prompt="$2"\n'
+            "output_path=$(printf '%s' \"$prompt\" | grep -o '[^ ]*output\\.json' | head -1)\n"
+            'cat > "$output_path" <<JSON\n'
+            + json.dumps(VALID_PAYLOAD) + "\n"
+            "JSON\n"
+            "exit 0\n"
+        )
+        fake_claude_max.chmod(0o700)
+
+        result = run_claude_summary(
+            transcript_segments=[{"speaker": "Clay", "text": "hi"}],
+            contact_context={"contact_id": "c-1", "type": "agent_partner"},
+            hermes_home=hermes_home,
+        )
+
+        assert result.contact_type == VALID_PAYLOAD["contact_type"]
+        assert result.summary_lines == VALID_PAYLOAD["summary_lines"]
+        assert result.discussed == VALID_PAYLOAD["discussed"]
+
+        argv_seen = argv_marker.read_text(encoding="utf-8")
+        assert "--dangerously-skip-permissions" in argv_seen
+        assert "--allowedTools Read,Write" in argv_seen
+
+
+class TestNoStdoutFallback:
+    def test_valid_json_on_stdout_does_not_rescue_a_missing_output_file(self) -> None:
+        def _runner(argv):
+            return subprocess.CompletedProcess(
+                argv,
+                returncode=0,
+                stdout=json.dumps(VALID_PAYLOAD).encode("utf-8"),
+                stderr=b"",
+            )
+
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(_runner)
+        assert exc_info.value.error_class == "no_output_file"
 
 
 class TestAttributionSafeguard:
