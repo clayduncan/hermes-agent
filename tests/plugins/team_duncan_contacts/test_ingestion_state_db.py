@@ -410,3 +410,80 @@ def test_identity_key_stable_across_loads(tmp_path: Path) -> None:
 
     mode = stat.S_IMODE((data_dir / "ingestion_identity_key").stat().st_mode)
     assert mode == stat.S_IRUSR | stat.S_IWUSR
+
+
+# ---------------------------------------------------------------------------
+# OPS-110: plaud_summary_state
+# ---------------------------------------------------------------------------
+
+
+def test_plaud_summary_state_missing_row_is_none(db: IngestionStateDb) -> None:
+    assert db.get_plaud_summary_state("rec-1") is None
+
+
+def test_plaud_summary_state_new_row_gets_fixed_defaults(db: IngestionStateDb) -> None:
+    row = db.upsert_plaud_summary_state("rec-1", match_status="matched")
+    assert row.plaud_recording_id == "rec-1"
+    assert row.match_status == "matched"
+    assert row.transcript_status == "not_fetched"
+    assert row.summary_status == "not_started"
+    assert row.desk_source_event_id is None
+    assert row.contact_id is None
+    assert row.note_id is None
+    assert row.error_class is None
+
+
+def test_plaud_summary_state_is_keyed_only_by_recording_id_idempotent_on_replay(
+    db: IngestionStateDb,
+) -> None:
+    first = db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", desk_source_event_id="desk-1"
+    )
+    second = db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", desk_source_event_id="desk-1"
+    )
+    assert first.id == second.id
+    assert db.get_plaud_summary_state("rec-1").desk_source_event_id == "desk-1"
+
+
+def test_plaud_summary_state_fields_left_none_preserve_prior_values(db: IngestionStateDb) -> None:
+    db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", desk_source_event_id="desk-1", contact_id="c-1",
+    )
+    db.upsert_plaud_summary_state("rec-1", match_status="matched", transcript_status="fetched")
+    row = db.get_plaud_summary_state("rec-1")
+    assert row.desk_source_event_id == "desk-1"
+    assert row.contact_id == "c-1"
+    assert row.transcript_status == "fetched"
+
+
+def test_plaud_summary_state_error_class_is_always_overwritten_including_to_none(
+    db: IngestionStateDb,
+) -> None:
+    db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", transcript_status="failed", error_class="transcript_fetch_failed"
+    )
+    row = db.get_plaud_summary_state("rec-1")
+    assert row.error_class == "transcript_fetch_failed"
+
+    db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", transcript_status="fetched", error_class=None
+    )
+    row = db.get_plaud_summary_state("rec-1")
+    assert row.error_class is None, "a later successful stage must clear a prior failure"
+
+
+def test_plaud_summary_state_note_id_and_hash_are_settable(db: IngestionStateDb) -> None:
+    db.upsert_plaud_summary_state(
+        "rec-1", match_status="matched", claude_output_hash="abc123", note_id="note-1",
+    )
+    row = db.get_plaud_summary_state("rec-1")
+    assert row.claude_output_hash == "abc123"
+    assert row.note_id == "note-1"
+
+
+def test_plaud_summary_state_two_different_recordings_are_independent(db: IngestionStateDb) -> None:
+    db.upsert_plaud_summary_state("rec-1", match_status="unmatched")
+    db.upsert_plaud_summary_state("rec-2", match_status="ambiguous")
+    assert db.get_plaud_summary_state("rec-1").match_status == "unmatched"
+    assert db.get_plaud_summary_state("rec-2").match_status == "ambiguous"

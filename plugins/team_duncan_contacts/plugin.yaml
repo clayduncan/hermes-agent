@@ -12,3 +12,5 @@ provides_tools:
   - prepare_call_log_ingest
   - confirm_call_log_ingest
   - accept_call_log_ingest_run
+  - prepare_plaud_summary_run
+  - confirm_plaud_summary_run

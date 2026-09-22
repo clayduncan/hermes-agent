@@ -1195,7 +1195,7 @@ class TestConfigRouting:
              ):
             register(fake_ctx)
 
-        assert fake_ctx.register_tool.call_count == 6
+        assert fake_ctx.register_tool.call_count == 8
         registered_names = {
             call.kwargs.get("name") or call.args[0]
             for call in fake_ctx.register_tool.call_args_list
@@ -1207,6 +1207,8 @@ class TestConfigRouting:
             "prepare_call_log_ingest",
             "confirm_call_log_ingest",
             "accept_call_log_ingest_run",
+            "prepare_plaud_summary_run",
+            "confirm_plaud_summary_run",
         }
 
 

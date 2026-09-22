@@ -17,14 +17,20 @@ import pytest
 from plugins.team_duncan_contacts.ingestion_runner import IngestionRunner
 from plugins.team_duncan_contacts.collectors.call_history_collector import CallHistoryCollector
 from plugins.team_duncan_contacts.collectors.plaud_collector import PlaudCollector
+from plugins.team_duncan_contacts.collectors.plaud_transcript import TranscriptPage
+from plugins.team_duncan_contacts.ghl_reader import FakeGhlReader
 from plugins.team_duncan_contacts.ingestion_state_db import IngestionStateDb
+from plugins.team_duncan_contacts.plaud_note_writer import PlaudSummaryNoteWriter
+from plugins.team_duncan_contacts.plaud_summary_runner import PlaudSummaryRunner
 from plugins.team_duncan_contacts.registry import ContactRegistry
 from plugins.team_duncan_contacts.activity_ledger import ActivityLedger
 from plugins.team_duncan_contacts.tools import (
     make_accept_call_log_ingest_run_handler,
     make_confirm_call_log_ingest_handler,
+    make_confirm_plaud_summary_run_handler,
     make_list_pending_call_reviews_handler,
     make_prepare_call_log_ingest_handler,
+    make_prepare_plaud_summary_run_handler,
 )
 from tools.ghl_client import TEAM_DUNCAN_LOCATION_ID
 
@@ -314,3 +320,125 @@ def test_accept_rejects_unknown_run_id(state_db) -> None:
     result = json.loads(accept_handler({"run_id": "not-a-real-run"}))
     assert result["status"] == "rejected"
     assert result["reason"] == "run_not_found_or_already_accepted"
+
+
+# ---------------------------------------------------------------------------
+# OPS-110: prepare_plaud_summary_run / confirm_plaud_summary_run
+# ---------------------------------------------------------------------------
+
+
+class _EmptyTranscriptTransport:
+    def fetch_transcript_page(self, recording_id, cursor):
+        return TranscriptPage(segments=[], next_cursor=None)
+
+
+class _EmptyNoteGhlClient:
+    def create_note(self, *args, **kwargs):
+        raise AssertionError("must not be called when there are zero Plaud records")
+
+    def update_note(self, *args, **kwargs):
+        raise AssertionError("must not be called when there are zero Plaud records")
+
+    def get_note(self, *args, **kwargs):
+        return None
+
+
+@pytest.fixture()
+def plaud_runner_factory(tmp_path: Path, state_db: IngestionStateDb):
+    registry = ContactRegistry(
+        tmp_path / "registry-plaud", team_duncan_location_id=TEAM_DUNCAN_LOCATION_ID
+    )
+    ledger = ActivityLedger(tmp_path / "activity-plaud.db", registry)
+    desk_transport = _EmptyTransport()
+
+    def _factory():
+        runner = PlaudSummaryRunner(
+            registry=registry,
+            activity_ledger=ledger,
+            state_db=state_db,
+            plaud_collector=PlaudCollector(_EmptyTransport()),
+            transcript_transport=_EmptyTranscriptTransport(),
+            desk_collector=CallHistoryCollector(desk_transport, b"\x0a" * 32),
+            ghl_reader=FakeGhlReader([]),
+            note_writer=PlaudSummaryNoteWriter(_EmptyNoteGhlClient(), state_db),
+            hermes_home=tmp_path,
+        )
+        return runner, state_db
+
+    _factory.desk_transport = desk_transport
+    return _factory
+
+
+def test_prepare_plaud_summary_run_rejects_cron_context(state_db, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    handler = make_prepare_plaud_summary_run_handler(state_db)
+    result = json.loads(handler({}))
+    assert result["status"] == "rejected"
+    assert result["reason"] == "cron_context"
+
+
+def test_prepare_plaud_summary_run_issues_token(state_db) -> None:
+    handler = make_prepare_plaud_summary_run_handler(state_db)
+    result = json.loads(handler({}))
+    assert result["status"] == "ready_for_confirmation"
+    assert "token" in result
+    assert "token_expires_at" in result
+
+
+def test_confirm_plaud_summary_run_rejects_cron_context(
+    state_db, plaud_runner_factory, monkeypatch
+) -> None:
+    prep = json.loads(make_prepare_plaud_summary_run_handler(state_db)({}))
+
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "rejected"
+    assert result["reason"] == "cron_context"
+
+    # Token is NOT consumed by a rejected cron attempt.
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    result2 = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result2["status"] == "completed"
+
+
+def test_confirm_plaud_summary_run_token_single_use_and_expiring(
+    state_db, plaud_runner_factory, clock
+) -> None:
+    prepare_handler = make_prepare_plaud_summary_run_handler(state_db)
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+
+    prep = json.loads(prepare_handler({}))
+    first = json.loads(confirm_handler({"token": prep["token"]}))
+    assert first["status"] == "completed"
+    assert first["matched"] == 0
+    assert first["notes_written"] == 0
+    assert first["errors"] == 0
+
+    second = json.loads(confirm_handler({"token": prep["token"]}))
+    assert second["status"] == "rejected"
+    assert second["reason"] == "token_not_found_or_expired"
+
+    expired_prep = json.loads(prepare_handler({}))
+    clock.advance(seconds=301)
+    expired = json.loads(confirm_handler({"token": expired_prep["token"]}))
+    assert expired["status"] == "rejected"
+    assert expired["reason"] == "token_not_found_or_expired"
+
+
+def test_confirm_plaud_summary_run_rejects_garbage_token(state_db, plaud_runner_factory) -> None:
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    result = json.loads(confirm_handler({"token": "not-a-real-token"}))
+    assert result["status"] == "rejected"
+    assert result["reason"] == "token_not_found_or_expired"
+
+
+def test_confirm_plaud_summary_run_with_zero_records_never_touches_ghl(
+    state_db, plaud_runner_factory
+) -> None:
+    prep = json.loads(make_prepare_plaud_summary_run_handler(state_db)({}))
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    result = json.loads(confirm_handler({"token": prep["token"]}))
+    assert result["status"] == "completed"
+    assert result["errors"] == 0
+    assert result["notes_written"] == 0
