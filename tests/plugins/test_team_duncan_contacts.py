@@ -31,3 +31,6 @@ from tests.plugins.team_duncan_contacts.test_registry import (  # noqa: F401
     TestExceptionCanary,
     TestNoEmDash,
 )
+from tests.plugins.team_duncan_contacts.test_manifest_parity import (  # noqa: F401
+    TestManifestToolParity,
+)
