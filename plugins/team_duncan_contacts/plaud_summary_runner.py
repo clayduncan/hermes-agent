@@ -28,12 +28,16 @@ Per Plaud recording, in order:
      ever the `transaction` surface.
   5. A bounded GHL contact context (plaud_context.py) and a claude-max
      subprocess summary (claude_summarizer.py). The visible note body is
-     never Claude's free-form summary_lines -- it is deterministically
-     composed here (build_visible_body_lines) from the structured
-     discussed/clay_commitment/next_step fields, so Clay's commitment and
-     the next step can never be silently dropped. Fewer than 2 resulting
-     lines is treated as invalid summarizer output: no note is written and
-     the frontier holds for retry, the same as a SummarizerError.
+     exactly Claude's validated, owner-labeled summary_lines
+     (build_visible_body_lines) -- third person, no narrative lead-in, and
+     every commitment/next-step line labeled "Clay: " or the contact's own
+     first name. claude_summarizer.py's own strict parser cross-checks
+     summary_lines against the structured discussed/clay_commitment/
+     next_step fields before a SummaryResult can ever exist, so Clay's
+     commitment and the contact's next step can never be silently dropped
+     or misattributed. Fewer than 2 resulting lines is treated as invalid
+     summarizer output: no note is written and the frontier holds for
+     retry, the same as a SummarizerError.
   6. A GHL note create-or-update-in-place (plaud_note_writer.py), title
      built from the same metadata-only formatter the Desk-only mirror uses.
 

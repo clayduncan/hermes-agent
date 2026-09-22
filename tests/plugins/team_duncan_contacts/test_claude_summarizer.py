@@ -4,6 +4,13 @@ No real subprocess is ever spawned: every test injects a fake `runner`
 callable, matching the LiveDeskTransport precedent (call_history_collector.py)
 of an injectable runner seam around subprocess.run. The fake runner plays
 claude-max's role of writing output.json into the temp dir it's told about.
+
+The visible note body is exactly Claude's validated, owner-labeled
+summary_lines -- third person, no narrative lead-in on line 1, and every
+remaining line labeled with exactly "Clay: " or the contact's exact
+first_name label. discussed/clay_commitment/next_step are kept as a durable
+record and cross-checked against summary_lines so the visible lines can
+never silently omit or contradict a named commitment.
 """
 
 from __future__ import annotations
@@ -27,16 +34,37 @@ from plugins.team_duncan_contacts.claude_summarizer import (
 )
 from plugins.team_duncan_contacts import claude_summarizer as claude_summarizer_module
 
+# Cory's exact example from the OPS-110 CRM summary-style correction.
+CORY_LINE_1 = (
+    "Referral and joint-venture opportunities with Realty One Group agents "
+    "and brokers, centered on the Destin One Talks event and Clay's AI "
+    "presentation tools."
+)
+CORY_CLAY_PHRASE = "covering his own costs to attend Destin, bringing prepared AI materials."
+CORY_CONTACT_PHRASE = (
+    "checking with the Destin broker owner on VIP cruise availability, "
+    "following up in a day or two."
+)
+
 VALID_PAYLOAD: dict[str, Any] = {
     "contact_type": "agent_partner",
     "summary_lines": [
-        "Clay and Cory discussed a new listing referral.",
-        "Cory asked about commission split on future co-listed deals.",
+        CORY_LINE_1,
+        f"Clay: {CORY_CLAY_PHRASE}",
+        f"Cory: {CORY_CONTACT_PHRASE}",
     ],
-    "discussed": "A potential referral and commission split arrangement.",
-    "clay_commitment": "Clay will send the standard co-listing agreement.",
-    "next_step": "Cory will review the agreement and reply by Friday.",
+    "discussed": CORY_LINE_1,
+    "clay_commitment": CORY_CLAY_PHRASE,
+    "next_step": CORY_CONTACT_PHRASE,
 }
+
+DEFAULT_CONTACT_CONTEXT: dict[str, Any] = {
+    "contact_id": "c-1", "type": "agent_partner", "first_name": "Cory",
+}
+
+
+def _valid_payload(**overrides: Any) -> dict[str, Any]:
+    return {**VALID_PAYLOAD, **overrides}
 
 
 def _extract_prompt(argv: list[str]) -> str:
@@ -87,7 +115,7 @@ class RecordingRunner:
 def _run(runner, **overrides):
     kwargs = dict(
         transcript_segments=[{"speaker": "Clay", "text": "hi"}],
-        contact_context={"contact_id": "c-1", "type": "agent_partner"},
+        contact_context=dict(DEFAULT_CONTACT_CONTEXT),
         hermes_home=Path("/nonexistent/hermes-home"),
         runner=runner,
     )
@@ -105,25 +133,31 @@ class TestHappyPath:
         assert result.clay_commitment == VALID_PAYLOAD["clay_commitment"]
         assert result.next_step == VALID_PAYLOAD["next_step"]
 
-    def test_none_stated_is_accepted_for_commitment_and_next_step(self) -> None:
-        payload = {**VALID_PAYLOAD, "clay_commitment": "None stated.", "next_step": "None stated."}
+    def test_clay_only_commitment_is_accepted_with_two_line_summary(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"],
+            next_step="None stated.",
+        )
         result = _run(RecordingRunner(payload))
-        assert result.clay_commitment == "None stated."
+        assert result.summary_lines == [CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"]
         assert result.next_step == "None stated."
 
-    def test_two_line_summary_is_accepted(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["Line one here.", "Line two here."]}
+    def test_contact_only_next_step_is_accepted_with_two_line_summary(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Cory: {CORY_CONTACT_PHRASE}"],
+            clay_commitment="None stated.",
+        )
         result = _run(RecordingRunner(payload))
-        assert len(result.summary_lines) == 2
+        assert result.summary_lines == [CORY_LINE_1, f"Cory: {CORY_CONTACT_PHRASE}"]
+        assert result.clay_commitment == "None stated."
 
-    def test_three_line_summary_is_accepted(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["Line one.", "Line two.", "Line three."]}
-        result = _run(RecordingRunner(payload))
+    def test_three_line_summary_with_both_owners_is_accepted(self) -> None:
+        result = _run(RecordingRunner(VALID_PAYLOAD))
         assert len(result.summary_lines) == 3
 
     @pytest.mark.parametrize("contact_type", CONTACT_TYPES)
     def test_every_contact_type_category_is_accepted(self, contact_type: str) -> None:
-        payload = {**VALID_PAYLOAD, "contact_type": contact_type}
+        payload = _valid_payload(contact_type=contact_type)
         result = _run(RecordingRunner(payload))
         assert result.contact_type == contact_type
 
@@ -201,6 +235,33 @@ class TestSubprocessFailureModes:
         assert exc_info.value.error_class == "invalid_json"
 
 
+class TestMissingContactFirstName:
+    """No visible owner label can ever be built for a contact whose
+    first_name is missing -- this must fail closed before claude-max is
+    even invoked."""
+
+    def test_missing_first_name_key_raises(self) -> None:
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(VALID_PAYLOAD), contact_context={"contact_id": "c-1"})
+        assert exc_info.value.error_class == "missing_contact_first_name"
+
+    def test_blank_first_name_raises(self) -> None:
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(VALID_PAYLOAD), contact_context={"first_name": "   "})
+        assert exc_info.value.error_class == "missing_contact_first_name"
+
+    def test_non_string_first_name_raises(self) -> None:
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(VALID_PAYLOAD), contact_context={"first_name": None})
+        assert exc_info.value.error_class == "missing_contact_first_name"
+
+    def test_no_subprocess_is_launched(self) -> None:
+        runner = RecordingRunner(VALID_PAYLOAD)
+        with pytest.raises(SummarizerError):
+            _run(runner, contact_context={"contact_id": "c-1"})
+        assert runner.argv is None
+
+
 class TestStrictSchemaValidation:
     def test_missing_keys_rejected(self) -> None:
         payload = dict(VALID_PAYLOAD)
@@ -210,61 +271,79 @@ class TestStrictSchemaValidation:
         assert exc_info.value.error_class == "missing_keys"
 
     def test_invalid_contact_type_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "contact_type": "mortgage_prospect"}
+        payload = _valid_payload(contact_type="mortgage_prospect")
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_contact_type"
 
     def test_one_line_summary_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["only one line here."]}
+        payload = _valid_payload(summary_lines=["only one line here."])
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_four_line_summary_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["a.", "b.", "c.", "d."]}
+        payload = _valid_payload(summary_lines=["a.", "Clay: b.", "Cory: c.", "d."])
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_empty_summary_line_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["", "second line."]}
+        payload = _valid_payload(summary_lines=["", "Clay: sends it today."])
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_markdown_bullet_in_summary_line_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["- a bullet point.", "second line."]}
+        payload = _valid_payload(summary_lines=["- a bullet point.", "second line."])
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_url_in_summary_line_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["See https://example.com for details.", "second."]}
+        payload = _valid_payload(
+            summary_lines=["See https://example.com for details.", "second."]
+        )
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_raw_phone_number_in_summary_line_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": ["Call 555-123-4567 to confirm.", "second."]}
+        payload = _valid_payload(summary_lines=["Call 555-123-4567 to confirm.", "second."])
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_email_in_summary_line_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=["Email cory.vasquez@realtyonegroup.com for details.", "second."]
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_em_dash_in_summary_line_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[f"{CORY_LINE_1} — an aside.", f"Clay: {CORY_CLAY_PHRASE}"]
+        )
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
 
     def test_empty_clay_commitment_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "clay_commitment": ""}
+        payload = _valid_payload(clay_commitment="")
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_clay_commitment"
 
     def test_empty_next_step_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "next_step": ""}
+        payload = _valid_payload(next_step="")
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_next_step"
 
     def test_non_list_summary_lines_rejected(self) -> None:
-        payload = {**VALID_PAYLOAD, "summary_lines": "just a string"}
+        payload = _valid_payload(summary_lines="just a string")
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(payload))
         assert exc_info.value.error_class == "invalid_summary_lines"
@@ -273,6 +352,308 @@ class TestStrictSchemaValidation:
         with pytest.raises(SummarizerError) as exc_info:
             _run(RecordingRunner(raw_output=json.dumps(["not", "a", "dict"])))
         assert exc_info.value.error_class == "invalid_json_shape"
+
+
+class TestNarrativeLeadInRejected:
+    """Line 1 must open directly with the substance -- never narration."""
+
+    @pytest.mark.parametrize(
+        "leadin",
+        [
+            "Clay and Cory discussed a new listing referral.",
+            "Clay discussed the referral opportunity.",
+            "Cory and Clay talked about the referral.",
+            "Discussed a new listing referral.",
+        ],
+    )
+    def test_narrative_leadin_rejected(self, leadin: str) -> None:
+        payload = _valid_payload(
+            summary_lines=[leadin, f"Clay: {CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_non_narrative_line_mentioning_discussed_verb_midsentence_is_allowed(self) -> None:
+        """The check targets a narration lead-in, not the mere presence of
+        a verb like "discussed" -- a substantive line that only later
+        references what was covered must still be accepted."""
+        line1 = "A referral opportunity for a new listing, plus terms Cory discussed for future deals."
+        payload = _valid_payload(
+            summary_lines=[line1, f"Clay: {CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        result = _run(RecordingRunner(payload))
+        assert result.summary_lines[0] == line1
+
+
+class TestFirstPersonRejected:
+    PRONOUNS = ["I", "me", "my", "mine", "we", "us", "our", "ours"]
+
+    @pytest.mark.parametrize("pronoun", PRONOUNS)
+    def test_first_person_pronoun_in_line_one_rejected(self, pronoun: str) -> None:
+        line1 = f"The team reviewed {pronoun} notes about the referral opportunity."
+        payload = _valid_payload(
+            summary_lines=[line1, f"Clay: {CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    @pytest.mark.parametrize("pronoun", PRONOUNS)
+    def test_first_person_pronoun_in_labeled_phrase_rejected(self, pronoun: str) -> None:
+        # clay_commitment stays clean so this isolates the summary_lines
+        # phrase check specifically, rather than the earlier field-level
+        # clay_commitment check (which would otherwise raise first).
+        phrase = f"shares {pronoun} notes with the team."
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay: {phrase}"],
+            next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_first_person_pronoun_in_discussed_rejected(self) -> None:
+        payload = _valid_payload(discussed="We discussed a new listing referral.")
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_discussed"
+
+    def test_first_person_pronoun_in_clay_commitment_rejected(self) -> None:
+        payload = _valid_payload(clay_commitment="I will send the agreement.")
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_clay_commitment"
+
+    def test_first_person_pronoun_in_next_step_rejected(self) -> None:
+        payload = _valid_payload(next_step="We will review the agreement.")
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_next_step"
+
+    def test_word_boundary_does_not_false_positive_on_substrings(self) -> None:
+        """Words like "hour", "trust", or "main" must not trip the
+        first-person check -- only whole-word pronouns do."""
+        line1 = "The main referral runs through trust in the hour before closing."
+        payload = _valid_payload(
+            summary_lines=[line1, f"Clay: {CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        result = _run(RecordingRunner(payload))
+        assert result.summary_lines[0] == line1
+
+
+class TestOwnerLabelValidation:
+    def test_line_one_starting_with_clay_label_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[f"Clay: {CORY_CLAY_PHRASE}", CORY_LINE_1],
+            next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_line_one_starting_with_contact_label_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[f"Cory: {CORY_CONTACT_PHRASE}", CORY_LINE_1],
+            clay_commitment="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_unlabeled_commitment_line_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"{CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_wrong_name_label_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Bob: {CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_last_name_label_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Vasquez: {CORY_CONTACT_PHRASE}"],
+            clay_commitment="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_duplicate_clay_owner_lines_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}", "Clay: also sends comps."],
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_duplicate_contact_owner_lines_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[
+                CORY_LINE_1, f"Cory: {CORY_CONTACT_PHRASE}", "Cory: also checks pricing.",
+            ],
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+    def test_label_prefix_must_be_exact_with_one_space(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay:{CORY_CLAY_PHRASE}"], next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "invalid_summary_lines"
+
+
+class TestAttributionCrossCheck:
+    """The parser cross-checks that summary_lines cannot omit or
+    contradict the durable clay_commitment/next_step fields."""
+
+    def test_clay_commitment_stated_but_no_clay_line_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Cory: {CORY_CONTACT_PHRASE}"],
+            clay_commitment=CORY_CLAY_PHRASE,
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_clay_line_present_but_clay_commitment_none_stated_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"],
+            clay_commitment="None stated.",
+            next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_next_step_stated_but_no_contact_line_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"],
+            next_step=CORY_CONTACT_PHRASE,
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_contact_line_present_but_next_step_none_stated_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, f"Cory: {CORY_CONTACT_PHRASE}"],
+            clay_commitment="None stated.",
+            next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_clay_line_contradicts_clay_commitment_field_rejected(self) -> None:
+        payload = _valid_payload(
+            summary_lines=[CORY_LINE_1, "Clay: sends a completely unrelated market report."],
+            clay_commitment=CORY_CLAY_PHRASE,
+            next_step="None stated.",
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_mismatched_commitment_attribution_swap_rejected(self) -> None:
+        """clay_commitment and next_step swapped relative to the visible
+        lines -- each field names the *other* person's action."""
+        payload = _valid_payload(
+            summary_lines=[
+                CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}", f"Cory: {CORY_CONTACT_PHRASE}",
+            ],
+            clay_commitment=CORY_CONTACT_PHRASE,
+            next_step=CORY_CLAY_PHRASE,
+        )
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload))
+        assert exc_info.value.error_class == "commitment_attribution_mismatch"
+
+    def test_commitment_and_next_step_are_wrapped_by_their_labeled_lines(self) -> None:
+        """The happy path proves the invariant this whole class guards:
+        the labeled line directly wraps ("Label: " + phrase) the durable
+        field, rather than the two ever being independent."""
+        result = _run(RecordingRunner(VALID_PAYLOAD))
+        assert result.summary_lines[1] == f"Clay: {result.clay_commitment}"
+        assert result.summary_lines[2] == f"Cory: {result.next_step}"
+
+
+class TestCoryExactExample:
+    """The canonical example from the OPS-110 correction spec."""
+
+    def test_cory_exact_example_produces_exact_safe_output(self) -> None:
+        result = _run(RecordingRunner(VALID_PAYLOAD))
+        assert result.summary_lines == [
+            CORY_LINE_1,
+            "Clay: covering his own costs to attend Destin, bringing prepared AI materials.",
+            "Cory: checking with the Destin broker owner on VIP cruise availability, "
+            "following up in a day or two.",
+        ]
+        assert build_visible_body_lines(result) == result.summary_lines
+
+
+class TestOtherContactNamesAcrossTypes:
+    """Owner-label validation must work for any real first name and any
+    contact_type category -- not just Cory/agent_partner."""
+
+    @pytest.mark.parametrize(
+        "contact_type,first_name,clay_phrase,contact_phrase",
+        [
+            (
+                "borrower", "Maria",
+                "locking the rate by end of week.",
+                "sending over the updated pay stubs.",
+            ),
+            (
+                "vendor", "Priya",
+                "reviewing the updated service agreement.",
+                "confirming pricing with her team by Monday.",
+            ),
+            (
+                "recruit", "Jordan",
+                "sending the onboarding packet today.",
+                "scheduling a follow-up call for next week.",
+            ),
+        ],
+    )
+    def test_valid_labeled_lines_for_contact_type(
+        self, contact_type: str, first_name: str, clay_phrase: str, contact_phrase: str
+    ) -> None:
+        line1 = f"A conversation about {contact_type} needs and next steps."
+        payload = {
+            "contact_type": contact_type,
+            "summary_lines": [line1, f"Clay: {clay_phrase}", f"{first_name}: {contact_phrase}"],
+            "discussed": line1,
+            "clay_commitment": clay_phrase,
+            "next_step": contact_phrase,
+        }
+        result = _run(RecordingRunner(payload), contact_context={"first_name": first_name})
+        assert result.contact_type == contact_type
+        assert result.summary_lines[1] == f"Clay: {clay_phrase}"
+        assert result.summary_lines[2] == f"{first_name}: {contact_phrase}"
+
+    def test_wrong_first_name_label_rejected_for_borrower(self) -> None:
+        line1 = "A conversation about borrower needs and next steps."
+        payload = {
+            "contact_type": "borrower",
+            "summary_lines": [line1, "Clay: locks the rate.", "Maria: sends pay stubs."],
+            "discussed": line1,
+            "clay_commitment": "locks the rate.",
+            "next_step": "sends pay stubs.",
+        }
+        with pytest.raises(SummarizerError) as exc_info:
+            _run(RecordingRunner(payload), contact_context={"first_name": "Marissa"})
+        assert exc_info.value.error_class == "invalid_summary_lines"
 
 
 class TestNonInteractivePermissionGrant:
@@ -392,7 +773,7 @@ class TestRealShapedSubprocessIntegration:
 
         result = run_claude_summary(
             transcript_segments=[{"speaker": "Clay", "text": "hi"}],
-            contact_context={"contact_id": "c-1", "type": "agent_partner"},
+            contact_context=dict(DEFAULT_CONTACT_CONTEXT),
             hermes_home=hermes_home,
         )
 
@@ -420,37 +801,17 @@ class TestNoStdoutFallback:
         assert exc_info.value.error_class == "no_output_file"
 
 
-class TestAttributionSafeguard:
-    """The summarizer keeps discussed/clay_commitment/next_step and
-    summary_lines entirely separate fields -- proving there is no code path
-    here that reconstructs or merges one into another (which is what would
-    risk attributing one person's commitment to the other)."""
-
-    def test_distinct_fields_are_never_merged_or_swapped(self) -> None:
-        payload = {
-            **VALID_PAYLOAD,
-            "clay_commitment": "Clay will send the comps by end of day.",
-            "next_step": "Cory will follow up with the seller next week.",
-        }
-        result = _run(RecordingRunner(payload))
-        assert result.clay_commitment == "Clay will send the comps by end of day."
-        assert result.next_step == "Cory will follow up with the seller next week."
-        assert result.clay_commitment not in result.summary_lines
-        assert result.next_step not in result.summary_lines
-
-
 def _summary_result(
     *,
-    discussed: str = "A referral opportunity for a new listing.",
-    clay_commitment: str = "Clay will send the standard co-listing agreement.",
-    next_step: str = "Cory will review the agreement and reply by Friday.",
+    discussed: str = CORY_LINE_1,
+    clay_commitment: str = CORY_CLAY_PHRASE,
+    next_step: str = CORY_CONTACT_PHRASE,
     summary_lines: list[str] | None = None,
 ) -> SummaryResult:
     return SummaryResult(
         contact_type="agent_partner",
         summary_lines=summary_lines or [
-            "Clay and Cory discussed a new listing referral.",
-            "Cory asked about commission split on future co-listed deals.",
+            CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}", f"Cory: {CORY_CONTACT_PHRASE}",
         ],
         discussed=discussed,
         clay_commitment=clay_commitment,
@@ -459,52 +820,26 @@ def _summary_result(
 
 
 class TestBuildVisibleBodyLines:
-    """The visible GHL note body must be deterministically composed from
-    the structured discussed/clay_commitment/next_step fields -- never
-    from the free-form summary_lines, which could omit Clay's commitment
-    or the next step entirely."""
+    """The visible GHL note body is exactly the validated summary_lines --
+    never a re-synthesis of discussed/clay_commitment/next_step."""
 
-    def test_all_three_fields_present_yields_three_lines_in_fixed_order(self) -> None:
+    def test_returns_summary_lines_unchanged(self) -> None:
         result = _summary_result()
-        assert build_visible_body_lines(result) == [
-            result.discussed,
-            result.clay_commitment,
-            result.next_step,
-        ]
+        assert build_visible_body_lines(result) == result.summary_lines
 
-    def test_no_clay_commitment_yields_discussed_then_next_step(self) -> None:
-        result = _summary_result(clay_commitment="None stated.")
-        assert build_visible_body_lines(result) == [result.discussed, result.next_step]
+    def test_two_line_result_returns_two_lines(self) -> None:
+        result = _summary_result(
+            summary_lines=[CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"],
+            next_step="None stated.",
+        )
+        assert build_visible_body_lines(result) == [CORY_LINE_1, f"Clay: {CORY_CLAY_PHRASE}"]
 
-    def test_no_next_step_yields_discussed_then_commitment(self) -> None:
-        result = _summary_result(next_step="None stated.")
-        assert build_visible_body_lines(result) == [result.discussed, result.clay_commitment]
-
-    def test_both_commitment_and_next_step_absent_fails_closed(self) -> None:
-        result = _summary_result(clay_commitment="None stated.", next_step="None stated.")
+    def test_defense_in_depth_returns_none_for_one_line(self) -> None:
+        """_validate_and_build can never actually produce this, but
+        build_visible_body_lines must still fail closed if it ever did."""
+        result = _summary_result(summary_lines=["only one line."])
         assert build_visible_body_lines(result) is None
 
-    def test_free_form_summary_lines_cannot_omit_or_override_structured_fields(self) -> None:
-        """Even when summary_lines never mentions the commitment or next
-        step (or says something different), the visible body is built only
-        from the structured fields -- summary_lines has zero influence."""
-        result = _summary_result(
-            summary_lines=["A vague, unrelated summary line.", "Another vague line."],
-        )
-        lines = build_visible_body_lines(result)
-        assert lines == [result.discussed, result.clay_commitment, result.next_step]
-        for line in lines:
-            assert line not in result.summary_lines
-
-    def test_free_form_summary_lines_cannot_rescue_an_otherwise_failing_result(self) -> None:
-        """Rich, seemingly-complete summary_lines must not paper over a
-        structured result that fails closed."""
-        result = _summary_result(
-            clay_commitment="None stated.",
-            next_step="None stated.",
-            summary_lines=[
-                "Clay committed to sending the agreement today.",
-                "Cory will reply by Friday.",
-            ],
-        )
+    def test_defense_in_depth_returns_none_for_four_lines(self) -> None:
+        result = _summary_result(summary_lines=["a.", "b.", "c.", "d."])
         assert build_visible_body_lines(result) is None

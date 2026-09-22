@@ -135,12 +135,13 @@ def _default_summary_result() -> SummaryResult:
     return SummaryResult(
         contact_type="agent_partner",
         summary_lines=[
-            "Clay and Cory discussed a new listing referral.",
-            "Cory will send the seller's contact information this week.",
+            "Referral and commission-split terms for a new listing with Realty One Group.",
+            "Clay: sends the standard co-listing agreement.",
+            "Cory: reviews the agreement and replies by Friday.",
         ],
-        discussed="A referral opportunity for a new listing.",
-        clay_commitment="Clay will send the standard co-listing agreement.",
-        next_step="Cory will review the agreement and reply by Friday.",
+        discussed="Referral and commission-split terms for a new listing with Realty One Group.",
+        clay_commitment="sends the standard co-listing agreement.",
+        next_step="reviews the agreement and replies by Friday.",
     )
 
 
@@ -261,9 +262,7 @@ class TestUniqueMatchHappyPath:
         assert ghl_client.create_calls == 1
         note = ghl_client.notes[contact_id][0]
         default_result = _default_summary_result()
-        assert note["body"] == "\n".join(
-            [default_result.discussed, default_result.clay_commitment, default_result.next_step]
-        )
+        assert note["body"] == "\n".join(default_result.summary_lines)
         assert note["color"] == CALL_NOTE_COLOR
         assert note["title"] == "Incoming call · Answered · 21 min 46 sec"
 
@@ -429,9 +428,7 @@ class TestExistingNoteUpdatedNotDuplicated:
         note = ghl_client.notes[contact_id][0]
         assert note["id"] == pre_existing.note_id
         default_result = _default_summary_result()
-        assert note["body"] == "\n".join(
-            [default_result.discussed, default_result.clay_commitment, default_result.next_step]
-        )
+        assert note["body"] == "\n".join(default_result.summary_lines)
 
 
 class TestIdempotentReplayAndCrashRecovery:
@@ -582,12 +579,13 @@ class TestCoryRealFixtureMatch:
         assert ghl_client.notes[CORY_CONTACT_ID][0]["title"] == "Incoming call · Answered · 21 min 46 sec"
 
 
-class TestVisibleBodyIsStructuredNotFreeForm:
-    """The visible note body must be deterministically composed from
-    Claude's structured discussed/clay_commitment/next_step fields, never
-    from the free-form summary_lines -- proving the OPS-110 real-proof
-    correction: Clay's commitment and the next step can no longer be
-    silently dropped from the note."""
+class TestVisibleBodyIsClaudesLabeledSummaryLines:
+    """The visible note body is exactly Claude's validated, owner-labeled
+    summary_lines -- proving the OPS-110 CRM summary-style correction: the
+    note shows the required third-person, owner-labeled style rather than a
+    synthesis of the durable discussed/clay_commitment/next_step fields
+    (which claude_summarizer.py's own parser already cross-checked against
+    summary_lines before this SummaryResult could exist)."""
 
     def _setup(self, registry, activity_ledger, state_db, clock, tmp_path, *, summary_result):
         contact_id = "c-1"
@@ -607,7 +605,7 @@ class TestVisibleBodyIsStructuredNotFreeForm:
         )
         return contact_id, runner, ghl_client
 
-    def test_all_three_fields_produce_a_three_line_body(
+    def test_three_line_result_produces_a_three_line_labeled_body(
         self, registry, activity_ledger, state_db, clock, tmp_path
     ) -> None:
         result = _default_summary_result()
@@ -617,34 +615,19 @@ class TestVisibleBodyIsStructuredNotFreeForm:
         summary = runner.run()
         assert summary.notes_written == 1
         note = ghl_client.notes[contact_id][0]
-        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}\n{result.next_step}"
+        assert note["body"] == "\n".join(result.summary_lines)
 
-    def test_no_clay_commitment_produces_a_two_line_body(
+    def test_two_line_clay_only_result_produces_a_two_line_labeled_body(
         self, registry, activity_ledger, state_db, clock, tmp_path
     ) -> None:
         result = SummaryResult(
             contact_type="agent_partner",
-            summary_lines=["Line one.", "Line two."],
+            summary_lines=[
+                "A referral opportunity for a new listing.",
+                "Clay: sends the standard co-listing agreement.",
+            ],
             discussed="A referral opportunity for a new listing.",
-            clay_commitment="None stated.",
-            next_step="Cory will review the agreement and reply by Friday.",
-        )
-        contact_id, runner, ghl_client = self._setup(
-            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
-        )
-        summary = runner.run()
-        assert summary.notes_written == 1
-        note = ghl_client.notes[contact_id][0]
-        assert note["body"] == f"{result.discussed}\n{result.next_step}"
-
-    def test_no_next_step_produces_a_two_line_body(
-        self, registry, activity_ledger, state_db, clock, tmp_path
-    ) -> None:
-        result = SummaryResult(
-            contact_type="agent_partner",
-            summary_lines=["Line one.", "Line two."],
-            discussed="A referral opportunity for a new listing.",
-            clay_commitment="Clay will send the standard co-listing agreement.",
+            clay_commitment="sends the standard co-listing agreement.",
             next_step="None stated.",
         )
         contact_id, runner, ghl_client = self._setup(
@@ -653,17 +636,90 @@ class TestVisibleBodyIsStructuredNotFreeForm:
         summary = runner.run()
         assert summary.notes_written == 1
         note = ghl_client.notes[contact_id][0]
-        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}"
+        assert note["body"] == "\n".join(result.summary_lines)
 
-    def test_both_absent_fails_closed_and_writes_no_note(
+    def test_two_line_contact_only_result_produces_a_two_line_labeled_body(
         self, registry, activity_ledger, state_db, clock, tmp_path
     ) -> None:
         result = SummaryResult(
             contact_type="agent_partner",
-            summary_lines=["Clay committed to sending it today.", "Cory replies Friday."],
+            summary_lines=[
+                "A referral opportunity for a new listing.",
+                "Cory: reviews the agreement and replies by Friday.",
+            ],
             discussed="A referral opportunity for a new listing.",
             clay_commitment="None stated.",
-            next_step="None stated.",
+            next_step="reviews the agreement and replies by Friday.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        assert note["body"] == "\n".join(result.summary_lines)
+
+    def test_note_body_is_summary_lines_not_a_synthesis_of_structured_fields(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """discussed/clay_commitment/next_step are a durable record only --
+        the visible body must never be reconstructed from them."""
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=[
+                "A referral opportunity for a new listing.",
+                "Clay: sends the standard co-listing agreement.",
+                "Cory: reviews the agreement and replies by Friday.",
+            ],
+            discussed="A durable-only sentence that must never appear on the note.",
+            clay_commitment="a durable-only phrase that must never appear on the note.",
+            next_step="another durable-only phrase that must never appear on the note.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        assert note["body"] == "\n".join(result.summary_lines)
+        assert result.discussed not in note["body"]
+        assert result.clay_commitment not in note["body"]
+        assert result.next_step not in note["body"]
+
+    def test_malformed_one_line_result_fails_closed_and_writes_no_note(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """A summarizer result with fewer than 2 summary_lines can no
+        longer pass claude_summarizer.py's own validator, but the runner
+        must still fail closed in depth if it ever received one."""
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["Only one line here."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="sends the standard co-listing agreement.",
+            next_step="reviews the agreement and replies by Friday.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 0
+        assert summary.errors == 1
+        assert ghl_client.create_calls == 0
+        row = state_db.get_plaud_summary_state("rec-1")
+        assert row.summary_status == "failed"
+        assert row.error_class == "invalid_structured_summary"
+        assert row.note_id is None
+
+    def test_malformed_four_line_result_fails_closed_and_writes_no_note(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["a.", "Clay: b.", "Cory: c.", "d."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="sends the standard co-listing agreement.",
+            next_step="reviews the agreement and replies by Friday.",
         )
         contact_id, runner, ghl_client = self._setup(
             registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
@@ -682,7 +738,7 @@ class TestVisibleBodyIsStructuredNotFreeForm:
     ) -> None:
         bad_result = SummaryResult(
             contact_type="agent_partner",
-            summary_lines=["Line one.", "Line two."],
+            summary_lines=["Only one line here."],
             discussed="A referral opportunity for a new listing.",
             clay_commitment="None stated.",
             next_step="None stated.",
@@ -722,25 +778,3 @@ class TestVisibleBodyIsStructuredNotFreeForm:
         assert row.error_class is None
         assert row.note_id is not None
 
-    def test_free_form_summary_lines_never_appear_in_the_note_body(
-        self, registry, activity_ledger, state_db, clock, tmp_path
-    ) -> None:
-        result = SummaryResult(
-            contact_type="agent_partner",
-            summary_lines=[
-                "A wildly different free-form line one.",
-                "A wildly different free-form line two.",
-            ],
-            discussed="A referral opportunity for a new listing.",
-            clay_commitment="Clay will send the standard co-listing agreement.",
-            next_step="Cory will review the agreement and reply by Friday.",
-        )
-        contact_id, runner, ghl_client = self._setup(
-            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
-        )
-        summary = runner.run()
-        assert summary.notes_written == 1
-        note = ghl_client.notes[contact_id][0]
-        for line in result.summary_lines:
-            assert line not in note["body"]
-        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}\n{result.next_step}"
