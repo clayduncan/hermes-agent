@@ -73,6 +73,16 @@ def test_normalize_record_requires_identity_and_start_time() -> None:
         normalize_record({"recording_id": "x", "caller_handle": "+1"})
 
 
+def test_normalize_record_allows_missing_caller_handle() -> None:
+    """Plaud's real `list_files` metadata contract carries no caller-handle
+    field at all -- normalize_record must not require one."""
+    raw = _record()
+    del raw["caller_handle"]
+    rec = normalize_record(raw)
+    assert rec.caller_handle is None
+    assert rec.source_event_id == "rec-1"
+
+
 def test_availability_flag_accepts_bool_and_int_length() -> None:
     rec = normalize_record(_record(transcript_available=0, summary_available=120))
     assert rec.transcript_available is False

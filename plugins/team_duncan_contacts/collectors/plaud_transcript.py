@@ -15,7 +15,7 @@ fails visibly (raises) and the caller writes nothing.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 #: Fixed bounds. Not configurable via argument, environment variable, or
 #: runtime option -- widening these requires a new, separately authorized
@@ -38,6 +38,8 @@ class TranscriptOverflowError(RuntimeError):
 class TranscriptSegment:
     speaker: str | None
     text: str
+    start_time: Any = None
+    end_time: Any = None
 
     @property
     def byte_size(self) -> int:
