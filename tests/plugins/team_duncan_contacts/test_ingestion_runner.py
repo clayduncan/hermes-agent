@@ -230,6 +230,32 @@ def test_plaud_zero_match_is_discarded_not_queued(registry, activity_ledger, sta
     assert notifier2.sent == []
 
 
+# --- Plaud record with no caller_handle: must never resolve identity ---------
+
+def test_plaud_record_missing_caller_handle_never_resolves_identity(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    """Plaud's real metadata contract carries no caller-handle field at all.
+    A Plaud record with no caller_handle must fail visibly rather than
+    resolving identity from nothing -- and must never advance the cursor
+    past it."""
+    contact_id = _activate(registry, CANARY_PHONE_A, "c-a")
+    runner, notifier = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        plaud_records=[_plaud_record("rec-1", None)],
+    )
+    summary = runner.run()
+    assert summary.errors == 1
+    assert summary.admitted == 0
+    assert summary.discarded == 0
+    assert summary.pending_review == 0
+    assert notifier.sent == []
+    assert activity_ledger.query_events(contact_id) == []
+    assert state_db.get_cursor("plaud") != "2026-06-01T12:00:00+00:00", (
+        "frontier must not advance past the failing record's own position"
+    )
+
+
 # --- Known pre-activation: notifies once, grant required ---------------------
 
 def test_deny_pre_activation_notifies_once_and_requires_grant(registry, activity_ledger, state_db, clock) -> None:

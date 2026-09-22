@@ -284,6 +284,14 @@ class IngestionRunner:
         override-admitted, queued for review, or recorded as a processed
         non-actionable outcome) -- i.e. the frontier may safely pass it."""
         raw_handle = record.raw_handle if isinstance(record, DeskCallRecord) else record.caller_handle
+        if not raw_handle:
+            # Plaud's real metadata contract carries no caller-handle field at
+            # all, so a Plaud record here has nothing to resolve identity
+            # from. Fail visibly rather than resolving (or silently skipping)
+            # on missing identity data -- this source is disabled in
+            # production (see plugins/team_duncan_contacts/__init__.py
+            # _ENABLED_SOURCES), so this path is unreached there.
+            raise ValueError(f"{source} record has no raw handle to resolve identity from.")
         event_ts = record.occurred_at
         source_event_id = record.source_event_id
         provenance = record.provenance()

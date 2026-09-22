@@ -1,10 +1,16 @@
 """Plaud MCP metadata collector.
 
-Reads only identity/timing fields, the caller handle needed for one-shot
-resolve_event matching, and transcript/summary availability flags. Never
-fetches transcript text, summary text, or mind-map content, under any
-circumstance -- including as a fallback when an availability flag's shape
-can't be determined (that case resolves to None/"unknown" instead).
+Reads only identity/timing fields and transcript/summary availability
+flags. Never fetches transcript text, summary text, or mind-map content,
+under any circumstance -- including as a fallback when an availability
+flag's shape can't be determined (that case resolves to None/"unknown"
+instead).
+
+Plaud's real metadata contract (`list_files`) carries no caller-handle
+field at all -- `caller_handle` is optional here and is never read by
+PlaudSummaryRunner or plaud_match.py for identity or correlation; it exists
+only so a transport that does have one (or a test fixture) can carry it
+through without being rejected.
 
 Cursor starts at the deployment boundary on first run: no historical
 backfill, ever, regardless of argument or option.
@@ -44,7 +50,7 @@ class PlaudRecord:
     source_event_id: str
     occurred_at: datetime
     duration_s: int | None
-    caller_handle: str  # raw handle; caller must clear it after resolve_event
+    caller_handle: str | None  # raw handle if present; caller must clear it after resolve_event
     transcript_available: bool | None
     summary_available: bool | None
 
@@ -93,15 +99,13 @@ def normalize_record(raw: dict[str, Any]) -> PlaudRecord:
         occurred_at = occurred_at.replace(tzinfo=timezone.utc)
 
     caller_handle = raw.get("caller_handle")
-    if not caller_handle:
-        raise ValueError("Plaud record is missing its caller_handle for resolution.")
 
     return PlaudRecord(
         source=SOURCE_PLAUD,
         source_event_id=str(recording_id),
         occurred_at=occurred_at,
         duration_s=raw.get("duration_s"),
-        caller_handle=str(caller_handle),
+        caller_handle=str(caller_handle) if caller_handle else None,
         transcript_available=_coerce_availability(raw.get("transcript_available")),
         summary_available=_coerce_availability(raw.get("summary_available")),
     )

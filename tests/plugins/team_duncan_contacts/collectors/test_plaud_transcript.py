@@ -82,3 +82,15 @@ def test_page_count_overflow_raises_for_a_never_terminating_transport() -> None:
 
 def test_bounds_are_within_page_limit_not_exceeded() -> None:
     assert MAX_TRANSCRIPT_PAGES > 0
+
+
+def test_start_and_end_time_metadata_survive_the_bounded_fetch() -> None:
+    transport = FakeTranscriptTransport(
+        [TranscriptPage(
+            segments=[TranscriptSegment(speaker="A", text="hello", start_time=0.0, end_time=1.2)],
+            next_cursor=None,
+        )]
+    )
+    result = fetch_full_transcript(transport, "rec-1")
+    assert result.segments[0].start_time == 0.0
+    assert result.segments[0].end_time == 1.2

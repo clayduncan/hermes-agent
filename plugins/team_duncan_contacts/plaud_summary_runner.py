@@ -15,10 +15,11 @@ Per Plaud recording, in order:
      event, no transcript fetch, no note.
   2. Sealed re-fetch of the exact matched Desk event (never the routine-scan
      copy) and identity resolution through registry.resolve_event using
-     *only* that sealed Desk raw handle -- Plaud's own caller_handle field
-     is never read by this module for identity, only for correlation
-     (plaud_match.py doesn't read it either; PlaudRecord.occurred_at and
-     .duration_s are the only fields correlation uses).
+     *only* that sealed Desk raw handle. Plaud's real metadata contract
+     carries no caller-handle field at all; PlaudRecord.caller_handle is
+     optional and this module never reads it -- identity comes solely from
+     the Desk raw handle, and correlation (plaud_match.py) uses only
+     PlaudRecord.occurred_at and .duration_s.
   3. Admission through the existing ActivityLedger (idempotent: a call
      already admitted by the Desk-only pipeline resolves to the same
      event_id and is a safe no-op re-affirmation). A non-activated or
