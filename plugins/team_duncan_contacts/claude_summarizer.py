@@ -197,16 +197,28 @@ def run_claude_summary(
     tmpdir = Path(tempfile.mkdtemp(prefix="ops110-plaud-"))
     try:
         os.chmod(tmpdir, stat.S_IRWXU)
+        resolved_tmpdir = tmpdir.resolve()
         transcript_path = tmpdir / _TRANSCRIPT_FILENAME
         context_path = tmpdir / _CONTEXT_FILENAME
         output_path = tmpdir / _OUTPUT_FILENAME
+
+        for path in (transcript_path, context_path, output_path):
+            if path.resolve().parent != resolved_tmpdir:
+                raise SummarizerError("unsafe_temp_path")
 
         _write_0600(transcript_path, transcript_segments)
         _write_0600(context_path, contact_context)
 
         prompt = _fixed_prompt(transcript_path, context_path, output_path)
         claude_max_bin = str(Path(hermes_home) / CLAUDE_MAX_RELATIVE_PATH)
-        argv = [claude_max_bin, "-p", prompt]
+        argv = [
+            claude_max_bin,
+            "-p",
+            prompt,
+            "--dangerously-skip-permissions",
+            "--allowedTools",
+            "Read,Write",
+        ]
 
         try:
             completed = runner(argv)
