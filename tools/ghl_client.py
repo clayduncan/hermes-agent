@@ -158,24 +158,34 @@ def _unwrap_note(payload: Any) -> Any:
 
 
 #: Fixed, non-sensitive placeholder written into the audit outcome's
-#: ``after["body"]`` in place of a note's real text when a caller opts in
-#: via ``create_note(..., redact_body_in_audit=True)``. Never derived from
-#: the note text itself, so it carries no sensitive content.
+#: ``after["body"]`` / ``after["bodyText"]`` in place of a note's real text
+#: when a caller opts in via ``create_note(..., redact_body_in_audit=True)``.
+#: Never derived from the note text itself, so it carries no sensitive
+#: content.
 REDACTED_NOTE_BODY_MARKER = "REDACTED: note body withheld from write-audit log"
+
+#: Note-body keys GHL's native read-back has been observed to use. Native
+#: read-back returns ``bodyText`` (not ``body``) for some notes, so both
+#: aliases must be redacted whenever present or the real text survives in
+#: the write-audit log under the alias this constant doesn't cover.
+_NOTE_BODY_KEYS = ("body", "bodyText")
 
 
 def _redact_note_body_for_audit(after: Any) -> Any:
-    """A copy of *after* with only its ``body`` replaced by a fixed marker.
+    """A copy of *after* with any note-body alias replaced by a fixed marker.
 
     Used solely to build the value passed to ``record_outcome`` for a
     redacted-body write; every other field (id, title, color, contactId,
     dateAdded, etc.) is left exactly as fetched, and the mapping *after*
-    itself is never mutated.
+    itself is never mutated. Only keys already present in *after* are
+    replaced -- see :data:`_NOTE_BODY_KEYS` for the recognized aliases.
     """
     if not isinstance(after, dict):
         return after
     sanitized = dict(after)
-    sanitized["body"] = REDACTED_NOTE_BODY_MARKER
+    for key in _NOTE_BODY_KEYS:
+        if key in sanitized:
+            sanitized[key] = REDACTED_NOTE_BODY_MARKER
     return sanitized
 
 

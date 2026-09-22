@@ -24,6 +24,7 @@ from tools.ghl_client import (
     TEAM_DUNCAN_ACCOUNT_KEY,
     TEAM_DUNCAN_LOCATION_ID,
     GoHighLevelWriteClient,
+    _redact_note_body_for_audit,
     api_key_env_var,
     api_key_from_hermes_env,
     scoped_client,
@@ -1182,3 +1183,136 @@ class TestCreateNoteAuditRedaction:
         intent = [e for e in entries(log_dir) if e["audit_phase"] == "intent"]
         assert len(intent) == 1
         assert intent[0]["before"] is None
+
+
+# ── OPS-75 follow-up: native read-back's ``bodyText`` alias ──────────────────
+#
+# Live proof (Note OtWUog73iHKjTY3O6CCb, source event 65A84065-CF2A-4E55-9297-
+# 350BBB4652EF) showed GHL's native read-back can key the note text under
+# ``bodyText`` rather than ``body``. ``_redact_note_body_for_audit`` only
+# scrubbed ``body``, so the exact message text survived once in the local
+# write-audit log at ``$.after.bodyText``. These tests pin both aliases.
+
+
+class TestRedactNoteBodyForAuditAliases:
+    """Unit tests directly on ``_redact_note_body_for_audit``."""
+
+    def test_body_only_is_redacted(self) -> None:
+        after = {"id": "n-1", "body": SENTINEL}
+        sanitized = _redact_note_body_for_audit(after)
+        assert sanitized["body"] == REDACTED_NOTE_BODY_MARKER
+        assert "bodyText" not in sanitized
+
+    def test_bodytext_only_is_redacted(self) -> None:
+        after = {"id": "n-1", "bodyText": SENTINEL}
+        sanitized = _redact_note_body_for_audit(after)
+        assert sanitized["bodyText"] == REDACTED_NOTE_BODY_MARKER
+        assert "body" not in sanitized
+
+    def test_both_body_and_bodytext_are_redacted(self) -> None:
+        after = {"id": "n-1", "body": SENTINEL, "bodyText": SENTINEL}
+        sanitized = _redact_note_body_for_audit(after)
+        assert sanitized["body"] == REDACTED_NOTE_BODY_MARKER
+        assert sanitized["bodyText"] == REDACTED_NOTE_BODY_MARKER
+
+    def test_other_metadata_is_unchanged(self) -> None:
+        after = {
+            "id": "n-1",
+            "contactId": "g-1",
+            "title": "iMessage · Received",
+            "color": "#8E8E93",
+            "dateAdded": "2026-08-21T00:00:00Z",
+            "body": SENTINEL,
+            "bodyText": SENTINEL,
+        }
+        sanitized = _redact_note_body_for_audit(after)
+        for key in ("id", "contactId", "title", "color", "dateAdded"):
+            assert sanitized[key] == after[key]
+
+    def test_input_dict_is_not_mutated(self) -> None:
+        after = {"id": "n-1", "body": SENTINEL, "bodyText": SENTINEL}
+        original = dict(after)
+        _redact_note_body_for_audit(after)
+        assert after == original
+
+    def test_neither_alias_present_is_a_no_op(self) -> None:
+        after = {"id": "n-1", "contactId": "g-1"}
+        sanitized = _redact_note_body_for_audit(after)
+        assert sanitized == after
+        assert "body" not in sanitized
+        assert "bodyText" not in sanitized
+
+
+SENTINEL_NOTE_BODYTEXT = {
+    "id": SENTINEL_NOTE_ID,
+    "contactId": "g-1",
+    "bodyText": SENTINEL,
+    "title": "iMessage · Received",
+    "color": "#8E8E93",
+}
+
+
+def route_create_sentinel_note_bodytext(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    """Simulates GHL's native read-back keying the note text as ``bodyText``
+    (the exact shape from the OtWUog73iHKjTY3O6CCb live proof), rather than
+    ``body`` as the POST payload and most fixtures in this file assume."""
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route(
+        "POST", f"/contacts/{contact_id}/notes", {"note": SENTINEL_NOTE_BODYTEXT}
+    )
+    transport.route(
+        "GET",
+        f"/contacts/{contact_id}/notes/{SENTINEL_NOTE_ID}",
+        {"note": SENTINEL_NOTE_BODYTEXT},
+    )
+
+
+class TestCreateNoteAuditRedactionBodyTextAlias:
+    """End-to-end: create_note(..., redact_body_in_audit=True) against a
+    native read-back shaped like the live bug -- text under ``bodyText``,
+    not ``body``."""
+
+    def test_sentinel_never_appears_in_audit_log_bytes(self, transport, log_dir) -> None:
+        route_create_sentinel_note_bodytext(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        raw = raw_log_bytes(log_dir)
+        assert raw, "expected audit lines to have been written"
+        assert SENTINEL.encode("utf-8") not in raw
+
+    def test_audit_outcome_bodytext_is_the_fixed_marker(self, transport, log_dir) -> None:
+        route_create_sentinel_note_bodytext(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["after"]["bodyText"] == REDACTED_NOTE_BODY_MARKER
+        assert REDACTED_NOTE_BODY_MARKER != SENTINEL
+
+    def test_post_body_and_readback_keep_the_exact_message(self, transport, log_dir) -> None:
+        route_create_sentinel_note_bodytext(transport)
+        c = client(transport, log_dir)
+        created = c.create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        post = [call for call in transport.writes if call.method == "POST"][0]
+        assert post.json_body["body"] == SENTINEL
+        assert created["bodyText"] == SENTINEL
+        readback = c.get_note("g-1", SENTINEL_NOTE_ID)
+        assert readback["bodyText"] == SENTINEL
+
+    def test_audit_outcome_preserves_id_title_and_color_metadata(
+        self, transport, log_dir
+    ) -> None:
+        route_create_sentinel_note_bodytext(transport)
+        client(transport, log_dir).create_note(
+            "g-1", SENTINEL, trigger=TRIGGER, redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["record_id"] == SENTINEL_NOTE_ID
+        assert outcome["after"]["id"] == SENTINEL_NOTE_ID
+        assert outcome["after"]["title"] == SENTINEL_NOTE_BODYTEXT["title"]
+        assert outcome["after"]["color"] == SENTINEL_NOTE_BODYTEXT["color"]
+        assert outcome["after"]["contactId"] == SENTINEL_NOTE_BODYTEXT["contactId"]
