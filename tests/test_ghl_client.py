@@ -121,6 +121,49 @@ def route_remove_tags(transport: SpyTransport) -> None:
     transport.route("DELETE", "/contacts/g-1/tags", {"tags": ["lead"]})
 
 
+NOTE_BODY = "Incoming call · Answered · 2 min 12 sec"
+NOTE_CREATED = {"id": "note-1", "contactId": "g-1", "body": NOTE_BODY}
+NOTE_UPDATED_BODY = "Incoming call · Missed · 0 sec"
+NOTE_BEFORE = {"id": "note-1", "contactId": "g-1", "body": NOTE_BODY}
+NOTE_AFTER = {"id": "note-1", "contactId": "g-1", "body": NOTE_UPDATED_BODY}
+
+CALL_NOTE_COLOR = "#D9EAD3"
+
+#: A before-state carrying every optional note field, used to prove
+#: update_note() preserves what the caller doesn't explicitly replace.
+NOTE_BEFORE_FULL = {
+    "id": "note-1",
+    "contactId": "g-1",
+    "body": NOTE_BODY,
+    "userId": "user-123",
+    "title": "Call log",
+    "pinned": True,
+    "color": "#FFFFFF",
+}
+NOTE_AFTER_GREEN = {**NOTE_BEFORE_FULL, "body": NOTE_UPDATED_BODY, "color": CALL_NOTE_COLOR}
+
+
+def route_update_note(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route(
+        "GET", f"/contacts/{contact_id}/notes/note-1", {"note": NOTE_BEFORE}, {"note": NOTE_AFTER}
+    )
+    transport.route("PUT", f"/contacts/{contact_id}/notes/note-1", {"note": NOTE_AFTER})
+
+
+def route_update_note_full(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    """Same as route_update_note(), but the before-state carries userId,
+    title, pinned, and color -- used to prove update_note() preserves them."""
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route(
+        "GET", f"/contacts/{contact_id}/notes/note-1",
+        {"note": NOTE_BEFORE_FULL}, {"note": NOTE_AFTER_GREEN},
+    )
+    transport.route("PUT", f"/contacts/{contact_id}/notes/note-1", {"note": NOTE_AFTER_GREEN})
+
+
 UPSERT_BODY = {"email": "nathan@example.com", "firstName": "Nathan"}
 
 WRITE_OPERATIONS = [
@@ -158,6 +201,11 @@ WRITE_OPERATIONS = [
         "remove_tags",
         route_remove_tags,
         lambda c, t: client(t, c).remove_tags("g-1", ["intro"], trigger=TRIGGER),
+    ),
+    (
+        "update_note",
+        route_update_note,
+        lambda c, t: client(t, c).update_note("g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER),
     ),
 ]
 
@@ -680,10 +728,7 @@ class TestExistingSubAccountsStillWork:
         assert transport.writes[0].json_body["locationId"] == "chillcabins-location"
 
 
-# ── OPS-18: contact notes (create/read only) ─────────────────────────────────
-
-NOTE_BODY = "Desk call - 2026-09-21 03:14 PM CDT\n[ops18-event:abc123]"
-NOTE_CREATED = {"id": "note-1", "contactId": "g-1", "body": NOTE_BODY}
+# ── OPS-18: contact notes (create/read/update) ────────────────────────────────
 
 
 def route_create_note(transport: SpyTransport, contact_id: str = "g-1") -> None:
@@ -740,6 +785,65 @@ class TestNoteAuditOrdering:
         assert outcome["after"] == NOTE_CREATED
 
 
+class TestNoteUpdateAuditOrdering:
+    """Same invariant as create_note: the audit intent must land before the
+    destination is ever called, contact scope is checked first, and the
+    write is followed by an exact read-back."""
+
+    def test_append_raising_blocks_the_update_note_call(
+        self, transport, log_dir, monkeypatch
+    ) -> None:
+        route_update_note(transport)
+        monkeypatch.setattr(
+            write_audit_log,
+            "append_entry",
+            lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left on device")),
+        )
+        with pytest.raises(WriteAuditLogError):
+            client(transport, log_dir).update_note("g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER)
+        assert [c for c in transport.writes if "/notes" in c.url] == []
+
+    def test_scope_check_happens_before_any_audit_line_or_call(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).update_note("g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER)
+        assert transport.paths == [("GET", "/contacts/g-1")]  # only the scope-check GET
+        assert entries(log_dir) == []
+
+    def test_update_note_reads_before_writing_and_reads_back_after(
+        self, transport, log_dir
+    ) -> None:
+        route_update_note(transport)
+        result = client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER
+        )
+        assert result == NOTE_AFTER
+        assert transport.paths == [
+            ("GET", "/contacts/g-1"),  # contact-scope check
+            ("GET", "/contacts/g-1/notes/note-1"),  # before-state
+            ("PUT", "/contacts/g-1/notes/note-1"),
+            ("GET", "/contacts/g-1/notes/note-1"),  # exact read-back
+        ]
+        outcome = outcome_entry(log_dir)
+        assert outcome["destination"] == "ghl_contacts"
+        assert outcome["operation"] == "update"
+        assert outcome["record_id"] == "note-1"
+        assert outcome["before"] == NOTE_BEFORE
+        assert outcome["after"] == NOTE_AFTER
+        assert outcome["trigger"] == TRIGGER
+
+    def test_empty_body_is_refused_before_the_gate(self, transport, log_dir) -> None:
+        in_scope = {**CONTACT_BEFORE, "locationId": LOCATION_ID}
+        transport.route("GET", "/contacts/g-1", {"contact": in_scope})
+        with pytest.raises(ValueError, match="non-empty body"):
+            client(transport, log_dir).update_note("g-1", "note-1", "  ", trigger=TRIGGER)
+        assert entries(log_dir) == []
+        assert [c for c in transport.writes if "/notes" in c.url] == []
+
+
 class TestNoteScopeRejection:
     def test_create_note_rejects_a_missing_contact(self, transport, log_dir) -> None:
         transport.route("GET", "/contacts/g-404", HttpResponse(status_code=404))
@@ -762,6 +866,22 @@ class TestNoteScopeRejection:
         transport.route("GET", "/contacts/g-1", {"contact": foreign})
         with pytest.raises(ScopeViolationError):
             client(transport, log_dir).get_note("g-1", "note-1")
+
+    def test_update_note_rejects_a_contact_from_another_location(
+        self, transport, log_dir
+    ) -> None:
+        foreign = {**CONTACT_BEFORE, "locationId": "some-other-location"}
+        transport.route("GET", "/contacts/g-1", {"contact": foreign})
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).update_note("g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER)
+        assert transport.paths == [("GET", "/contacts/g-1")]
+        assert entries(log_dir) == []
+
+    def test_update_note_rejects_a_missing_contact(self, transport, log_dir) -> None:
+        transport.route("GET", "/contacts/g-404", HttpResponse(status_code=404))
+        with pytest.raises(ScopeViolationError):
+            client(transport, log_dir).update_note("g-404", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER)
+        assert entries(log_dir) == []
 
 
 class TestNoteCreateAndReadBack:
@@ -802,9 +922,113 @@ class TestNoteCreateAndReadBack:
         assert entries(log_dir) == []
         assert [c for c in transport.writes if "/notes" in c.url] == []
 
+    def test_update_note_returns_the_updated_note(self, transport, log_dir) -> None:
+        route_update_note(transport)
+        updated = client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER
+        )
+        assert updated == NOTE_AFTER
 
-class TestNoUpdateOrDeleteNoteCapability:
-    def test_the_client_exposes_no_note_mutation_beyond_create(self, transport, log_dir) -> None:
+
+class TestNoDeleteNoteCapability:
+    def test_the_client_exposes_no_note_deletion(self, transport, log_dir) -> None:
         ghl = client(transport, log_dir)
-        assert not hasattr(ghl, "update_note")
+        assert hasattr(ghl, "update_note")
         assert not hasattr(ghl, "delete_note")
+
+
+# ── OPS-18: green call-note color + safe field preservation ──────────────────
+
+
+class TestCreateNoteColorAndPinned:
+    def test_default_create_note_call_has_no_color_and_is_unpinned(
+        self, transport, log_dir
+    ) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note("g-1", NOTE_BODY, trigger=TRIGGER)
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert post.json_body == {"body": NOTE_BODY, "pinned": False}
+
+    def test_create_note_writes_the_given_color_and_stays_unpinned_by_default(
+        self, transport, log_dir
+    ) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", NOTE_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR
+        )
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert post.json_body == {
+            "body": NOTE_BODY, "pinned": False, "color": CALL_NOTE_COLOR,
+        }
+
+    def test_create_note_pinned_true_is_passed_through(self, transport, log_dir) -> None:
+        route_create_note(transport)
+        client(transport, log_dir).create_note(
+            "g-1", NOTE_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR, pinned=True
+        )
+        post = [c for c in transport.writes if c.method == "POST"][0]
+        assert post.json_body == {
+            "body": NOTE_BODY, "pinned": True, "color": CALL_NOTE_COLOR,
+        }
+
+
+class TestUpdateNotePreservesUnrelatedFields:
+    """update_note() must never clear userId/title/pinned/color the caller
+    didn't ask to change -- GHL's note PUT has replace semantics, so an
+    omitted field is read from the pre-write GET and carried forward."""
+
+    def test_body_and_color_only_preserves_userid_title_and_pinned(
+        self, transport, log_dir
+    ) -> None:
+        route_update_note_full(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR
+        )
+        put = [c for c in transport.writes if c.method == "PUT"][0]
+        assert put.json_body == {
+            "body": NOTE_UPDATED_BODY,
+            "pinned": True,
+            "userId": "user-123",
+            "title": "Call log",
+            "color": CALL_NOTE_COLOR,
+        }
+
+    def test_this_is_the_exact_authorized_live_update_shape(
+        self, transport, log_dir
+    ) -> None:
+        """The Cory-note correction Clay authorized changes body and color
+        only -- everything else on the call must come from before-state."""
+        route_update_note_full(transport)
+        result = client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR
+        )
+        assert result == NOTE_AFTER_GREEN
+
+    def test_explicit_overrides_win_over_before_state(self, transport, log_dir) -> None:
+        route_update_note_full(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER,
+            color=CALL_NOTE_COLOR, pinned=False, userId="user-999", title="Renamed",
+        )
+        put = [c for c in transport.writes if c.method == "PUT"][0]
+        assert put.json_body == {
+            "body": NOTE_UPDATED_BODY,
+            "pinned": False,
+            "userId": "user-999",
+            "title": "Renamed",
+            "color": CALL_NOTE_COLOR,
+        }
+
+    def test_before_state_with_no_optional_fields_defaults_pinned_false_and_omits_the_rest(
+        self, transport, log_dir
+    ) -> None:
+        route_update_note(transport)  # NOTE_BEFORE has no userId/title/pinned/color
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER, color=CALL_NOTE_COLOR
+        )
+        put = [c for c in transport.writes if c.method == "PUT"][0]
+        assert put.json_body == {
+            "body": NOTE_UPDATED_BODY,
+            "pinned": False,
+            "color": CALL_NOTE_COLOR,
+        }

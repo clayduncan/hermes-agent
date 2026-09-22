@@ -11,11 +11,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-pytestmark = pytest.mark.skip("zero_match is discarded")
 
 from plugins.team_duncan_contacts.activity_ledger import ActivityLedger
 from plugins.team_duncan_contacts.collectors.call_history_collector import (
-    CallHistoryCollector, apple_epoch_to_utc, utc_to_apple_epoch,
+    CallHistoryCollector, apple_epoch_to_utc, compute_desk_source_event_id, utc_to_apple_epoch,
 )
 from plugins.team_duncan_contacts.collectors.plaud_collector import PlaudCollector
 from plugins.team_duncan_contacts.ghl_reader import FakeGhlReader
@@ -145,11 +144,20 @@ def runner(registry, activity_ledger, state_db, clock, plaud_transport):
 
 
 @pytest.fixture()
-def zero_match_pending_id(runner, state_db) -> str:
-    runner.run()
-    rows = state_db.query_pending_review(source="plaud")
-    assert len(rows) == 1
-    return rows[0].id
+def zero_match_pending_id(state_db) -> str:
+    """The runner no longer auto-queues a zero_match encountered during
+    ingestion (OPS-18: zero_match is discarded, never queued). The rest of
+    the review workflow under test here -- sealed creation, activation,
+    dismiss -- is untouched by that change and still operates on a
+    pending_review row exactly like this one, so this directly constructs
+    the legacy row via the same insert_pending_review() API the runner
+    itself still uses for deny_pre_activation/multiple_match rows."""
+    ins = state_db.insert_pending_review(
+        source="plaud", source_event_id="rec-zero", decision="review_required",
+        match_outcome="zero_match", occurred_at="2026-06-01T09:00:00+00:00",
+        duration_s=45, direction=None, answered=None, status=STATUS_PENDING_REVIEW,
+    )
+    return ins.pending_review_id
 
 
 def test_creation_requires_valid_approval_token(runner, state_db, zero_match_pending_id) -> None:
@@ -247,10 +255,16 @@ def test_missing_source_refetch_fails_visibly_no_creation(runner, state_db, plau
 
 
 def test_ambiguous_desk_replay_fails_visibly_no_creation(registry, activity_ledger, state_db, clock) -> None:
-    zdate = utc_to_apple_epoch(clock.now - timedelta(days=1))
+    # A desk zero_match is no longer auto-queued by runner.run() (OPS-18:
+    # discarded, never queued), so the legacy pending_review row this test
+    # needs is constructed directly -- with a source_event_id computed the
+    # exact same way the collector itself would, so the later exact-event
+    # replay lookup still recognizes both returned rows as genuine matches
+    # for it (which is what makes the lookup ambiguous rather than missing).
+    occurred_at = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(occurred_at)
     row = {"ZDATE": zdate, "ZADDRESS": UNREGISTERED_PHONE, "ZDURATION": 30, "ZORIGINATED": 1, "ZANSWERED": 1}
-    # The routine scan sees one row (so exactly one pending_review is queued),
-    # but the later exact-event replay lookup ambiguously returns it twice.
+    source_event_id = compute_desk_source_event_id(IDENTITY_KEY, zdate, UNREGISTERED_PHONE, 30)
     desk_transport = FakeDeskTransport(routine_rows=[row], replay_rows=[row, dict(row)])
     runner = IngestionRunner(
         registry=registry, activity_ledger=activity_ledger, state_db=state_db,
@@ -258,10 +272,12 @@ def test_ambiguous_desk_replay_fails_visibly_no_creation(registry, activity_ledg
         desk_collector=CallHistoryCollector(desk_transport, IDENTITY_KEY),
         notifier=FakeNotifier(), clock=clock,
     )
-    runner.run()
-    rows = state_db.query_pending_review(source="desk_call")
-    assert len(rows) == 1
-    pending_id = rows[0].id
+    ins = state_db.insert_pending_review(
+        source="desk_call", source_event_id=source_event_id, decision="review_required",
+        match_outcome="zero_match", occurred_at=occurred_at.isoformat(),
+        duration_s=30, direction="outbound", answered=1, status=STATUS_PENDING_REVIEW,
+    )
+    pending_id = ins.pending_review_id
 
     calls = []
     token = state_db.issue_action_approval_token(pending_id, ACTION_CREATE_CONTACT)

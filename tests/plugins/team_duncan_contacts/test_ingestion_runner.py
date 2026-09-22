@@ -105,11 +105,14 @@ class FakeNoteGhlClient:
     def list_notes(self, contact_id):
         return list(self.notes.get(contact_id, []))
 
-    def create_note(self, contact_id, body, *, trigger):
+    def create_note(self, contact_id, body, *, trigger, color=None, pinned=False):
         if contact_id in self._fail_create_for:
             raise RuntimeError("simulated GHL outage")
         self.create_calls += 1
-        note = {"id": f"note-{self.create_calls}", "body": body, "contactId": contact_id}
+        note = {
+            "id": f"note-{self.create_calls}", "body": body, "contactId": contact_id,
+            "color": color, "pinned": pinned,
+        }
         self.notes.setdefault(contact_id, []).append(note)
         return note
 
@@ -185,10 +188,9 @@ def _make_runner(registry, activity_ledger, state_db, clock, *,
     return runner, notifier
 
 
-# --- Desk zero-match: silent queue -------------------------------------------
+# --- Desk zero-match: discarded, never queued ---------------------------------
 
-@pytest.mark.skip("zero_match is discarded")
-def test_desk_zero_match_queues_silently(registry, activity_ledger, state_db, clock) -> None:
+def test_desk_zero_match_is_discarded_not_queued(registry, activity_ledger, state_db, clock) -> None:
     _activate(registry, CANARY_PHONE_A, "c-a")
     zdate = utc_to_apple_epoch(clock.now)
     runner, notifier = _make_runner(
@@ -196,57 +198,40 @@ def test_desk_zero_match_queues_silently(registry, activity_ledger, state_db, cl
         desk_rows=[_desk_row(zdate, UNREGISTERED_PHONE)],
     )
     summary = runner.run()
-    assert summary.pending_review == 1
-    assert notifier.sent == []  # never notifies, regardless of genuine insert
+    assert summary.discarded == 1
+    assert summary.pending_review == 0
+    assert notifier.sent == []  # never notifies
     rows = state_db.query_pending_review(source="desk_call")
-    assert len(rows) == 1
-    assert rows[0].match_outcome == "zero_match"
-    assert rows[0].notification_state == "not_notified"
+    assert rows == []
 
 
-@pytest.mark.skip("zero_match is discarded")
-def test_pending_call_reviews_shows_queued_desk_zero_match(registry, activity_ledger, state_db, clock) -> None:
-    from plugins.team_duncan_contacts.ingestion_state_db import list_pending_call_reviews
+# --- Plaud zero-match: discarded, never queued, never notified ---------------
 
-    _activate(registry, CANARY_PHONE_A, "c-a")
-    zdate = utc_to_apple_epoch(clock.now)
-    runner, _ = _make_runner(registry, activity_ledger, state_db, clock,
-                              desk_rows=[_desk_row(zdate, UNREGISTERED_PHONE)])
-    summary = runner.run()
-    result = list_pending_call_reviews(state_db)
-    assert result["pending_review_count"] == 1
-    assert result["oldest_pending_at"] is not None
-    assert summary.pending_review_count == 1
-    assert summary.oldest_pending_at is not None
-
-
-# --- Plaud zero-match: notifies once ------------------------------------------
-
-@pytest.mark.skip("zero_match is discarded")
-def test_plaud_zero_match_notifies_once(registry, activity_ledger, state_db, clock) -> None:
+def test_plaud_zero_match_is_discarded_not_queued(registry, activity_ledger, state_db, clock) -> None:
     _activate(registry, CANARY_PHONE_A, "c-a")
     runner, notifier = _make_runner(
         registry, activity_ledger, state_db, clock,
         plaud_records=[_plaud_record("rec-1", UNREGISTERED_PHONE)],
     )
     summary = runner.run()
-    assert summary.pending_review == 1
-    assert len(notifier.sent) == 1
-    assert notifier.sent[0]["source"] == "plaud"
-    assert "masked_source_label" in notifier.sent[0]
+    assert summary.discarded == 1
+    assert summary.pending_review == 0
+    assert notifier.sent == []  # zero_match no longer notifies for any source
+    rows = state_db.query_pending_review(source="plaud")
+    assert rows == []
 
-    # Re-running with the same record: genuine_insert is False, no re-notify.
+    # Re-running with the same record: still discarded, still no notify.
     runner2, notifier2 = _make_runner(
         registry, activity_ledger, state_db, clock,
         plaud_records=[_plaud_record("rec-1", UNREGISTERED_PHONE)],
     )
-    runner2.run()
+    summary2 = runner2.run()
+    assert summary2.discarded == 1
     assert notifier2.sent == []
 
 
 # --- Known pre-activation: notifies once, grant required ---------------------
 
-@pytest.mark.skip("zero_match is discarded")
 def test_deny_pre_activation_notifies_once_and_requires_grant(registry, activity_ledger, state_db, clock) -> None:
     contact_id = _activate(registry, CANARY_PHONE_A, "c-a")
     before_cutoff = clock.now - timedelta(days=1)
@@ -291,7 +276,6 @@ def _force_shared_hmac(registry: ContactRegistry, contact_a: str, contact_b: str
     state_path.write_text(json.dumps(state))
 
 
-@pytest.mark.skip("zero_match is discarded")
 def test_multiple_match_notifies_once_and_requires_exact_selection(registry, activity_ledger, state_db, clock) -> None:
     c1 = _activate(registry, CANARY_PHONE_A, "c-1", first="Alice", last="A")
     c2 = _activate(registry, CANARY_PHONE_B, "c-2", first="Bob", last="B")
@@ -396,7 +380,6 @@ def test_failed_shared_handle_visible_in_reviews_and_summary(registry, activity_
     assert CANARY_PHONE_A not in raw_summary and CANARY_PHONE_B not in raw_summary
 
 
-@pytest.mark.skip("zero_match is discarded")
 def test_multiple_match_collision_no_candidates_exposed(registry, activity_ledger, state_db, clock) -> None:
     # Identical display names AND identical shared phone on both contacts,
     # so their masked-phone-last4 (and thus full canonical display_label)

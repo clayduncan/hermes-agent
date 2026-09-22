@@ -479,7 +479,7 @@ class GoHighLevelWriteClient:
         authorized.record_outcome(after=after, after_fetch_failed=after_fetch_failed)
         return result
 
-    # ── Contact notes (create/read only, no update/delete capability) ───────
+    # ── Contact notes (create/read/update, no delete capability) ────────────
 
     def _require_contact_in_scope(self, contact_id: str) -> Any:
         """The shared boundary every note read/write goes through first.
@@ -510,13 +510,22 @@ class GoHighLevelWriteClient:
         self._require_contact_in_scope(contact_id)
         return _unwrap_note(self._call("GET", f"/contacts/{contact_id}/notes/{note_id}"))
 
-    def create_note(self, contact_id: str, body: str, *, trigger: str) -> Any:
+    def create_note(
+        self,
+        contact_id: str,
+        body: str,
+        *,
+        trigger: str,
+        color: str | None = None,
+        pinned: bool = False,
+    ) -> Any:
         """``POST /contacts/{id}/notes``. Audited as a ``create``.
 
         Contact scope is enforced before the audit intent and before any
-        destination call. There is deliberately no ``update_note``/
-        ``delete_note``: this build introduces create/read only for contact
-        notes.
+        destination call. There is deliberately no ``delete_note``: this
+        build never removes a contact note. A new note has no prior state
+        to preserve, so *pinned* defaults to ``False``; *color* is written
+        only when given.
         """
         self._require_contact_in_scope(contact_id)
         require_trigger(trigger)
@@ -525,11 +534,14 @@ class GoHighLevelWriteClient:
                 "create_note() requires a non-empty body. No audit line was "
                 "written and no destination API was called."
             )
+        payload: dict[str, Any] = {"body": body, "pinned": pinned}
+        if color is not None:
+            payload["color"] = color
         authorized = self._authorize(
             operation="create", record_id=None, before=None, trigger=trigger
         )
         created = _unwrap_note(
-            self._call("POST", f"/contacts/{contact_id}/notes", json_body={"body": body})
+            self._call("POST", f"/contacts/{contact_id}/notes", json_body=payload)
         )
 
         note_id = created.get("id") if isinstance(created, dict) else None
@@ -541,6 +553,64 @@ class GoHighLevelWriteClient:
             record_id=note_id, after=after, after_fetch_failed=after_fetch_failed
         )
         return created
+
+    def update_note(
+        self,
+        contact_id: str,
+        note_id: str,
+        body: str,
+        *,
+        trigger: str,
+        color: str | None = None,
+        pinned: bool | None = None,
+        userId: str | None = None,
+        title: str | None = None,
+    ) -> Any:
+        """``PUT /contacts/{id}/notes/{noteId}``. Audited as an ``update``.
+
+        Same shape as ``create_note``: contact scope is enforced before the
+        pre-write ``GET``, the audit intent, or any destination call; the
+        write is followed by an exact read-back before returning.
+
+        GHL's note PUT has replace semantics, so a field left out of the
+        payload can be cleared. To avoid silently wiping unrelated note
+        properties, ``pinned``, ``userId``, ``title``, and ``color`` are
+        read from the pre-write ``before`` state and carried forward into
+        the payload unless the caller supplies an explicit replacement.
+        """
+        self._require_contact_in_scope(contact_id)
+        require_trigger(trigger)
+        if not body or not str(body).strip():
+            raise ValueError(
+                "update_note() requires a non-empty body. No audit line was "
+                "written and no destination API was called."
+            )
+        before = _unwrap_note(
+            self._call("GET", f"/contacts/{contact_id}/notes/{note_id}")
+        )
+        authorized = self._authorize(
+            operation="update", record_id=note_id, before=before, trigger=trigger
+        )
+
+        before_state = before if isinstance(before, dict) else {}
+        payload: dict[str, Any] = {"body": body}
+        payload["pinned"] = pinned if pinned is not None else bool(before_state.get("pinned", False))
+        for field_name, explicit in (("userId", userId), ("title", title), ("color", color)):
+            value = explicit if explicit is not None else before_state.get(field_name)
+            if value is not None:
+                payload[field_name] = value
+
+        updated = _unwrap_note(
+            self._call(
+                "PUT", f"/contacts/{contact_id}/notes/{note_id}", json_body=payload
+            )
+        )
+
+        after, after_fetch_failed = self._fetch_note_after(contact_id, note_id)
+        authorized.record_outcome(
+            record_id=note_id, after=after, after_fetch_failed=after_fetch_failed
+        )
+        return after if not after_fetch_failed else updated
 
     def _fetch_note_after(self, contact_id: str, note_id: str) -> tuple[Any, bool]:
         try:
