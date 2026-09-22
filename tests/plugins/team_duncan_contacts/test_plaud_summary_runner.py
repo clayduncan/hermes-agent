@@ -260,7 +260,10 @@ class TestUniqueMatchHappyPath:
         assert summary.errors == 0
         assert ghl_client.create_calls == 1
         note = ghl_client.notes[contact_id][0]
-        assert note["body"] == "\n".join(_default_summary_result().summary_lines)
+        default_result = _default_summary_result()
+        assert note["body"] == "\n".join(
+            [default_result.discussed, default_result.clay_commitment, default_result.next_step]
+        )
         assert note["color"] == CALL_NOTE_COLOR
         assert note["title"] == "Incoming call · Answered · 21 min 46 sec"
 
@@ -425,7 +428,10 @@ class TestExistingNoteUpdatedNotDuplicated:
         assert ghl_client.update_calls == 1
         note = ghl_client.notes[contact_id][0]
         assert note["id"] == pre_existing.note_id
-        assert note["body"] == "\n".join(_default_summary_result().summary_lines)
+        default_result = _default_summary_result()
+        assert note["body"] == "\n".join(
+            [default_result.discussed, default_result.clay_commitment, default_result.next_step]
+        )
 
 
 class TestIdempotentReplayAndCrashRecovery:
@@ -574,3 +580,167 @@ class TestCoryRealFixtureMatch:
         assert row.contact_id == CORY_CONTACT_ID
         assert row.note_id is not None
         assert ghl_client.notes[CORY_CONTACT_ID][0]["title"] == "Incoming call · Answered · 21 min 46 sec"
+
+
+class TestVisibleBodyIsStructuredNotFreeForm:
+    """The visible note body must be deterministically composed from
+    Claude's structured discussed/clay_commitment/next_step fields, never
+    from the free-form summary_lines -- proving the OPS-110 real-proof
+    correction: Clay's commitment and the next step can no longer be
+    silently dropped from the note."""
+
+    def _setup(self, registry, activity_ledger, state_db, clock, tmp_path, *, summary_result):
+        contact_id = "c-1"
+        _activate(registry, CANARY_PHONE, contact_id)
+        clock.advance(hours=1)
+
+        zdate = utc_to_apple_epoch(datetime(2026, 9, 17, 20, 24, 30, tzinfo=timezone.utc))
+        desk_rows = [_desk_row(zdate, CANARY_PHONE, zduration=1306)]
+        plaud_records = [_plaud_record("rec-1", start_time="2026-09-17T20:22:59+00:00")]
+        ghl_contacts = [{"id": contact_id, "locationId": TEAM_DUNCAN_LOCATION_ID,
+                          "firstName": "Cory", "lastName": "Vasquez"}]
+        summarizer = FakeSummarizer(result=summary_result)
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=desk_rows, ghl_reader_contacts=ghl_contacts,
+            summarizer=summarizer,
+        )
+        return contact_id, runner, ghl_client
+
+    def test_all_three_fields_produce_a_three_line_body(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = _default_summary_result()
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}\n{result.next_step}"
+
+    def test_no_clay_commitment_produces_a_two_line_body(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["Line one.", "Line two."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="None stated.",
+            next_step="Cory will review the agreement and reply by Friday.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        assert note["body"] == f"{result.discussed}\n{result.next_step}"
+
+    def test_no_next_step_produces_a_two_line_body(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["Line one.", "Line two."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="Clay will send the standard co-listing agreement.",
+            next_step="None stated.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}"
+
+    def test_both_absent_fails_closed_and_writes_no_note(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["Clay committed to sending it today.", "Cory replies Friday."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="None stated.",
+            next_step="None stated.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 0
+        assert summary.errors == 1
+        assert ghl_client.create_calls == 0
+        row = state_db.get_plaud_summary_state("rec-1")
+        assert row.summary_status == "failed"
+        assert row.error_class == "invalid_structured_summary"
+        assert row.note_id is None
+
+    def test_failed_structured_summary_holds_frontier_then_retry_succeeds(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        bad_result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=["Line one.", "Line two."],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="None stated.",
+            next_step="None stated.",
+        )
+        contact_id = "c-1"
+        _activate(registry, CANARY_PHONE, contact_id)
+        clock.advance(hours=1)
+        zdate = utc_to_apple_epoch(datetime(2026, 9, 17, 20, 24, 30, tzinfo=timezone.utc))
+        desk_rows = [_desk_row(zdate, CANARY_PHONE, zduration=1306)]
+        plaud_records = [_plaud_record("rec-1", start_time="2026-09-17T20:22:59+00:00")]
+        ghl_contacts = [{"id": contact_id, "locationId": TEAM_DUNCAN_LOCATION_ID}]
+
+        class _SwitchingSummarizer:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def __call__(self, *, transcript_segments, contact_context, hermes_home):
+                self.calls += 1
+                return bad_result if self.calls == 1 else _default_summary_result()
+
+        summarizer = _SwitchingSummarizer()
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=desk_rows, ghl_reader_contacts=ghl_contacts,
+            summarizer=summarizer,
+        )
+        first = runner.run()
+        assert first.errors == 1
+        assert first.notes_written == 0
+        assert ghl_client.create_calls == 0
+
+        second = runner.run()
+        assert second.notes_written == 1
+        assert ghl_client.create_calls == 1
+        row = state_db.get_plaud_summary_state("rec-1")
+        assert row.summary_status == "complete"
+        assert row.error_class is None
+        assert row.note_id is not None
+
+    def test_free_form_summary_lines_never_appear_in_the_note_body(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        result = SummaryResult(
+            contact_type="agent_partner",
+            summary_lines=[
+                "A wildly different free-form line one.",
+                "A wildly different free-form line two.",
+            ],
+            discussed="A referral opportunity for a new listing.",
+            clay_commitment="Clay will send the standard co-listing agreement.",
+            next_step="Cory will review the agreement and reply by Friday.",
+        )
+        contact_id, runner, ghl_client = self._setup(
+            registry, activity_ledger, state_db, clock, tmp_path, summary_result=result,
+        )
+        summary = runner.run()
+        assert summary.notes_written == 1
+        note = ghl_client.notes[contact_id][0]
+        for line in result.summary_lines:
+            assert line not in note["body"]
+        assert note["body"] == f"{result.discussed}\n{result.clay_commitment}\n{result.next_step}"

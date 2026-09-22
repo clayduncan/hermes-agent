@@ -21,6 +21,8 @@ from plugins.team_duncan_contacts.claude_summarizer import (
     CONTACT_TYPES,
     MAX_OUTPUT_BYTES,
     SummarizerError,
+    SummaryResult,
+    build_visible_body_lines,
     run_claude_summary,
 )
 from plugins.team_duncan_contacts import claude_summarizer as claude_summarizer_module
@@ -435,3 +437,74 @@ class TestAttributionSafeguard:
         assert result.next_step == "Cory will follow up with the seller next week."
         assert result.clay_commitment not in result.summary_lines
         assert result.next_step not in result.summary_lines
+
+
+def _summary_result(
+    *,
+    discussed: str = "A referral opportunity for a new listing.",
+    clay_commitment: str = "Clay will send the standard co-listing agreement.",
+    next_step: str = "Cory will review the agreement and reply by Friday.",
+    summary_lines: list[str] | None = None,
+) -> SummaryResult:
+    return SummaryResult(
+        contact_type="agent_partner",
+        summary_lines=summary_lines or [
+            "Clay and Cory discussed a new listing referral.",
+            "Cory asked about commission split on future co-listed deals.",
+        ],
+        discussed=discussed,
+        clay_commitment=clay_commitment,
+        next_step=next_step,
+    )
+
+
+class TestBuildVisibleBodyLines:
+    """The visible GHL note body must be deterministically composed from
+    the structured discussed/clay_commitment/next_step fields -- never
+    from the free-form summary_lines, which could omit Clay's commitment
+    or the next step entirely."""
+
+    def test_all_three_fields_present_yields_three_lines_in_fixed_order(self) -> None:
+        result = _summary_result()
+        assert build_visible_body_lines(result) == [
+            result.discussed,
+            result.clay_commitment,
+            result.next_step,
+        ]
+
+    def test_no_clay_commitment_yields_discussed_then_next_step(self) -> None:
+        result = _summary_result(clay_commitment="None stated.")
+        assert build_visible_body_lines(result) == [result.discussed, result.next_step]
+
+    def test_no_next_step_yields_discussed_then_commitment(self) -> None:
+        result = _summary_result(next_step="None stated.")
+        assert build_visible_body_lines(result) == [result.discussed, result.clay_commitment]
+
+    def test_both_commitment_and_next_step_absent_fails_closed(self) -> None:
+        result = _summary_result(clay_commitment="None stated.", next_step="None stated.")
+        assert build_visible_body_lines(result) is None
+
+    def test_free_form_summary_lines_cannot_omit_or_override_structured_fields(self) -> None:
+        """Even when summary_lines never mentions the commitment or next
+        step (or says something different), the visible body is built only
+        from the structured fields -- summary_lines has zero influence."""
+        result = _summary_result(
+            summary_lines=["A vague, unrelated summary line.", "Another vague line."],
+        )
+        lines = build_visible_body_lines(result)
+        assert lines == [result.discussed, result.clay_commitment, result.next_step]
+        for line in lines:
+            assert line not in result.summary_lines
+
+    def test_free_form_summary_lines_cannot_rescue_an_otherwise_failing_result(self) -> None:
+        """Rich, seemingly-complete summary_lines must not paper over a
+        structured result that fails closed."""
+        result = _summary_result(
+            clay_commitment="None stated.",
+            next_step="None stated.",
+            summary_lines=[
+                "Clay committed to sending the agreement today.",
+                "Cory will reply by Friday.",
+            ],
+        )
+        assert build_visible_body_lines(result) is None

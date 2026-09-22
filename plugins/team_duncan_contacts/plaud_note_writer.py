@@ -11,10 +11,12 @@ Every GHL write goes through the audited GoHighLevelWriteClient
 (tools.ghl_client) -- create_note/update_note/get_note -- never a direct
 unlogged REST call. Every write here uses the fixed CALL_NOTE_COLOR (the
 same light green every call note in this build uses) and a metadata-only
-title; the body is exactly the Claude-authored summary_lines joined with
-newlines, passed through verbatim -- this module never reconstructs note
-text from `discussed`/`clay_commitment`/`next_step` itself, which is what
-prevents it from ever mixing up who said or committed to what.
+title; the body passed in (`summary_lines`, despite the name -- see
+plaud_summary_runner.build_visible_body_lines) is the caller's
+deterministic discussed/clay_commitment/next_step composition, joined with
+newlines and written verbatim -- this module itself never reconstructs or
+reorders note text from those fields, which is what prevents it from ever
+mixing up who said or committed to what.
 """
 
 from __future__ import annotations

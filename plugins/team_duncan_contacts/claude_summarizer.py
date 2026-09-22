@@ -183,6 +183,25 @@ def _validate_and_build(payload: Any) -> SummaryResult:
     )
 
 
+def build_visible_body_lines(result: SummaryResult) -> list[str] | None:
+    """Deterministically compose the visible note body from the structured
+    discussed/clay_commitment/next_step fields -- never from the free-form
+    summary_lines, which the model could write without ever mentioning
+    Clay's commitment or the next step. Line order is fixed: discussed,
+    then clay_commitment (unless "None stated."), then next_step (unless
+    "None stated."). Returns None when that would produce fewer than 2
+    lines, meaning the caller must treat this summarizer output as invalid
+    and write no note rather than substituting or inline-summarizing."""
+    lines = [result.discussed]
+    if result.clay_commitment != _NONE_STATED:
+        lines.append(result.clay_commitment)
+    if result.next_step != _NONE_STATED:
+        lines.append(result.next_step)
+    if len(lines) < 2:
+        return None
+    return lines
+
+
 def run_claude_summary(
     *,
     transcript_segments: list[dict[str, Any]],
@@ -258,4 +277,5 @@ __all__ = [
     "SummarizerError",
     "SummaryResult",
     "run_claude_summary",
+    "build_visible_body_lines",
 ]
