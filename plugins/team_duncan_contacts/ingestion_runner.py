@@ -352,23 +352,8 @@ class IngestionRunner:
             return True
 
         if decision == "review_required" and result.match_outcome == "zero_match":
-            masked_source_label = _mask_raw_handle(raw_handle) if source == SOURCE_PLAUD else None
             raw_handle = None
-            ins = self._state_db.insert_pending_review(
-                source=source, source_event_id=source_event_id, decision=decision,
-                match_outcome=result.match_outcome, occurred_at=_iso(event_ts),
-                duration_s=duration_s, direction=direction, answered=answered,
-                status=STATUS_PENDING_REVIEW,
-            )
-            summary.pending_review += 1
-            if ins.genuine_insert and source == SOURCE_PLAUD:
-                row = self._state_db.get_pending_review(ins.pending_review_id)
-                delivered = self._notifier.send(
-                    build_plaud_zero_match_payload(row, masked_source_label)
-                )
-                self._state_db.record_notification_attempt(ins.pending_review_id, delivered)
-            # desk_call zero_match: silently queued, never notified, regardless
-            # of genuine_insert.
+            summary.discarded += 1
             return True
 
         if decision == "review_required" and result.match_outcome == "multiple_match":
