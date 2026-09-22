@@ -8,6 +8,7 @@ platforms: [linux, macos]
 provides_tools:
   - prepare_activation
   - confirm_activation
+  - set_imessage_activation
   - list_pending_call_reviews
   - prepare_call_log_ingest
   - confirm_call_log_ingest
