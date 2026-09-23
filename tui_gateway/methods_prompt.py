@@ -708,7 +708,10 @@ def _(rid, params: dict) -> dict:
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
-        _start_inflight_turn(session, text)
+        # One opaque id for this accepted turn, generated before any event for
+        # it can be emitted — the ack below and every message.*/error/status
+        # event this turn produces all carry it (voice-turn-id-round19).
+        turn_id = _start_inflight_turn(session, text)
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
@@ -722,6 +725,10 @@ def _(rid, params: dict) -> dict:
                 isolated_response["result"][
                     "survivor_user_row_ids"
                 ] = survivor_user_row_ids
+            # Compute-host turns still originate the id locally; the child
+            # process's own event forwarding is not yet turn-id aware, so
+            # only the ack is guaranteed to carry it on this path today.
+            isolated_response["result"]["turn_id"] = turn_id
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -782,6 +789,9 @@ def _(rid, params: dict) -> dict:
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
                 session["running"] = False
+                # Read back before clearing — the cancelled turn's id is what a
+                # client watching for this specific turn is correlating against.
+                cancel_turn_id = _current_turn_id(session)
                 _clear_inflight_turn(session)
                 # Surface the cancellation to the client. Without this emit the
                 # turn vanishes silently — the Desktop sees `prompt.submit`
@@ -789,18 +799,34 @@ def _(rid, params: dict) -> dict:
                 # `message.start` or `error` event, so the composer shows no
                 # feedback (issue #63078 server-side half). Match the
                 # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
-                )
+                with _turn_scope(cancel_turn_id):
+                    _emit(
+                        "error",
+                        sid,
+                        {
+                            "message": "Turn cancelled before the agent was ready"
+                            if session.get("_turn_cancel_requested")
+                            else "Session no longer running before the agent was ready"
+                        },
+                    )
                 return
         _run_prompt_submit(rid, sid, session, text, display_kind=display_kind)
 
+    # Ack-before-events: the turn thread started below emits this turn's
+    # first event (message.start) the moment it actually runs, but it must
+    # first pass through _wait_agent_for_prompt (a real thread-scheduling
+    # handoff, plus — on anything but an already-warm agent — a genuine wait
+    # on the deferred build). The RPC response below is constructed and
+    # handed back to the caller synchronously on THIS thread with no such
+    # handoff, so in practice the ack reaches the transport first. Making
+    # that a hard guarantee (write the ack here, return None, mirroring the
+    # _LONG_HANDLERS "handler writes its own response" contract in
+    # server.dispatch) was evaluated and rejected for this pass: prompt.submit
+    # is invoked directly via handle_request()/dispatch() in ~75 existing
+    # tests that assert on its returned dict for the success path, and
+    # flipping the return contract to None there would be a much larger,
+    # riskier change than the ordering property it buys. Documented here as
+    # the known gap rather than silently assumed.
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
@@ -810,6 +836,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            "turn_id": turn_id,
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None

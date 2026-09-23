@@ -1660,7 +1660,23 @@ def write_json(obj: dict) -> bool:
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
+    # turn_id rides as its own params field (a sibling of session_id), not
+    # inside payload, so every event shape carries it the same way regardless
+    # of what payload looks like (None for bare events like message.start).
+    # Omitted (not null) when there's no turn — an older client that doesn't
+    # know the key simply never sees it, which is the whole compatibility
+    # contract here (#turn-id-round19). Read from the ambient _active_turn_id
+    # contextvar rather than a parameter: threading an explicit turn_id
+    # through every _emit call site (tool/thinking/reasoning/status
+    # callbacks alone are 10+ call sites, several wired once at agent-build
+    # time with only ``sid`` in closure) would touch dozens of signatures and
+    # the ~40 existing tests that monkeypatch ``_emit`` with a fixed-arity
+    # stub. The contextvar is set once per turn (see ``_turn_scope``) and
+    # every _emit call made while it's active picks it up for free.
     params: dict = {"type": event, "session_id": sid}
+    turn_id = _active_turn_id.get()
+    if turn_id:
+        params["turn_id"] = turn_id
     if payload is not None:
         params["payload"] = payload
     return {"jsonrpc": "2.0", "method": "event", "params": params}
@@ -1846,12 +1862,14 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
                 )
             except Exception:
                 pass
+        turn_id = _current_turn_id(session)
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        with _turn_scope(turn_id):
+            _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
@@ -6432,43 +6450,53 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
         return
     csid = live[0]
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
-        if not st["started"]:
+        st = _child_mirrors.setdefault(
+            child_key, {"seq": 0, "open_tool": None, "started": False, "turn_id": None}
+        )
+        just_started = not st["started"]
+        if just_started:
             st["started"] = True
-            _emit("message.start", csid)
-        if event_type == "subagent.thinking":
-            if text := str(payload.get("text") or ""):
-                _emit("reasoning.delta", csid, {"text": text})
-        elif event_type == "subagent.text":
-            # The child's streamed reply text — the actual "agent talking".
-            # Relayed token-by-token from the child's run_conversation
-            # stream_callback, so the watch window streams the reply live.
-            if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": text})
-        elif event_type == "subagent.start":
-            # One-time header line (the child's goal) so a freshly opened window
-            # shows immediate context before the first reply token streams.
-            if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": f"{text}\n"})
-        elif event_type == "subagent.tool":
-            if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
-            st["seq"] += 1
-            tool = {
-                "name": str(payload.get("tool_name") or "tool"),
-                "tool_id": f"submirror:{child_key}:{st['seq']}",
-                "args": {},
-            }
-            if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
-                tool["preview"] = preview
-            st["open_tool"] = tool
-            _emit("tool.start", csid, tool)
-        elif event_type == "subagent.complete":
-            if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
-            summary = str(payload.get("summary") or payload.get("text") or "")
-            _emit("message.complete", csid, {"text": summary})
-            _child_mirrors.pop(child_key, None)
+            st["turn_id"] = _new_turn_id()
+        # This mirror emits on the CHILD's sid but may run on the parent
+        # turn's thread (the parent's own _active_turn_id, if any, is not
+        # this synthetic turn's id) — scope explicitly rather than relying
+        # on ambient context.
+        with _turn_scope(st["turn_id"]):
+            if just_started:
+                _emit("message.start", csid)
+            if event_type == "subagent.thinking":
+                if text := str(payload.get("text") or ""):
+                    _emit("reasoning.delta", csid, {"text": text})
+            elif event_type == "subagent.text":
+                # The child's streamed reply text — the actual "agent talking".
+                # Relayed token-by-token from the child's run_conversation
+                # stream_callback, so the watch window streams the reply live.
+                if text := str(payload.get("text") or ""):
+                    _emit("message.delta", csid, {"text": text})
+            elif event_type == "subagent.start":
+                # One-time header line (the child's goal) so a freshly opened window
+                # shows immediate context before the first reply token streams.
+                if text := str(payload.get("text") or ""):
+                    _emit("message.delta", csid, {"text": f"{text}\n"})
+            elif event_type == "subagent.tool":
+                if st["open_tool"]:
+                    _emit("tool.complete", csid, st["open_tool"])
+                st["seq"] += 1
+                tool = {
+                    "name": str(payload.get("tool_name") or "tool"),
+                    "tool_id": f"submirror:{child_key}:{st['seq']}",
+                    "args": {},
+                }
+                if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
+                    tool["preview"] = preview
+                st["open_tool"] = tool
+                _emit("tool.start", csid, tool)
+            elif event_type == "subagent.complete":
+                if st["open_tool"]:
+                    _emit("tool.complete", csid, st["open_tool"])
+                summary = str(payload.get("summary") or payload.get("text") or "")
+                _emit("message.complete", csid, {"text": summary})
+                _child_mirrors.pop(child_key, None)
 
 
 def _agent_cbs(sid: str) -> dict:
@@ -7970,15 +7998,60 @@ def _inflight_text(value: Any) -> str:
     return _content_display_text(value).strip()
 
 
-def _start_inflight_turn(session: dict, text: Any) -> None:
+def _new_turn_id() -> str:
+    # Opaque transport-metadata id — never fed to the model, never persisted
+    # into history/cache content. One per accepted turn (see the "Required
+    # contract" in the voice-turn-id-round19 changeset).
+    return uuid.uuid4().hex
+
+
+def _current_turn_id(session: dict | None) -> str | None:
+    """The id of the turn currently occupying ``session["inflight_turn"]``."""
+    if not isinstance(session, dict):
+        return None
+    turn = session.get("inflight_turn")
+    return turn.get("turn_id") if isinstance(turn, dict) else None
+
+
+# Ambient turn attribution for _emit(). Only ever read/written through
+# _turn_scope() below — every callback the agent fires during a turn (tool
+# start/complete/progress, thinking/reasoning deltas, status updates) is
+# wired once at agent-build time with just a session id in closure, not a
+# turn id; threading an explicit turn_id through each of those signatures
+# (and the ~40 existing tests that monkeypatch _emit with a fixed-arity
+# stub) would be both invasive and brittle. A contextvar set for the
+# duration of a turn's execution (see _run_prompt_submit) makes every
+# nested _emit() call inside that turn attribute correctly for free.
+# Contextvars do not cross a real OS thread boundary on their own, so code
+# that runs on its OWN thread (the turn's run() thread, its usage-ticker
+# thread, a terminal-error path invoked from a thread that never entered a
+# turn scope) must open its own scope explicitly.
+_active_turn_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "_active_turn_id", default=None
+)
+
+
+@contextlib.contextmanager
+def _turn_scope(turn_id: str | None):
+    token = _active_turn_id.set(turn_id)
+    try:
+        yield
+    finally:
+        _active_turn_id.reset(token)
+
+
+def _start_inflight_turn(session: dict, text: Any) -> str:
     now = time.time()
+    turn_id = _new_turn_id()
     session["inflight_turn"] = {
         "assistant": "",
         "started_at": now,
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
+        "turn_id": turn_id,
     }
+    return turn_id
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -8046,7 +8119,8 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
     now = time.time()
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "user": "", "started_at": now}
+        turn = {"assistant": "", "user": "", "started_at": now, "turn_id": _new_turn_id()}
+    turn.setdefault("turn_id", _new_turn_id())
     turn["assistant"] = str(turn.get("assistant") or "")
     turn["user"] = str(turn.get("user") or "")
     turn["error"] = message or "turn failed"
@@ -8190,7 +8264,6 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 sid,
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
-            _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
         except Exception as exc:
             print(
@@ -8587,6 +8660,11 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    if turn.get("turn_id"):
+        # Reconnect/resume must not mutate history and must not mint a new
+        # id for a turn that was already running — hand back the same one a
+        # still-connected client would be correlating events against.
+        snapshot["turn_id"] = turn["turn_id"]
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -8629,6 +8707,7 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         message = str(turn.get("error") or "turn failed")
         partial = str(turn.get("assistant") or "")
         cols = int(session.get("cols", 80))
+        turn_id = turn.get("turn_id")
     text = partial or f"Error: {message}"
     agent = session.get("agent")
     payload = {
@@ -8647,7 +8726,8 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     if rendered:
         payload["rendered"] = rendered
     _retire_turn_marker(session)
-    _emit("message.complete", sid, payload)
+    with _turn_scope(turn_id):
+        _emit("message.complete", sid, payload)
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -10051,7 +10131,6 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
                             mgr.abandon_tick()
                             return
                         session["running"] = True
-                    _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, payload["message"])
                     return
             except Exception:
@@ -10060,7 +10139,6 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
-        _emit("message.start", sid)
         _run_prompt_submit(rid, sid, session, wakeup)
     except Exception as exc:
         print(
@@ -10298,7 +10376,6 @@ def _notification_poller_loop(
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
-                        _emit("message.start", sid)
                         _run_prompt_submit(rid, sid, session, "\n".join(_batch))
                     except Exception as exc:
                         print(
@@ -10384,7 +10461,6 @@ def _notification_poller_loop(
         if _claim is None:
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -10462,7 +10538,6 @@ def _notification_poller_loop(
         if _claim is None:
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -10777,6 +10852,12 @@ def _start_usage_ticker(
     except Exception:
         baseline = None
 
+    # Snapshot now, on the caller's thread (the turn's run() thread, whose
+    # _active_turn_id is already set) — the ticker's own thread below starts
+    # with a blank context and would otherwise attribute every tick to no
+    # turn at all.
+    turn_id = _active_turn_id.get()
+
     def _loop() -> None:
         last = baseline
         while not stop.wait(interval):
@@ -10792,7 +10873,8 @@ def _start_usage_ticker(
                     # Turn ended while snapshotting — drop the tick;
                     # message.complete carries the authoritative usage.
                     break
-                _emit("session.usage", sid, {"usage": usage})
+                with _turn_scope(turn_id):
+                    _emit("session.usage", sid, {"usage": usage})
             except Exception:
                 pass
 
@@ -10832,6 +10914,16 @@ def _run_prompt_submit(
         # by the time a new turn starts — replace it, never append onto it.
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
+        # Read back now, under the same lock: whether this call started the
+        # turn above or a caller (prompt.submit) already started it before
+        # handing off to this thread, the id lives in exactly one place.
+        # Captured once and closed over by run() below — inflight_turn is
+        # cleared/replaced before this turn's terminal frame emits, so
+        # anything read from session state at emit time would be too late.
+        # ``.get()`` rather than ``[...]``: a test double for
+        # _start_inflight_turn (several exist, asserting it's a no-op in a
+        # given scenario) may not populate the key at all.
+        turn_id = (session.get("inflight_turn") or {}).get("turn_id")
         agent = session["agent"]
         if hasattr(agent, "clear_interrupt"):
             try:
@@ -10857,13 +10949,19 @@ def _run_prompt_submit(
         len(text) if isinstance(text, str) else "-",
         len(images),
     )
-    _emit("message.start", sid)
+    with _turn_scope(turn_id):
+        _emit("message.start", sid)
 
     def run():
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
         # child; delegate_task then captures it as non-serializable authority.
+        # Same reasoning for _active_turn_id: every _emit() made on this
+        # thread for the rest of the turn (including deep inside agent
+        # callbacks — tool/thinking/reasoning/status) picks this up with no
+        # further plumbing.
+        turn_ctx_token = _active_turn_id.set(turn_id)
         transport_token = bind_transport(session.get("transport"))
         runtime_session_token = _current_runtime_session_record.set(session)
         # Bound eagerly so the except/finally paths below always have an agent
@@ -11659,6 +11757,7 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
+            _active_turn_id.reset(turn_ctx_token)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -11690,7 +11789,6 @@ def _run_prompt_submit(
                     return
                 session["running"] = True
             try:
-                _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
             except Exception as _cont_exc:
                 print(
@@ -11736,7 +11834,6 @@ def _run_prompt_submit(
                 if _claim is None:
                     continue
                 try:
-                    _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:

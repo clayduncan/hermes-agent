@@ -260,7 +260,15 @@ def test_fresh_marker_schedules_continuation(emits, schedule_env, marker_home):
     assert text.startswith("[System note: Your previous turn was interrupted")
     assert "fix the flaky test" in text
     assert kwargs["display_kind"] == "auto_continue"
-    assert ("message.start", "sid", None) in [(e, s, p) for e, s, p in emits]
+    # message.start (with this turn's id) is now emitted from inside
+    # _run_prompt_submit itself, not by this caller — it used to be emitted
+    # here too, redundantly, before _run_prompt_submit's own unconditional
+    # emit. _run_prompt_submit is mocked in this fixture (schedule_env), so
+    # its emit isn't observable here; the resuming-turn status note above it
+    # still is.
+    assert ("status.update", "sid", {"kind": "process", "text": "Resuming interrupted turn…"}) in [
+        (e, s, p) for e, s, p in emits
+    ]
 
 
 def test_stale_marker_is_cleared_not_continued(schedule_env, marker_home, monkeypatch):

@@ -128,11 +128,16 @@ def test_snapshot_returned_for_error_only_turn():
 
 def test_healthy_snapshot_carries_no_error_keys():
     session = _session()
-    server._start_inflight_turn(session, "hi")
+    turn_id = server._start_inflight_turn(session, "hi")
     server._append_inflight_delta(session, "hello")
 
     snapshot = server._inflight_snapshot(session)
-    assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
+    assert snapshot == {
+        "assistant": "hello",
+        "streaming": True,
+        "user": "hi",
+        "turn_id": turn_id,
+    }
 
 
 # ── Returned-error path (run_conversation returns an error result) ────

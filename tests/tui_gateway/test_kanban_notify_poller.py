@@ -329,7 +329,11 @@ class TestNotificationPollerLoopKanbanWiring:
 
         status_texts = [p["text"] for e, p in emits if e == "status.update" and p]
         assert any(tid in t for t in status_texts), status_texts
-        assert any(e == "message.start" for e, _ in emits)
+        # message.start (carrying this turn's id) is now emitted from inside
+        # _run_prompt_submit itself rather than redundantly by this caller
+        # first — _run_prompt_submit is mocked above, so it isn't observable
+        # here; the dispatched turn text below is the behavior this test
+        # actually owns.
         assert any(tid in text for text in submits), submits
         assert session["running"] is True  # poller claimed the turn
         assert not session.get("_kanban_pending")
