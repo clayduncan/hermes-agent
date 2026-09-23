@@ -302,7 +302,11 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
                 "params": {"session_id": "iso-sid", "text": "hello"},
             }
         )
-        assert resp["result"] == {"status": "streaming", "turn_isolation": True}
+        assert resp["result"]["turn_id"]
+        assert {k: v for k, v in resp["result"].items() if k != "turn_id"} == {
+            "status": "streaming",
+            "turn_isolation": True,
+        }
         assert fake_supervisor.frames[0]["type"] == "turn.start"
         assert fake_supervisor.frames[0]["sid"] == "iso-sid"
         assert fake_supervisor.frames[0]["text"] == "hello"
@@ -392,6 +396,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
     finally:
         server._sessions.pop("iso-fallback", None)
 
+    assert resp["result"].pop("turn_id")
     assert resp == {
         "jsonrpc": "2.0",
         "id": "fallback-turn",
@@ -14609,6 +14614,7 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         )
 
         inflight = resp["result"].get("inflight")
+        assert inflight.pop("turn_id")
         assert inflight == {
             "assistant": "partial answer",
             "streaming": True,
