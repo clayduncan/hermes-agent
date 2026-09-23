@@ -10309,6 +10309,32 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _completion_lifecycle_functions(evt: dict):
+    """Pick the durable claim/complete/release trio for this event's producer.
+
+    ``async_delegation`` completions and background-process (``type=
+    "completion"``) completions are durable rows in two SEPARATE tables
+    (tools/async_delegation.py, tools/process_completion_store.py) with their
+    own claim lifecycle. Each module's ``claim_event_delivery`` /
+    ``complete_event_delivery`` / ``release_event_delivery`` already no-ops
+    for the OTHER event type (returns ``""``/does nothing), so calling only
+    ``async_delegation``'s trio here — as this poller used to, unconditionally
+    — means a ``completion`` event's durable row is never acknowledged: the
+    TUI still delivers the message, but the row stays ``pending`` and
+    replays again on the next restart even though the user already saw it
+    (#OPS-117: "some TUI paths fail to ack rows").
+    """
+    if evt.get("type") == "completion":
+        from tools.process_completion_store import (
+            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        )
+    else:
+        from tools.async_delegation import (
+            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        )
+    return claim_event_delivery, complete_event_delivery, release_event_delivery
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10454,8 +10480,8 @@ def _notification_poller_loop(
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        claim_event_delivery, complete_event_delivery, release_event_delivery = (
+            _completion_lifecycle_functions(evt)
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
@@ -10531,8 +10557,8 @@ def _notification_poller_loop(
             session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        claim_event_delivery, complete_event_delivery, release_event_delivery = (
+            _completion_lifecycle_functions(evt)
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:

@@ -15990,6 +15990,66 @@ def test_notification_poller_delivers_completion(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+def test_notification_poller_acks_durable_completion_row(monkeypatch):
+    """#OPS-117: the poller used to claim/complete ONLY through
+    tools.async_delegation, which no-ops for ``type="completion"`` events —
+    the message was delivered but the durable row stayed 'pending' forever
+    and replayed on every restart. It must ack through
+    tools.process_completion_store instead."""
+    import queue as _queue_mod
+
+    import tools.process_completion_store as pc_store
+    from tools.process_registry import process_registry
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+        def start(self):
+            self._target()
+
+    sess = _session(agent=_Agent())
+    server._sessions["sid_ack"] = sess
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard("proc_ack_test")
+
+    evt = {
+        "type": "completion",
+        "session_id": "proc_ack_test",
+        "command": "echo hello",
+        "exit_code": 0,
+        "output": "hello",
+    }
+    assert pc_store.record_pending_completion(evt) is True
+    isolated_queue.put(evt)
+
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_ack", sess)
+
+        record = pc_store.get_completion_record("proc_ack_test")
+        assert record is not None
+        assert record["delivery_state"] == "delivered"
+    finally:
+        server._sessions.pop("sid_ack", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_notification_poller_skips_consumed(monkeypatch):
     """Already-consumed completions are not dispatched by the poller."""
     import queue as _queue_mod

@@ -276,6 +276,146 @@ def test_terminal_verdict_returns_none_without_injection():
 
 
 # ---------------------------------------------------------------------------
+# Raw/API-server session ids get the SAME boundary gate (#OPS-117)
+# ---------------------------------------------------------------------------
+# An api_server raw-resumed session's ``session_key`` IS the raw session id
+# (not a structured ``agent:main:...`` key), so it never receives the
+# parent_session_id stamp terminal_tool adds for gateway-routed sessions.
+# Before this fix, ``_deliver_completion_notification`` only pre-flighted
+# ``parent_session_id`` — an event with no stamp fell through the gate
+# entirely, and the self-post path in ``_inject_watch_notification`` woke a
+# terminal/archived/unresolvable raw session with no boundary check at all.
+
+
+def _raw_completion_evt(session_key, session_id="proc_raw", **extra):
+    evt = {
+        "type": "completion",
+        "session_id": session_id,
+        "session_key": session_key,
+        "started_at": 1234.5,
+        "command": "echo done",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "output": "done\n",
+    }
+    evt.update(extra)
+    return evt
+
+
+def _raw_runner(*, session_db=...):
+    """A non-push (api_server-shaped) adapter — the raw-session self-post
+    path only ever engages ``Platform.API_SERVER`` with
+    ``supports_async_delivery=False`` (see gateway/wake.py)."""
+    adapter = SimpleNamespace(supports_async_delivery=False)
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.API_SERVER: adapter}
+    runner.session_store = SimpleNamespace(
+        _ensure_loaded=lambda: None,
+        _entries={},
+    )
+    runner._session_source_cache = {}
+    runner._completion_delivery_lock = __import__("threading").Lock()
+    runner._completion_deliveries_inflight = set()
+    runner._completion_deliveries_delivered = OrderedDict()
+    runner._completion_delivery_retention = 2048
+    if session_db is not ...:
+        runner._session_db = session_db
+    return runner, adapter
+
+
+def test_raw_session_completion_from_terminal_session_is_dropped(monkeypatch):
+    """/new (or any user boundary) closed the raw session -> the self-post
+    must NOT wake it, even though the event carries no parent_session_id."""
+    runner, _adapter = _raw_runner(
+        session_db=_SessionDB(
+            {"ended_at": 1786288000.0, "end_reason": "session_reset"}
+        ),
+    )
+    wake_calls = []
+
+    async def _fake_deliver_wake(*_a, **kw):
+        wake_calls.append(kw.get("session_id"))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", _fake_deliver_wake)
+
+    result = asyncio.run(
+        runner._deliver_completion_notification(
+            "text", _raw_completion_evt("raw-session-closed-abc123"),
+        )
+    )
+
+    assert result is None
+    assert wake_calls == []
+
+
+def test_raw_session_completion_from_live_session_still_delivers(monkeypatch):
+    runner, _adapter = _raw_runner(session_db=_SessionDB({"ended_at": None}))
+    wake_calls = []
+
+    async def _fake_deliver_wake(*_a, **kw):
+        wake_calls.append(kw.get("session_id"))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", _fake_deliver_wake)
+
+    result = asyncio.run(
+        runner._deliver_completion_notification(
+            "text", _raw_completion_evt("raw-session-live-abc123"),
+        )
+    )
+
+    assert result is True
+    assert wake_calls == ["raw-session-live-abc123"]
+
+
+def test_raw_session_id_prefers_origin_session_id_over_session_key(monkeypatch):
+    """``origin_session_id`` (persisted for api_server self-post routing)
+    takes priority over the bare session_key fallback."""
+    runner, _adapter = _raw_runner(
+        session_db=_SessionDB(
+            {"ended_at": 1786288000.0, "end_reason": "session_reset"}
+        ),
+    )
+    wake_calls = []
+
+    async def _fake_deliver_wake(*_a, **kw):
+        wake_calls.append(kw.get("session_id"))
+
+    monkeypatch.setattr("gateway.wake.deliver_wake", _fake_deliver_wake)
+    evt = _raw_completion_evt(
+        "raw-session-other-xyz", origin_session_id="raw-session-closed-real",
+    )
+
+    result = asyncio.run(runner._deliver_completion_notification("text", evt))
+
+    assert result is None
+    assert wake_calls == []
+
+
+def test_structured_session_key_is_never_treated_as_a_raw_id():
+    """A normal ``agent:main:...`` session_key must not trip the raw-id
+    fallback — only a session_key that fails to parse counts as raw."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, session_db=None)
+
+    result = asyncio.run(
+        runner._deliver_completion_notification(
+            "text",
+            {
+                "type": "completion",
+                "session_id": "proc_structured",
+                "session_key": "agent:main:telegram:dm:123",
+                "command": "echo done",
+                "exit_code": 0,
+            },
+        )
+    )
+
+    assert result is True
+    adapter.handle_message.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
 # The async-delegation path is unaffected
 # ---------------------------------------------------------------------------
 
