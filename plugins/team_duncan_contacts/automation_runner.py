@@ -118,10 +118,18 @@ class RegistryUnavailableError(RuntimeError):
 
 def _run_desk(hermes_home: Path, registry: Any) -> dict[str, Any]:
     from . import _build_ingestion_runner_factory
+    from .ingestion_state_db import build_ops114_pending_review_summary
 
-    runner, _state_db = _build_ingestion_runner_factory(hermes_home, registry)()
+    runner, state_db = _build_ingestion_runner_factory(hermes_home, registry)()
     summary = runner.run(token=None)
-    return _sanitize_desk_counts(summary.to_dict())
+    counts = _sanitize_desk_counts(summary.to_dict())
+    # OPS-114: production ingestion no longer sends any per-row Telegram/
+    # email notification (defer_notifications=True in the production
+    # factory) -- this bounded, content-safe projection is what lets the
+    # scripts-repo report wrapper hand the shared cron Amber router one
+    # actionable incident describing the current unresolved set.
+    counts["pending_reviews"] = build_ops114_pending_review_summary(state_db)
+    return counts
 
 
 def _run_plaud_reconcile(hermes_home: Path, registry: Any, ghl_reader: Any) -> dict[str, Any]:

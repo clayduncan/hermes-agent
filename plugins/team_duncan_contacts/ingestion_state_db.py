@@ -601,6 +601,25 @@ class IngestionStateDb:
             ).fetchall()
         return [_row_to_pending_review(r) for r in rows]
 
+    def query_unresolved_pending_review(self, *, limit: int = 50) -> list[PendingReviewRow]:
+        """Bounded query for every pending_review row not yet in a terminal
+        status (the same set `count_unresolved_pending_review` counts),
+        ordered by occurred_at then id for deterministic pagination --
+        OPS-114's report projection depends on this exact, stable order."""
+        if limit is None or limit <= 0:
+            raise ValueError("limit must be a positive integer; unbounded queries are rejected.")
+        limit = min(limit, 200)
+        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM pending_review
+                    WHERE status NOT IN ({placeholders})
+                    ORDER BY occurred_at ASC, id ASC
+                    LIMIT ?""",
+                (*TERMINAL_STATUSES, limit),
+            ).fetchall()
+        return [_row_to_pending_review(r) for r in rows]
+
     def count_unresolved_pending_review(self) -> int:
         with self._connect() as conn:
             row = conn.execute(
@@ -1174,4 +1193,62 @@ def list_pending_call_reviews(
         "pending_review_count": state_db.count_unresolved_pending_review(),
         "oldest_pending_at": state_db.oldest_pending_at(),
         "rows": safe_rows,
+    }
+
+
+# ---------------------------------------------------------------------------
+# OPS-114 report projection (build_ops114_pending_review_summary): a
+# separate, deliberately different allowlist from _PENDING_REVIEW_SAFE_FIELDS
+# above -- that one backs the agent-facing list_pending_call_reviews tool
+# and has its own pinned shape (status, notification_state; no display_name
+# or masked_labels). This one feeds the OPS-114 scheduled Desk automation's
+# stable, content-safe incident detail for shared cron Amber.
+# ---------------------------------------------------------------------------
+
+#: Exactly these fields (plus masked_labels, added explicitly below) reach
+#: the OPS-114 report projection. Never source_event_id, resolved_contact_id,
+#: idempotency_key, failure_stage/detail, notification_state, status, or any
+#: raw handle -- this table has no raw handle/transcript/note-body column at
+#: all (see the module docstring), so there is nothing further to redact
+#: beyond the field allowlist itself.
+_OPS114_REPORT_SAFE_FIELDS = (
+    "id", "display_name", "occurred_at", "duration_s", "direction",
+    "answered", "decision", "match_outcome",
+)
+
+
+def build_ops114_pending_review_summary(
+    state_db: IngestionStateDb, *, limit: int = 50
+) -> dict[str, Any]:
+    """Bounded, sorted, content-safe projection of every currently
+    unresolved pending_review row, for the OPS-114 scheduled Desk automation
+    to hand to the shared cron Amber router as one actionable incident.
+
+    At most *limit* (default and hard cap for this call site: 50) items,
+    ordered by occurred_at then id -- the same deterministic order as
+    `query_unresolved_pending_review`. Identical pending state always
+    produces an identical return value (and, once serialized with
+    sort_keys=True by the automation's own `_emit`, byte-stable JSON): the
+    cron Amber fingerprint depends on that stability to avoid spurious
+    re-alerts and to properly suppress/recover as state changes.
+    """
+    total = state_db.count_unresolved_pending_review()
+    rows = state_db.query_unresolved_pending_review(limit=limit)
+    items = []
+    for r in rows:
+        d = {k: getattr(r, k) for k in _OPS114_REPORT_SAFE_FIELDS}
+        row_id = d.pop("id")
+        # Only the free-text/label-shaped fields go through sanitize_output
+        # as a defense-in-depth pass -- occurred_at is an ISO-8601
+        # timestamp (digit-hyphen groups) that the generic phone-like
+        # pattern would otherwise partially match and corrupt, and
+        # duration_s/direction/answered/decision/match_outcome are fixed
+        # structured/enum values that never carry raw contact data.
+        d["display_name"] = sanitize_output(d["display_name"])
+        d["masked_labels"] = sanitize_output(r.masked_labels)
+        items.append({"pending_review_id": row_id, **d})
+    return {
+        "pending_review_count": total,
+        "truncated": total > len(items),
+        "items": items,
     }

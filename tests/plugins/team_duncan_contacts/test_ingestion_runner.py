@@ -27,6 +27,9 @@ from plugins.team_duncan_contacts.ingestion_runner import ActionNotApprovedError
 from plugins.team_duncan_contacts.ingestion_state_db import (
     ACTION_GRANT_OVERRIDE,
     IngestionStateDb,
+    NOTIF_NOT_NOTIFIED,
+    NOTIF_RETRIES_EXHAUSTED,
+    NOTIF_RETRY_SCHEDULED,
     STATUS_COMPLETE,
     STATUS_CONTACT_SELECTED,
     STATUS_DUPLICATE_RESOLUTION_REQUIRED,
@@ -171,7 +174,8 @@ def _activate(registry: ContactRegistry, phone: str, contact_id: str, first="Al"
 
 def _make_runner(registry, activity_ledger, state_db, clock, *,
                   plaud_records=None, desk_rows=None, deliver=True,
-                  activity_ledger_override=None, note_mirror=None):
+                  activity_ledger_override=None, note_mirror=None,
+                  defer_notifications=False):
     plaud_collector = PlaudCollector(FakePlaudTransport(plaud_records or []))
     desk_collector = CallHistoryCollector(FakeDeskTransport(desk_rows or []), IDENTITY_KEY)
     notifier = FakeNotifier(deliver=deliver)
@@ -184,6 +188,7 @@ def _make_runner(registry, activity_ledger, state_db, clock, *,
         notifier=notifier,
         clock=clock,
         note_mirror=note_mirror,
+        defer_notifications=defer_notifications,
     )
     return runner, notifier
 
@@ -290,6 +295,118 @@ def test_deny_pre_activation_notifies_once_and_requires_grant(registry, activity
     neighbor_zdate = utc_to_apple_epoch(before_cutoff - timedelta(hours=1))
     result = registry.resolve_event(CANARY_PHONE_A, apple_epoch_to_utc(neighbor_zdate))
     assert result.decision == "deny_pre_activation"
+
+
+# --- OPS-114 deferred notifications: production authority is shared cron Amber, not this path ---
+
+def test_deferred_mode_skips_notify_and_leaves_row_honestly_not_notified(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    runner, notifier = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)],
+        defer_notifications=True,
+    )
+    summary = runner.run()
+    assert summary.pending_review == 1
+    assert notifier.sent == []  # no send attempt at all, successful or not
+
+    rows = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.notification_state == NOTIF_NOT_NOTIFIED
+    assert row.notification_attempts == 0
+    assert row.last_notified_at is None
+    assert row.next_retry_at is None
+
+
+def test_deferred_mode_never_runs_due_retry_loop(registry, activity_ledger, state_db, clock) -> None:
+    # First, a non-deferred run whose notifier always fails: this is the only
+    # way to legitimately get a row into retry_scheduled at all.
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    runner1, notifier1 = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)],
+        deliver=False,
+    )
+    runner1.run()
+    seeded = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)[0]
+    assert seeded.notification_state == NOTIF_RETRY_SCHEDULED
+    assert len(notifier1.sent) == 1
+
+    # Advance the clock well past next_retry_at, then run a deferred-mode
+    # runner against the same state_db/clock with no new records at all.
+    clock.advance(hours=2)
+    runner2, notifier2 = _make_runner(
+        registry, activity_ledger, state_db, clock, defer_notifications=True,
+    )
+    runner2.run()
+
+    assert notifier2.sent == []  # the due-retry loop never ran
+    unchanged = state_db.get_pending_review(seeded.id)
+    assert unchanged.notification_state == NOTIF_RETRY_SCHEDULED
+    assert unchanged.notification_attempts == seeded.notification_attempts
+    assert unchanged.next_retry_at == seeded.next_retry_at
+
+
+def test_deferred_mode_never_rewrites_existing_retries_exhausted_evidence(
+    registry, activity_ledger, state_db, clock
+) -> None:
+    # Drive one row to retries_exhausted the legitimate way: three failed
+    # non-deferred send attempts, each landing on its own due retry.
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    runner, _notifier = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)],
+        deliver=False,
+    )
+    runner.run()
+    pending_id = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)[0].id
+    for _ in range(2):
+        clock.advance(hours=2)
+        runner, _ = _make_runner(registry, activity_ledger, state_db, clock, deliver=False)
+        runner.run()
+
+    exhausted = state_db.get_pending_review(pending_id)
+    assert exhausted.notification_state == NOTIF_RETRIES_EXHAUSTED
+    before = (exhausted.notification_attempts, exhausted.last_notified_at, exhausted.updated_at)
+
+    clock.advance(hours=2)
+    deferred_runner, deferred_notifier = _make_runner(
+        registry, activity_ledger, state_db, clock, defer_notifications=True,
+    )
+    deferred_runner.run()
+
+    assert deferred_notifier.sent == []
+    after = state_db.get_pending_review(pending_id)
+    assert after.notification_state == NOTIF_RETRIES_EXHAUSTED
+    assert (after.notification_attempts, after.last_notified_at, after.updated_at) == before
+
+
+def test_legacy_direct_injection_mode_still_sends(registry, activity_ledger, state_db, clock) -> None:
+    """defer_notifications explicitly False (not merely omitted) still
+    exercises the pre-OPS-114 send + record_notification_attempt path, for
+    isolated tests or any separately authorized future sender."""
+    _activate(registry, CANARY_PHONE_A, "c-a")
+    before_cutoff = clock.now - timedelta(days=1)
+    zdate = utc_to_apple_epoch(before_cutoff)
+    runner, notifier = _make_runner(
+        registry, activity_ledger, state_db, clock,
+        desk_rows=[_desk_row(zdate, CANARY_PHONE_A)],
+        defer_notifications=False,
+    )
+    summary = runner.run()
+    assert summary.pending_review == 1
+    assert len(notifier.sent) == 1
+    row = state_db.query_pending_review(status=STATUS_PENDING_REVIEW)[0]
+    assert row.notification_state != NOTIF_NOT_NOTIFIED
 
 
 # --- Multiple match: notifies once, exact selection required -----------------

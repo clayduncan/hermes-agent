@@ -26,6 +26,7 @@ from plugins.team_duncan_contacts.ingestion_state_db import (
     STATUS_PENDING_REVIEW,
     IngestionStateDb,
     InvalidTransitionError,
+    build_ops114_pending_review_summary,
     list_pending_call_reviews,
 )
 
@@ -241,6 +242,96 @@ def test_list_pending_call_reviews_oldest_first_and_bounded(db: IngestionStateDb
     assert len(result["rows"]) == 2
     ages = [r["age_seconds"] for r in result["rows"]]
     assert ages == sorted(ages, reverse=True)  # oldest (largest age) first
+
+
+# --- OPS-114 report projection: bounded, sorted, content-safe, byte-stable ---
+
+def test_build_ops114_pending_review_summary_only_approved_fields(db: IngestionStateDb) -> None:
+    db.insert_pending_review(
+        source="desk_call", source_event_id="evt-secret", decision="deny_pre_activation",
+        match_outcome=None, occurred_at="2026-01-01T00:00:00+00:00",
+        duration_s=42, direction="inbound", answered=1, status=STATUS_PENDING_REVIEW,
+        display_name="A. Caller", masked_labels={"phone": "***-***-9999"},
+    )
+    result = build_ops114_pending_review_summary(db)
+    assert result["pending_review_count"] == 1
+    assert result["truncated"] is False
+    assert len(result["items"]) == 1
+    item = result["items"][0]
+    approved = {
+        "pending_review_id", "display_name", "masked_labels", "occurred_at",
+        "duration_s", "direction", "answered", "decision", "match_outcome",
+    }
+    assert set(item.keys()) == approved
+    # Never source_event_id, contact ID, status, or notification_state.
+    assert "evt-secret" not in str(item.values())
+    assert "status" not in item
+    assert "notification_state" not in item
+
+
+def test_build_ops114_pending_review_summary_bounded_sorted_and_truncated(
+    db: IngestionStateDb,
+) -> None:
+    # Inserted out of occurred_at order on purpose.
+    order = [("evt-c", "2026-01-03T00:00:00+00:00"), ("evt-a", "2026-01-01T00:00:00+00:00"),
+              ("evt-b", "2026-01-02T00:00:00+00:00")]
+    for source_event_id, occurred_at in order:
+        db.insert_pending_review(
+            source="desk_call", source_event_id=source_event_id, decision="review_required",
+            match_outcome="multiple_match", occurred_at=occurred_at,
+            duration_s=1, direction=None, answered=None, status=STATUS_PENDING_REVIEW,
+        )
+    result = build_ops114_pending_review_summary(db, limit=2)
+    assert result["pending_review_count"] == 3
+    assert result["truncated"] is True
+    assert len(result["items"]) == 2
+    assert [i["occurred_at"] for i in result["items"]] == [
+        "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00",
+    ]
+
+
+def test_build_ops114_pending_review_summary_excludes_terminal_rows(db: IngestionStateDb) -> None:
+    ins = db.insert_pending_review(
+        source="desk_call", source_event_id="evt-1", decision="review_required",
+        match_outcome="zero_match", occurred_at="2026-01-01T00:00:00+00:00",
+        duration_s=1, direction=None, answered=None, status=STATUS_PENDING_REVIEW,
+    )
+    db.advance_pending_review_stage(ins.pending_review_id, STATUS_DISMISSED)
+    result = build_ops114_pending_review_summary(db)
+    assert result["pending_review_count"] == 0
+    assert result["truncated"] is False
+    assert result["items"] == []
+
+
+def test_build_ops114_pending_review_summary_redacts_phone_like_text(db: IngestionStateDb) -> None:
+    # Defense-in-depth: even though display_name is already masked upstream
+    # (registry.py) before it ever reaches this table, sanitize_output must
+    # still scrub a raw phone-shaped string if one somehow appeared here.
+    db.insert_pending_review(
+        source="desk_call", source_event_id="evt-1", decision="deny_pre_activation",
+        match_outcome=None, occurred_at="2026-01-01T00:00:00+00:00",
+        duration_s=1, direction=None, answered=None, status=STATUS_PENDING_REVIEW,
+        display_name=f"Caller {CANARY_PHONE_DIGITS}", masked_labels={},
+    )
+    result = build_ops114_pending_review_summary(db)
+    assert CANARY_PHONE_DIGITS not in str(result["items"])
+
+
+def test_build_ops114_pending_review_summary_identical_state_is_byte_stable(
+    db: IngestionStateDb,
+) -> None:
+    import json
+
+    db.insert_pending_review(
+        source="desk_call", source_event_id="evt-1", decision="review_required",
+        match_outcome="multiple_match", occurred_at="2026-01-01T00:00:00+00:00",
+        duration_s=1, direction="inbound", answered=1, status=STATUS_PENDING_REVIEW,
+        display_name="A. Caller", masked_labels={"phone": "***-***-1234"},
+    )
+    first = build_ops114_pending_review_summary(db)
+    second = build_ops114_pending_review_summary(db)
+    assert first == second
+    assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
 
 
 def test_advance_pending_review_stage_validates_transitions(db: IngestionStateDb) -> None:

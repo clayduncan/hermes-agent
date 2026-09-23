@@ -267,9 +267,20 @@ def test_desk_and_plaud_reconcile_unaffected_by_disabled_webhook_flag(
         def close(self):
             pass
 
+    class _FakeStateDb:
+        """OPS-114: `_run_desk` also calls
+        `build_ops114_pending_review_summary(state_db)`, which needs these
+        two read methods -- see IngestionStateDb's real ones."""
+
+        def count_unresolved_pending_review(self):
+            return 0
+
+        def query_unresolved_pending_review(self, *, limit=50):
+            return []
+
     monkeypatch.setattr(
         team_duncan_contacts, "_build_ingestion_runner_factory",
-        lambda hermes_home, registry: (lambda: (_FakeRunner(), object())),
+        lambda hermes_home, registry: (lambda: (_FakeRunner(), _FakeStateDb())),
     )
     monkeypatch.setattr(
         team_duncan_contacts, "_build_plaud_summary_runner_factory",

@@ -31,7 +31,11 @@ from plugins.team_duncan_contacts.collectors.call_history_collector import (
 )
 from plugins.team_duncan_contacts.ghl_reader import FakeGhlReader
 from plugins.team_duncan_contacts.ingestion_runner import RunSummary
-from plugins.team_duncan_contacts.ingestion_state_db import SOURCE_DESK_CALL, SOURCE_PLAUD
+from plugins.team_duncan_contacts.ingestion_state_db import (
+    NOTIF_NOT_NOTIFIED,
+    SOURCE_DESK_CALL,
+    SOURCE_PLAUD,
+)
 from plugins.team_duncan_contacts.registry import ContactRegistry
 from tools.ghl_client import TEAM_DUNCAN_LOCATION_ID
 
@@ -155,6 +159,69 @@ def test_desk_factory_activity_ledger_is_functional_without_register(tmp_path: P
     rows = state_db.query_pending_review(source=SOURCE_DESK_CALL)
     assert len(rows) == 1
     assert rows[0].decision == "deny_pre_activation"
+
+
+def test_desk_factory_defers_notifications_and_never_calls_unconfigured_notifier(
+    tmp_path: Path,
+) -> None:
+    """OPS-114: production ingestion (manual and automated alike, since both
+    paths call this same factory) must never call either `_UnconfiguredNotifier`
+    leg, and must leave a genuinely-inserted row honestly `not_notified`.
+    Shared cron Amber, not this per-row path, is the production alert
+    authority. Same direct-`_process_record` technique as the sibling
+    activity-ledger regression test above: no live Desk fetch, no live GHL
+    call, no live Telegram/email send of any kind.
+    """
+    hermes_home = tmp_path / "hermes_home"
+    registry = ContactRegistry(
+        hermes_home / "registry", team_duncan_location_id=TEAM_DUNCAN_LOCATION_ID
+    )
+    _activate(registry, CANARY_PHONE, "c-desk-defer-notifications")
+
+    factory = team_duncan_contacts._build_ingestion_runner_factory(hermes_home, registry)
+    runner, state_db = factory()
+
+    assert runner._defer_notifications is True
+
+    # The factory wires exactly two _UnconfiguredNotifier legs. Spy on both
+    # -- if defer_notifications did not actually gate the send call, this
+    # test would catch it even though _UnconfiguredNotifier.send already
+    # (independently) always returns False.
+    telegram_leg = runner._notifier._telegram
+    email_leg = runner._notifier._email
+    assert isinstance(telegram_leg, team_duncan_contacts._UnconfiguredNotifier)
+    assert isinstance(email_leg, team_duncan_contacts._UnconfiguredNotifier)
+    telegram_calls: list[dict] = []
+    email_calls: list[dict] = []
+    telegram_leg.send = lambda payload: telegram_calls.append(payload) or False
+    email_leg.send = lambda payload: email_calls.append(payload) or False
+
+    before_cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    record = DeskCallRecord(
+        source=SOURCE_DESK_CALL,
+        source_event_id="desk-ops114-defer-notifications",
+        occurred_at=before_cutoff,
+        duration_s=42,
+        raw_handle=CANARY_PHONE,
+        direction="inbound",
+        answered=1,
+    )
+    summary = RunSummary(run_id=None)
+
+    reached = runner._process_record(SOURCE_DESK_CALL, record, summary)
+
+    assert reached is True
+    assert summary.pending_review == 1
+    assert telegram_calls == []
+    assert email_calls == []
+
+    rows = state_db.query_pending_review(source=SOURCE_DESK_CALL)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.decision == "deny_pre_activation"
+    assert row.notification_state == NOTIF_NOT_NOTIFIED
+    assert row.notification_attempts == 0
+    assert row.next_retry_at is None
 
 
 def test_plaud_factory_activity_ledger_is_functional_without_register(tmp_path: Path) -> None:

@@ -155,6 +155,7 @@ class IngestionRunner:
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         enabled_sources: frozenset[str] | None = None,
         note_mirror: Any | None = None,
+        defer_notifications: bool = False,
     ) -> None:
         """*enabled_sources* is a fixed internal configuration decided at
         construction time by the plugin factory -- never agent/model input.
@@ -171,6 +172,19 @@ class IngestionRunner:
         feature existed. It is only ever consulted for SOURCE_DESK_CALL
         events -- Plaud stays excluded from the mirror the same way it stays
         excluded from ingestion, pending OPS-110.
+
+        *defer_notifications* (OPS-114): when False (the default -- matching
+        every pre-existing direct construction, mostly in tests), a genuine
+        pending-review insertion sends through *notifier* and records the
+        attempt on the row, and `run()` also drives the legacy due-retry
+        loop, exactly as before this flag existed. When True (production
+        wiring only, see `_build_ingestion_runner_factory`), neither send
+        happens: no `notifier.send`, no `record_notification_attempt`, and
+        `_process_due_retries` is never called. `notification_state` is left
+        honestly at `not_notified` for every newly inserted row -- shared
+        cron Amber (not this per-row Telegram/email path) is the production
+        notification authority, so recording a false send attempt or a fake
+        retry schedule here would misrepresent what actually happened.
         """
         self._registry = registry
         self._activity_ledger = activity_ledger
@@ -183,6 +197,7 @@ class IngestionRunner:
             frozenset(enabled_sources) if enabled_sources is not None else ALL_SOURCES
         )
         self._note_mirror = note_mirror
+        self._defer_notifications = defer_notifications
 
     # --- Ingestion ------------------------------------------------------------
 
@@ -201,7 +216,8 @@ class IngestionRunner:
             self._run_plaud(summary)
         if SOURCE_DESK_CALL in self._enabled_sources:
             self._run_desk(summary)
-        self._process_due_retries()
+        if not self._defer_notifications:
+            self._process_due_retries()
 
         summary.pending_review_count = self._state_db.count_unresolved_pending_review()
         summary.oldest_pending_at = self._state_db.oldest_pending_at()
@@ -353,7 +369,7 @@ class IngestionRunner:
                 masked_labels=masked_meta.get("masked_labels"),
             )
             summary.pending_review += 1
-            if ins.genuine_insert:
+            if ins.genuine_insert and not self._defer_notifications:
                 row = self._state_db.get_pending_review(ins.pending_review_id)
                 delivered = self._notifier.send(build_deny_pre_activation_payload(row))
                 self._state_db.record_notification_attempt(ins.pending_review_id, delivered)
@@ -378,7 +394,7 @@ class IngestionRunner:
                 status=status,
             )
             summary.pending_review += 1
-            if ins.genuine_insert:
+            if ins.genuine_insert and not self._defer_notifications:
                 row = self._state_db.get_pending_review(ins.pending_review_id)
                 if result.candidate_collision:
                     payload = build_collision_payload(row)

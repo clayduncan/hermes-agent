@@ -115,6 +115,23 @@ class _NoopNotifier:
         return False
 
 
+class _FakeStateDbForPendingSummary:
+    """Stands in for the (runner, state_db) tuple's state_db half wherever
+    `_build_ingestion_runner_factory` itself is monkeypatched out (most of
+    this file): `_run_desk` now also calls
+    `build_ops114_pending_review_summary(state_db)`, which needs exactly
+    these two read methods -- see IngestionStateDb's real ones."""
+
+    def __init__(self, unresolved_rows=None):
+        self._rows = list(unresolved_rows or [])
+
+    def count_unresolved_pending_review(self):
+        return len(self._rows)
+
+    def query_unresolved_pending_review(self, *, limit=50):
+        return list(self._rows[:limit])
+
+
 @dataclass
 class _FakeSummary:
     counts: dict[str, Any] = field(default_factory=dict)
@@ -159,7 +176,11 @@ def fake_registry_wiring(monkeypatch):
     plaud-webhook mode, not the fail-closed gate itself (that has its own
     dedicated coverage in test_plaud_webhook_enabled_flag.py)."""
 
-    state = {"runner": _FakeRunner(), "registry_ok": True}
+    state = {
+        "runner": _FakeRunner(),
+        "registry_ok": True,
+        "state_db": _FakeStateDbForPendingSummary(),
+    }
 
     def _fake_build_registry_and_reader(hermes_home):
         if not state["registry_ok"]:
@@ -167,7 +188,7 @@ def fake_registry_wiring(monkeypatch):
         return object(), object(), "loc-1"
 
     def _fake_ingestion_factory(hermes_home, registry):
-        return lambda: (state["runner"], object())
+        return lambda: (state["runner"], state["state_db"])
 
     def _fake_plaud_factory(hermes_home, registry, ghl_reader):
         return lambda: (state["runner"], object())

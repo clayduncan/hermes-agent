@@ -266,6 +266,14 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
         # constructed fail-closed as defense in depth.
         plaud_collector = PlaudCollector(_UnconfiguredTransport())
         desk_collector = CallHistoryCollector(LiveDeskTransport(), identity_key)
+        # OPS-114: this notifier is never invoked in production -- see
+        # defer_notifications below. It is still constructed (rather than
+        # left None) only because IngestionRunner requires a Notifier
+        # instance; kept as the same known no-op pair so nothing here
+        # could accidentally start sending if defer_notifications were ever
+        # dropped by mistake. Shared cron Amber (team_duncan_ops114_report.py
+        # in the scripts repo) is the actual production pending-review alert
+        # path for both manual and automated runs.
         notifier = TelegramPrimaryEmailFallbackNotifier(
             _UnconfiguredNotifier(), _UnconfiguredNotifier()
         )
@@ -280,6 +288,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
             notifier=notifier,
             enabled_sources=frozenset(_ENABLED_SOURCES),
             note_mirror=note_mirror,
+            defer_notifications=True,
         )
         return runner, state_db
 

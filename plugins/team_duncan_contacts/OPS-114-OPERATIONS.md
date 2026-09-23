@@ -46,6 +46,48 @@ Clay-controlled decision -- see §7.
   existing `cron_watchdog_cron.sh` the same way
   `hindsight_circuit_red_watchdog.py` is chained today.
 
+## 1a. Pending-review alert path: shared Cron-Amber is production authority
+
+A live run created nine actionable pending reviews with no Telegram
+notification reaching Clay. Root cause: the production runner factory
+(`_build_ingestion_runner_factory`) wired the per-row notifier to two
+`_UnconfiguredNotifier` instances (always return `False`), while still
+calling `Notifier.send` and `record_notification_attempt` on every genuine
+pending-review insertion and running the legacy due-notification retry
+loop -- recording real-looking `retry_scheduled`/`retries_exhausted`
+history for sends that never had any chance of delivering.
+
+The correction: `IngestionRunner` takes an explicit `defer_notifications`
+flag (default `False`, preserving direct-construction/test behavior
+exactly). The production factory now always passes
+`defer_notifications=True` for both manual and automated construction. In
+deferred mode, a genuine pending-review insertion never calls
+`Notifier.send` or `record_notification_attempt`, and `run()` never drives
+the due-retry loop -- `notification_state` is left honestly at
+`not_notified` for every new row, rather than recording a false attempt.
+The notifier classes and legacy direct-injection behavior are unchanged
+and still fully exercised by isolated tests (`defer_notifications=False`
+or omitted); nothing was deleted.
+
+**Shared Cron-Amber is the actual production pending-review alert path.**
+`automation_runner._run_desk` now also emits a bounded, sorted,
+content-safe projection of the current unresolved pending-review set
+(`build_ops114_pending_review_summary`, at most 50 items, ordered by
+`occurred_at` then id) alongside the existing count fields. The
+scripts-repo `team_duncan_ops114_report.py` wrapper classifies
+`pending_review_count > 0` as Amber material (even with zero errors) and
+routes that projection through `cron_report.py` / `cron_ledger.py`'s
+existing shared Amber machinery: one first alert, one 24-hour reminder,
+suppression while unchanged, one recovery when the count reaches zero.
+
+Per-row fields (`notification_state`, `notification_attempts`,
+`last_notified_at`, `next_retry_at`) remain in the schema and remain
+readable (e.g. via `list_pending_call_reviews`) as an audit/debugging
+surface, but **they are not delivery authority in automated production**.
+Rows already marked `retries_exhausted` from before this correction are
+evidence of the prior broken path and are left exactly as they were --
+nothing rewrites them.
+
 ## 2. Present manual baseline (unchanged by this build)
 
 - **Desk**: `prepare_call_log_ingest` issues a single-use 5-minute token
@@ -53,7 +95,10 @@ Clay-controlled decision -- see §7.
   earlier run is still awaiting acceptance. `confirm_call_log_ingest`
   consumes the token and runs ingestion, leaving the run
   `awaiting_acceptance`. `accept_call_log_ingest_run` clears that hold.
-  Notification retries are only processed during a confirmed run.
+  As of the §1a correction, the production factory defers per-row
+  notification on this path too (`defer_notifications=True`), so a
+  confirmed run no longer sends or retries per-row notifications -- see
+  §1a for the current alert authority.
 - **Plaud**: `prepare_plaud_summary_run` issues its own single-use
   5-minute token (no source read), rejects cron/background context.
   `confirm_plaud_summary_run` consumes it and runs match, transcript
