@@ -25072,6 +25072,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        durable_session_id = ""
+        durable_kind = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
@@ -25083,6 +25085,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         durable_delegation_id, durable_claim_id,
                     ):
                         return None
+                    durable_kind = "async_delegation"
                 except Exception as exc:
                     logger.warning(
                         "Could not claim durable async completion %s: %s",
@@ -25133,30 +25136,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     return False
         elif evt.get("type") == "completion":
+            durable_session_id = str(evt.get("session_id") or "")
+            if durable_session_id:
+                try:
+                    from tools.process_completion_store import claim_completion_delivery
+
+                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
+                    if not claim_completion_delivery(
+                        durable_session_id, durable_claim_id,
+                    ):
+                        return None
+                    durable_kind = "completion"
+                except Exception as exc:
+                    logger.warning(
+                        "Could not claim durable process completion %s: %s",
+                        durable_session_id, exc,
+                    )
+                    return False
             # Background-process completions carry only session_key (chat/
             # thread routing), so after /new the notification from the OLD
             # session would land in the chat's NEW session. Stamped events
             # (spawn-time parent_session_id from terminal_tool) get the same
             # session-boundary pre-flight as async delegations — one policy
             # owner (_classify_completion_target), never a forked predicate.
-            # Legacy/unstamped events keep today's behavior and deliver.
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
+            #
+            # A raw/API-server session never receives that stamp (its
+            # session_key IS the raw resumed session id, not a structured
+            # ``agent:main:...`` key) — never gate solely on parent_session_id
+            # (#OPS-117). Fall back to the SAME raw-id derivation
+            # ``_inject_watch_notification`` uses for its self-post target, so
+            # a terminal/archived/unresolvable raw session gets the identical
+            # boundary gate a stamped event gets.
+            target_session_id = str(evt.get("parent_session_id") or "").strip()
+            if not target_session_id:
+                raw_sid = str(evt.get("origin_session_id") or "").strip()
+                if not raw_sid:
+                    _sk = str(evt.get("session_key") or "").strip()
+                    if _sk and _parse_session_key(_sk) is None:
+                        raw_sid = _sk
+                target_session_id = raw_sid
+            if target_session_id:
+                verdict = await self._classify_completion_target(target_session_id)
                 if verdict == "terminal":
                     logger.warning(
                         "Background process %s completion targets "
                         "permanently-gone session %s (user boundary such as "
-                        "/new); dropping notification (output remains "
-                        "available via process(action='log')).",
-                        evt.get("session_id") or "<unknown>", parent_session_id,
+                        "/new, or unresolvable); dropping notification "
+                        "(output remains available via "
+                        "process(action='log')).",
+                        evt.get("session_id") or "<unknown>", target_session_id,
                     )
+                    if durable_claim_id:
+                        try:
+                            from tools.process_completion_store import drop_completion_delivery
+
+                            drop_completion_delivery(
+                                durable_session_id, durable_claim_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not drop durable completion claim",
+                                exc_info=True,
+                            )
                     return None
                 if verdict == "retry":
                     # Transient uncertainty (session DB unavailable or a
                     # compression rotation mid-flight): signal the watcher to
                     # re-poll and try again rather than dropping or
                     # misrouting the result.
+                    if durable_claim_id:
+                        try:
+                            from tools.process_completion_store import release_completion_delivery
+
+                            release_completion_delivery(
+                                durable_session_id, durable_claim_id,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Could not release durable completion claim",
+                                exc_info=True,
+                            )
                     return False
         if identity is not None:
             with self._completion_delivery_lock:
@@ -25184,20 +25243,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
+            # If a durable producer branch claimed a row above, its SQLite row
+            # remains the authoritative replay state. Acknowledge it after
+            # adapter acceptance; this gateway keeps no parallel ledger.
             if durable_claim_id:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
+                    if durable_kind == "async_delegation":
+                        from tools.async_delegation import complete_completion_delivery
 
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                        complete_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                    elif durable_kind == "completion":
+                        from tools.process_completion_store import (
+                            complete_completion_delivery as _complete_process_completion,
+                        )
+
+                        _complete_process_completion(
+                            durable_session_id, durable_claim_id,
+                        )
                 except Exception as exc:
                     logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
+                        "Could not acknowledge durable completion %s: %s",
+                        durable_delegation_id or durable_session_id, exc,
                     )
             return True
         finally:
@@ -25206,11 +25274,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._completion_deliveries_inflight.discard(identity)
             if durable_claim_id and not accepted:
                 try:
-                    from tools.async_delegation import release_completion_delivery
+                    if durable_kind == "async_delegation":
+                        from tools.async_delegation import release_completion_delivery
 
-                    release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                        release_completion_delivery(
+                            durable_delegation_id, durable_claim_id,
+                        )
+                    elif durable_kind == "completion":
+                        from tools.process_completion_store import (
+                            release_completion_delivery as _release_process_completion,
+                        )
+
+                        _release_process_completion(
+                            durable_session_id, durable_claim_id,
+                        )
                 except Exception:
                     logger.debug("Could not release durable completion claim", exc_info=True)
 
@@ -25625,6 +25702,105 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
 
+    async def _deliver_restored_completion_group(
+        self, group: list[dict],
+    ) -> Optional[bool]:
+        """Deliver a same-route batch of REPLAYED process completions as ONE turn.
+
+        Mirrors :meth:`_deliver_async_delegation_group`'s claim-then-
+        consolidate pattern, using ``tools.process_completion_store``'s claim
+        lifecycle (not async_delegation's — separate table, separate lock)
+        instead. A gateway that just restarted can have a durable row for
+        every process a session ever spawned with ``notify_on_complete``; live
+        evidence: batches of 153 and 122 replayed events, one session woken
+        131 times (#OPS-117). Without this, ``_restored_completion_watcher``
+        would call :meth:`_deliver_completion_notification` once per row —
+        one full model turn per finished process instead of one per batch.
+
+        Returns ``True`` after adapter acceptance, ``False`` when the caller
+        should requeue the group for retry, and ``None`` when nothing in the
+        group is deliverable by this runner (siblings claimed by this runner
+        but left undelivered are released here so they stay retryable).
+        """
+        deliverable: list[tuple[dict, str]] = []
+        for evt in group:
+            synth_text = _format_gateway_process_notification(evt)
+            if not synth_text:
+                continue
+            identity = self._completion_delivery_identity(evt)
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    if (
+                        identity in self._completion_deliveries_inflight
+                        or identity in self._completion_deliveries_delivered
+                    ):
+                        continue
+            deliverable.append((evt, synth_text))
+
+        if not deliverable:
+            return None
+        if len(deliverable) == 1:
+            evt, synth_text = deliverable[0]
+            return await self._deliver_completion_notification(synth_text, evt)
+
+        from tools.process_completion_store import (
+            claim_event_delivery,
+            complete_event_delivery,
+            release_event_delivery,
+        )
+
+        primary_evt, primary_text = deliverable[0]
+        blocks: list[tuple[str, dict, None]] = [(primary_text, primary_evt, None)]
+        siblings: list[tuple[dict, str]] = []
+        for evt, synth_text in deliverable[1:]:
+            claim_id = claim_event_delivery(evt, f"gateway-restored:{id(self)}")
+            if claim_id is None:
+                # Another consumer owns this row's delivery; keep its result
+                # out of our consolidated text so it is never double-injected.
+                continue
+            siblings.append((evt, claim_id))
+            blocks.append((synth_text, evt, None))
+
+        if not siblings:
+            return await self._deliver_completion_notification(
+                primary_text, primary_evt,
+            )
+
+        consolidated = self._format_coalesced_process_completions(blocks)
+        delivered: Optional[bool] = False
+        try:
+            delivered = await self._deliver_completion_notification(
+                consolidated, primary_evt,
+            )
+        finally:
+            if delivered is True:
+                for evt, claim_id in siblings:
+                    try:
+                        complete_event_delivery(evt, claim_id)
+                    except Exception:
+                        logger.debug(
+                            "Could not acknowledge coalesced durable process "
+                            "completion",
+                            exc_info=True,
+                        )
+                self._record_coalesced_completion_siblings(
+                    [evt for evt, _claim_id in siblings]
+                )
+            else:
+                # Not delivered — release every sibling claim so a retry (or
+                # another consumer) can claim it, honestly leaving the
+                # durable rows pending.
+                for evt, claim_id in siblings:
+                    try:
+                        release_event_delivery(evt, claim_id)
+                    except Exception:
+                        logger.debug(
+                            "Could not release coalesced durable process "
+                            "completion claim",
+                            exc_info=True,
+                        )
+        return delivered
+
     async def _restored_completion_watcher(self, interval: float = 2.0) -> None:
         """Deliver background completions replayed from the durable store.
 
@@ -25640,6 +25816,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (async-delegation completions in particular belong to
         ``_async_delegation_watcher``; a fresh process completion belongs to
         its own ``_run_process_watcher``).
+
+        A single drain can carry many rows addressed to the SAME target
+        session (a startup backlog). Those are grouped by full gateway route
+        and delivered as one coalesced turn via
+        :meth:`_deliver_restored_completion_group` — at most one model wake
+        per session per drained batch, never one per finished process
+        (#OPS-117).
         """
         try:
             from tools.process_completion_store import restored_session_ids
@@ -25682,22 +25865,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
+
+                # The persisted payload carries only session_key; the
+                # platform/chat routing the adapter needs is derived from it,
+                # the same way async-delegation completions are routed. Group
+                # by full route AFTER enrichment so a startup backlog for one
+                # target session coalesces into a single delivery below.
+                groups: dict[tuple[str, ...], list[dict]] = {}
+                group_order: list[tuple[str, ...]] = []
                 for evt in mine:
-                    session_id = str(evt.get("session_id") or "")
-                    attempts[session_id] = attempts.get(session_id, 0) + 1
-                    exhausted = attempts[session_id] >= MAX_DELIVERY_PASSES
-                    # The persisted payload carries only session_key; the
-                    # platform/chat routing the adapter needs is derived from
-                    # it, the same way async-delegation completions are routed.
                     self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        outstanding.discard(session_id)
-                        continue
+                    key = GatewayRunner._completion_notification_batch_key(evt)
+                    if key not in groups:
+                        groups[key] = []
+                        group_order.append(key)
+                    groups[key].append(evt)
+
+                for key in group_order:
+                    group = groups[key]
+                    session_ids = [str(evt.get("session_id") or "") for evt in group]
+                    for session_id in session_ids:
+                        attempts[session_id] = attempts.get(session_id, 0) + 1
+                    exhausted = all(
+                        attempts.get(sid, 0) >= MAX_DELIVERY_PASSES
+                        for sid in session_ids
+                    )
                     try:
-                        delivered = await self._deliver_completion_notification(
-                            synth_text, evt,
-                        )
+                        if len(group) == 1:
+                            evt = group[0]
+                            synth_text = _format_gateway_process_notification(evt)
+                            if not synth_text:
+                                outstanding.discard(session_ids[0])
+                                continue
+                            delivered = await self._deliver_completion_notification(
+                                synth_text, evt,
+                            )
+                        else:
+                            delivered = await self._deliver_restored_completion_group(
+                                group,
+                            )
                     except Exception as e:
                         logger.error("Restored completion injection error: %s", e)
                         delivered = False
@@ -25705,25 +25911,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Adapter injection failed — retry on the next pass
                         # rather than dropping a notification we know is owed.
                         if exhausted:
-                            outstanding.discard(session_id)
+                            for session_id in session_ids:
+                                outstanding.discard(session_id)
                             logger.warning(
-                                "Giving up on replayed completion %s after %d "
-                                "delivery attempts; it stays pending for the "
-                                "next restart",
-                                session_id, MAX_DELIVERY_PASSES,
+                                "Giving up on %d replayed completion(s) after "
+                                "%d delivery attempts; they stay pending for "
+                                "the next restart",
+                                len(group), MAX_DELIVERY_PASSES,
                             )
                             continue
-                        _pr.completion_queue.put(evt)
+                        for evt in group:
+                            _pr.completion_queue.put(evt)
                         continue
-                    outstanding.discard(session_id)
+                    for session_id in session_ids:
+                        outstanding.discard(session_id)
                     if delivered is True:
                         # Confirmed adapter acceptance: acknowledge durably so
-                        # no later boot replays it.  ``None`` deliberately does
+                        # no later boot replays it. ``None`` deliberately does
                         # NOT ack — it means this event has no gateway route,
                         # and an unroutable event that is never acknowledged
                         # stays replayable (bounded by the store's replay cap)
                         # instead of being silently written off as delivered.
-                        _ack_process_completion(session_id)
+                        # Idempotent: a coalesced group's primary and siblings
+                        # are already acknowledged inside
+                        # _deliver_completion_notification /
+                        # _deliver_restored_completion_group, so this is a
+                        # no-op there — it is the ONLY ack for a stub runner
+                        # that replaces _deliver_completion_notification
+                        # outright (as the durability tests do).
+                        for session_id in session_ids:
+                            _ack_process_completion(session_id)
             except Exception as e:
                 logger.debug("Restored completion watcher error: %s", e)
             await asyncio.sleep(interval)

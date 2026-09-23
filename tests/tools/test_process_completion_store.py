@@ -438,3 +438,247 @@ class TestRegistryIntegration:
         registry._move_to_finished(session)
 
         assert registry.completion_queue.qsize() == 1
+
+
+class TestClaimLifecycle:
+    """The atomic claim/release/drop/complete state machine (OPS-117).
+
+    Mirrors tools/async_delegation.py's proven claim lifecycle: a claim is a
+    compare-and-swap (only one caller wins), a stale claim (holder crashed)
+    can be re-claimed, and a claim that keeps being released without ever
+    completing converges to a terminal ``dropped`` state instead of
+    retrying forever.
+    """
+
+    def test_double_claim_only_one_winner(self):
+        store.record_pending_completion(_completion_evt())
+
+        first = store.claim_completion_delivery("proc_1", "claim-a")
+        second = store.claim_completion_delivery("proc_1", "claim-b")
+
+        assert first is True
+        assert second is False
+        assert store.get_completion_record("proc_1")["delivery_claim"] == "claim-a"
+
+    def test_claim_on_a_row_missing_from_the_store_succeeds_uncontested(self):
+        """No durable row (legacy queue-only event) — nothing to race, so the
+        caller proceeds exactly as it always could."""
+        assert store.claim_completion_delivery("proc_ghost", "claim-a") is True
+
+    def test_stale_claim_can_be_reclaimed_after_a_crash(self):
+        store.record_pending_completion(_completion_evt())
+        assert store.claim_completion_delivery("proc_1", "claim-a") is True
+
+        conn = sqlite3.connect(store._db_path())
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE process_completion_events SET delivery_claimed_at=? "
+                    "WHERE session_id=?",
+                    (time.time() - store._CLAIM_STALE_SECONDS - 1, "proc_1"),
+                )
+        finally:
+            conn.close()
+
+        assert store.claim_completion_delivery("proc_1", "claim-b") is True
+        assert store.get_completion_record("proc_1")["delivery_claim"] == "claim-b"
+
+    def test_fresh_claim_is_not_stealable(self):
+        store.record_pending_completion(_completion_evt())
+        assert store.claim_completion_delivery("proc_1", "claim-a") is True
+
+        assert store.claim_completion_delivery("proc_1", "claim-b") is False
+
+    def test_complete_flips_to_delivered_and_clears_the_claim(self):
+        store.record_pending_completion(_completion_evt())
+        store.claim_completion_delivery("proc_1", "claim-a")
+
+        assert store.complete_completion_delivery("proc_1", "claim-a") is True
+
+        record = store.get_completion_record("proc_1")
+        assert record["delivery_state"] == "delivered"
+        assert record["delivery_claim"] is None
+
+    def test_complete_requires_the_matching_claim(self):
+        store.record_pending_completion(_completion_evt())
+        store.claim_completion_delivery("proc_1", "claim-a")
+
+        assert store.complete_completion_delivery("proc_1", "wrong-claim") is False
+        assert store.get_completion_record("proc_1")["delivery_state"] == "pending"
+
+    def test_release_returns_the_row_to_pending_for_a_retry(self):
+        store.record_pending_completion(_completion_evt())
+        store.claim_completion_delivery("proc_1", "claim-a")
+
+        assert store.release_completion_delivery("proc_1", "claim-a") is True
+
+        record = store.get_completion_record("proc_1")
+        assert record["delivery_state"] == "pending"
+        assert record["delivery_claim"] is None
+        # Now claimable again by a fresh (or retrying) consumer.
+        assert store.claim_completion_delivery("proc_1", "claim-b") is True
+
+    def test_release_drops_once_delivery_attempts_are_exhausted(self):
+        store.record_pending_completion(_completion_evt())
+
+        for i in range(store.MAX_DELIVERY_ATTEMPTS):
+            claim_id = f"claim-{i}"
+            assert store.claim_completion_delivery("proc_1", claim_id) is True
+            store.release_completion_delivery("proc_1", claim_id)
+
+        record = store.get_completion_record("proc_1")
+        assert record["delivery_state"] == "dropped"
+        assert record["delivery_claim"] is None
+        # A dropped row can never be reclaimed.
+        assert store.claim_completion_delivery("proc_1", "claim-final") is False
+
+    def test_drop_terminally_drops_a_claimed_row(self):
+        store.record_pending_completion(_completion_evt())
+        store.claim_completion_delivery("proc_1", "claim-a")
+
+        assert store.drop_completion_delivery("proc_1", "claim-a") is True
+
+        record = store.get_completion_record("proc_1")
+        assert record["delivery_state"] == "dropped"
+        assert store.claim_completion_delivery("proc_1", "claim-b") is False
+
+    def test_dropped_row_never_replays(self):
+        store.record_pending_completion(_completion_evt())
+        store.claim_completion_delivery("proc_1", "claim-a")
+        store.drop_completion_delivery("proc_1", "claim-a")
+        _simulate_restart("proc_1")
+
+        assert store.restore_pending_completions(queue.Queue()) == 0
+
+
+class TestEventLifecycleWrappers:
+    """``claim_event_delivery`` / ``complete_event_delivery`` /
+    ``release_event_delivery`` — the evt-dict-shaped wrappers gateway/TUI
+    consumers call, gated to ``type=="completion"`` so they no-op for
+    async_delegation events sharing the same queue."""
+
+    def test_claim_event_delivery_returns_empty_string_for_other_event_types(self):
+        evt = {"type": "async_delegation", "delegation_id": "deleg_1"}
+        assert store.claim_event_delivery(evt, "consumer") == ""
+
+    def test_claim_event_delivery_returns_empty_string_without_a_session_id(self):
+        assert store.claim_event_delivery({"type": "completion"}, "consumer") == ""
+
+    def test_claim_event_delivery_round_trip(self):
+        store.record_pending_completion(_completion_evt())
+        evt = _completion_evt()
+
+        claim_id = store.claim_event_delivery(evt, "consumer")
+        assert claim_id
+        assert store.claim_event_delivery(dict(evt), "other-consumer") is None
+
+        store.complete_event_delivery(evt, claim_id)
+        assert store.get_completion_record("proc_1")["delivery_state"] == "delivered"
+
+    def test_release_event_delivery_requeues_for_retry(self):
+        store.record_pending_completion(_completion_evt())
+        evt = _completion_evt()
+        claim_id = store.claim_event_delivery(evt, "consumer")
+
+        store.release_event_delivery(evt, claim_id)
+
+        assert store.get_completion_record("proc_1")["delivery_state"] == "pending"
+
+    def test_drop_event_delivery_terminally_drops(self):
+        store.record_pending_completion(_completion_evt())
+        evt = _completion_evt()
+        claim_id = store.claim_event_delivery(evt, "consumer")
+
+        store.drop_event_delivery(evt, claim_id)
+
+        assert store.get_completion_record("proc_1")["delivery_state"] == "dropped"
+
+    def test_complete_event_delivery_noops_without_a_claim(self):
+        store.record_pending_completion(_completion_evt())
+
+        store.complete_event_delivery(_completion_evt(), "")
+
+        assert store.get_completion_record("proc_1")["delivery_state"] == "pending"
+
+
+class TestReplayAgeCap:
+    """A pending completion older than MAX_REPLAY_AGE_SECONDS is terminally
+    dropped instead of replayed — mirrors async_delegation's staleness cap
+    (a week-old completion re-waking a session nobody is waiting on)."""
+
+    def _age_row(self, session_id, age_seconds):
+        conn = sqlite3.connect(store._db_path())
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE process_completion_events SET created_at=? "
+                    "WHERE session_id=?",
+                    (time.time() - age_seconds, session_id),
+                )
+        finally:
+            conn.close()
+
+    def test_a_stale_pending_completion_is_dropped_not_replayed(self):
+        store.record_pending_completion(_completion_evt())
+        self._age_row("proc_1", store.MAX_REPLAY_AGE_SECONDS + 60)
+        _simulate_restart("proc_1")
+
+        assert store.restore_pending_completions(queue.Queue()) == 0
+        assert store.get_completion_record("proc_1")["delivery_state"] == "dropped"
+
+    def test_a_completion_within_the_age_cap_still_replays(self):
+        store.record_pending_completion(_completion_evt())
+        self._age_row("proc_1", store.MAX_REPLAY_AGE_SECONDS - 60)
+        _simulate_restart("proc_1")
+
+        q = queue.Queue()
+        assert store.restore_pending_completions(q) == 1
+        assert q.qsize() == 1
+
+
+class TestSchemaCompatibility:
+    """Additive migration must be idempotent on a table that predates the
+    claim-lifecycle columns — including the 20 pre-existing pending rows
+    carried into this build."""
+
+    def test_migration_adds_claim_columns_to_a_pre_existing_table(self):
+        conn = sqlite3.connect(store._db_path())
+        try:
+            with conn:
+                conn.execute(
+                    """CREATE TABLE process_completion_events (
+                        session_id TEXT PRIMARY KEY,
+                        session_key TEXT NOT NULL DEFAULT '',
+                        event_json TEXT NOT NULL,
+                        delivery_state TEXT NOT NULL DEFAULT 'pending',
+                        replay_count INTEGER NOT NULL DEFAULT 0,
+                        created_at REAL NOT NULL,
+                        delivered_at REAL,
+                        owner_pid INTEGER,
+                        owner_started_at INTEGER
+                    )"""
+                )
+                conn.execute(
+                    """INSERT INTO process_completion_events
+                       (session_id, session_key, event_json, delivery_state,
+                        replay_count, created_at, delivered_at, owner_pid,
+                        owner_started_at)
+                       VALUES ('proc_old', 'telegram:dm:1', '{}', 'pending',
+                               0, ?, NULL, NULL, NULL)""",
+                    (time.time(),),
+                )
+        finally:
+            conn.close()
+        store._schema_ready_for = None  # force re-migration on next _connect()
+
+        record = store.get_completion_record("proc_old")
+
+        assert record is not None
+        assert record["delivery_state"] == "pending"
+        assert record["delivery_claim"] is None
+        assert record["delivery_attempts"] == 0
+        # The pre-existing row is fully usable through the new lifecycle.
+        assert store.claim_completion_delivery("proc_old", "claim-a") is True
+        assert store.claim_completion_delivery("proc_old", "claim-b") is False
+        assert store.complete_completion_delivery("proc_old", "claim-a") is True
+        assert store.get_completion_record("proc_old")["delivery_state"] == "delivered"

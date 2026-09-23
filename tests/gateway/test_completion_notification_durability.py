@@ -19,11 +19,15 @@ import queue
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from collections import OrderedDict
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.config import Platform
 from gateway.run import (
     GatewayRunner,
     _drain_gateway_watch_events,
@@ -388,3 +392,158 @@ def _no_wait(real_sleep):
     async def _sleep(delay, *a, **kw):
         return await real_sleep(0 if delay >= 1 else delay, *a, **kw)
     return _sleep
+
+
+# ---------------------------------------------------------------------------
+# Startup-backlog coalescing (#OPS-117)
+# ---------------------------------------------------------------------------
+# Live evidence for the bug this section pins: batches of 153 and 122
+# replayed completion events, and one session woken 131 times, after a
+# gateway restart that carried a large durable backlog. Each replayed event
+# used to go through _deliver_completion_notification individually — one
+# full model turn per finished process. These tests drive a REAL GatewayRunner
+# (not the bare stub used above) because coalescing needs the real claim /
+# identity-dedup / batch-formatting machinery, not just the delivery hook.
+
+
+class TestRestoredCompletionCoalescing:
+    def _real_runner(self, adapter):
+        runner = object.__new__(GatewayRunner)
+        runner._running = True
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner.session_store = SimpleNamespace(
+            _ensure_loaded=lambda: None, _entries={},
+        )
+        runner._session_source_cache = {}
+        runner._completion_delivery_lock = threading.Lock()
+        runner._completion_deliveries_inflight = set()
+        runner._completion_deliveries_delivered = OrderedDict()
+        runner._completion_delivery_retention = 2048
+        runner._background_tasks = set()
+        return runner
+
+    def _seed_pending(self, count, session_key, prefix):
+        registry = ProcessRegistry()
+        for i in range(count):
+            session = ProcessSession(
+                id=f"{prefix}_{i}",
+                command=f"echo {i}",
+                session_key=session_key,
+                started_at=time.time() - 5,
+                notify_on_complete=True,
+            )
+            _exit_session(registry, session)
+        return registry
+
+    async def _drive_watcher_once(self, runner, window=0.05):
+        async def _stopper():
+            await asyncio.sleep(window)
+            runner._running = False
+
+        task = asyncio.ensure_future(
+            GatewayRunner._restored_completion_watcher(runner, interval=0.01)
+        )
+        await asyncio.gather(task, _stopper())
+
+    @pytest.mark.asyncio
+    async def test_100_pending_rows_for_one_session_coalesce_into_one_wake(
+        self, monkeypatch,
+    ):
+        dying = self._seed_pending(
+            100, "agent:main:telegram:dm:99", "proc_bulk",
+        )
+        del dying
+        _simulate_restart()
+
+        reborn = ProcessRegistry()
+        assert reborn.restore_pending_completions() == 100
+        monkeypatch.setattr("tools.process_registry.process_registry", reborn)
+        monkeypatch.setattr(asyncio, "sleep", _no_wait(asyncio.sleep))
+
+        adapter = SimpleNamespace(handle_message=AsyncMock())
+        runner = self._real_runner(adapter)
+
+        await self._drive_watcher_once(runner)
+
+        adapter.handle_message.assert_awaited_once()
+        delivered = adapter.handle_message.await_args.args[0]
+        assert "100 background processes completed" in delivered.text
+        assert reborn.completion_queue.empty()
+        for i in range(100):
+            record = store.get_completion_record(f"proc_bulk_{i}")
+            assert record is not None
+            assert record["delivery_state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_multiple_sessions_each_get_one_wake(self, monkeypatch):
+        dying = ProcessRegistry()
+        for i in range(3):
+            _exit_session(dying, ProcessSession(
+                id=f"proc_a_{i}", command="echo a",
+                session_key="agent:main:telegram:dm:99",
+                started_at=time.time() - 5, notify_on_complete=True,
+            ))
+        for i in range(2):
+            _exit_session(dying, ProcessSession(
+                id=f"proc_b_{i}", command="echo b",
+                session_key="agent:main:telegram:dm:55",
+                started_at=time.time() - 5, notify_on_complete=True,
+            ))
+        del dying
+        _simulate_restart()
+
+        reborn = ProcessRegistry()
+        assert reborn.restore_pending_completions() == 5
+        monkeypatch.setattr("tools.process_registry.process_registry", reborn)
+        monkeypatch.setattr(asyncio, "sleep", _no_wait(asyncio.sleep))
+
+        adapter = SimpleNamespace(handle_message=AsyncMock())
+        runner = self._real_runner(adapter)
+
+        await self._drive_watcher_once(runner)
+
+        assert adapter.handle_message.await_count == 2
+        texts = [
+            call.args[0].text for call in adapter.handle_message.await_args_list
+        ]
+        assert any("3 background processes completed" in t for t in texts)
+        assert any("2 background processes completed" in t for t in texts)
+        for i in range(3):
+            assert store.get_completion_record(f"proc_a_{i}")["delivery_state"] == "delivered"
+        for i in range(2):
+            assert store.get_completion_record(f"proc_b_{i}")["delivery_state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_failed_batch_delivery_releases_claims_and_retries_once_without_duplicating(
+        self, monkeypatch,
+    ):
+        """A rejected consolidated injection — the same failure mode a
+        self-post HTTP error produces — must leave every durable row pending,
+        retried as ONE batch on the next watcher pass, and delivered exactly
+        once with no duplicate after success."""
+        dying = self._seed_pending(
+            3, "agent:main:telegram:dm:99", "proc_fail",
+        )
+        del dying
+        _simulate_restart()
+
+        reborn = ProcessRegistry()
+        assert reborn.restore_pending_completions() == 3
+        monkeypatch.setattr("tools.process_registry.process_registry", reborn)
+        monkeypatch.setattr(asyncio, "sleep", _no_wait(asyncio.sleep))
+
+        adapter = SimpleNamespace(
+            handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
+        )
+        runner = self._real_runner(adapter)
+
+        await self._drive_watcher_once(runner)
+
+        # One failed consolidated attempt, one successful retry — never one
+        # call per process.
+        assert adapter.handle_message.await_count == 2
+        assert reborn.completion_queue.empty()
+        for i in range(3):
+            record = store.get_completion_record(f"proc_fail_{i}")
+            assert record is not None
+            assert record["delivery_state"] == "delivered"
