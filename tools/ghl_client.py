@@ -610,6 +610,7 @@ class GoHighLevelWriteClient:
         pinned: bool | None = None,
         userId: str | None = None,
         title: str | None = None,
+        redact_body_in_audit: bool = False,
     ) -> Any:
         """``PUT /contacts/{id}/notes/{noteId}``. Audited as an ``update``.
 
@@ -622,6 +623,16 @@ class GoHighLevelWriteClient:
         properties, ``pinned``, ``userId``, ``title``, and ``color`` are
         read from the pre-write ``before`` state and carried forward into
         the payload unless the caller supplies an explicit replacement.
+
+        *redact_body_in_audit*, when ``True``, replaces every present
+        supported body alias (``body``, ``bodyText``) with
+        :data:`REDACTED_NOTE_BODY_MARKER` in BOTH the pre-write audit
+        ``before`` snapshot and the post-write audit ``after`` snapshot --
+        the same marker create_note() uses. The real pre-write object (used
+        for the carry-forward payload above) and the actual PUT body/
+        read-back returned to the caller are unaffected; only what reaches
+        the write-audit log is redacted. Defaults to ``False`` so every
+        existing caller is byte-behavior unchanged.
         """
         self._require_contact_in_scope(contact_id)
         require_trigger(trigger)
@@ -633,8 +644,9 @@ class GoHighLevelWriteClient:
         before = _unwrap_note(
             self._call("GET", f"/contacts/{contact_id}/notes/{note_id}")
         )
+        audit_before = _redact_note_body_for_audit(before) if redact_body_in_audit else before
         authorized = self._authorize(
-            operation="update", record_id=note_id, before=before, trigger=trigger
+            operation="update", record_id=note_id, before=audit_before, trigger=trigger
         )
 
         before_state = before if isinstance(before, dict) else {}
@@ -652,8 +664,9 @@ class GoHighLevelWriteClient:
         )
 
         after, after_fetch_failed = self._fetch_note_after(contact_id, note_id)
+        audit_after = _redact_note_body_for_audit(after) if redact_body_in_audit else after
         authorized.record_outcome(
-            record_id=note_id, after=after, after_fetch_failed=after_fetch_failed
+            record_id=note_id, after=audit_after, after_fetch_failed=after_fetch_failed
         )
         return after if not after_fetch_failed else updated
 

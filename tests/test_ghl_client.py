@@ -1316,3 +1316,215 @@ class TestCreateNoteAuditRedactionBodyTextAlias:
         assert outcome["after"]["title"] == SENTINEL_NOTE_BODYTEXT["title"]
         assert outcome["after"]["color"] == SENTINEL_NOTE_BODYTEXT["color"]
         assert outcome["after"]["contactId"] == SENTINEL_NOTE_BODYTEXT["contactId"]
+
+
+# ── OPS-75 v2 privacy correction: update_note(redact_body_in_audit=True) ─────
+
+
+SENTINEL_UPDATE_BEFORE_BODY = "SENTINEL-imsg-update-before-a1b2"
+SENTINEL_UPDATE_AFTER_BODY = "SENTINEL-imsg-update-after-c3d4"
+SENTINEL_UPDATE_NOTE_BEFORE = {
+    "id": "note-1",
+    "contactId": "g-1",
+    "body": SENTINEL_UPDATE_BEFORE_BODY,
+    "userId": "user-123",
+    "title": "iMessage · Received",
+    "pinned": True,
+    "color": "#f2f4f7",
+}
+SENTINEL_UPDATE_NOTE_AFTER = {**SENTINEL_UPDATE_NOTE_BEFORE, "body": SENTINEL_UPDATE_AFTER_BODY}
+
+
+def route_update_sentinel_note(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route(
+        "GET", f"/contacts/{contact_id}/notes/note-1",
+        {"note": SENTINEL_UPDATE_NOTE_BEFORE}, {"note": SENTINEL_UPDATE_NOTE_AFTER},
+    )
+    transport.route("PUT", f"/contacts/{contact_id}/notes/note-1", {"note": SENTINEL_UPDATE_NOTE_AFTER})
+
+
+class TestUpdateNoteAuditRedaction:
+    """OPS-75 v2 privacy correction: update_note(..., redact_body_in_audit=True)
+    keeps the real pre-write object (for PUT carry-forward), the actual PUT
+    body, and the read-back exact, but writes a fixed marker in place of the
+    body on BOTH the audit *intent* (before) and *outcome* (before/after)
+    lines -- never the message text itself, never derived from it."""
+
+    def test_sentinel_reaches_the_real_put_body(self, transport, log_dir) -> None:
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        put = [c for c in transport.writes if c.method == "PUT"][0]
+        assert put.json_body["body"] == SENTINEL_UPDATE_AFTER_BODY
+
+    def test_sentinel_present_in_native_read_back(self, transport, log_dir) -> None:
+        route_update_sentinel_note(transport)
+        updated = client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        assert updated["body"] == SENTINEL_UPDATE_AFTER_BODY
+
+    def test_sentinel_never_appears_in_audit_log_bytes(self, transport, log_dir) -> None:
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        raw = raw_log_bytes(log_dir)
+        assert raw, "expected audit lines to have been written"
+        assert SENTINEL_UPDATE_BEFORE_BODY.encode("utf-8") not in raw
+        assert SENTINEL_UPDATE_AFTER_BODY.encode("utf-8") not in raw
+
+    def test_audit_intent_before_body_is_the_fixed_marker(self, transport, log_dir) -> None:
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        intent = [e for e in entries(log_dir) if e["audit_phase"] == "intent"]
+        assert len(intent) == 1
+        assert intent[0]["before"]["body"] == REDACTED_NOTE_BODY_MARKER
+
+    def test_audit_outcome_before_and_after_body_are_the_fixed_marker(
+        self, transport, log_dir
+    ) -> None:
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["before"]["body"] == REDACTED_NOTE_BODY_MARKER
+        assert outcome["after"]["body"] == REDACTED_NOTE_BODY_MARKER
+        assert REDACTED_NOTE_BODY_MARKER not in (SENTINEL_UPDATE_BEFORE_BODY, SENTINEL_UPDATE_AFTER_BODY)
+
+    def test_audit_outcome_preserves_non_body_metadata(self, transport, log_dir) -> None:
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["record_id"] == "note-1"
+        assert outcome["after"]["title"] == SENTINEL_UPDATE_NOTE_AFTER["title"]
+        assert outcome["after"]["color"] == SENTINEL_UPDATE_NOTE_AFTER["color"]
+        assert outcome["after"]["userId"] == SENTINEL_UPDATE_NOTE_AFTER["userId"]
+        assert outcome["after"]["pinned"] == SENTINEL_UPDATE_NOTE_AFTER["pinned"]
+
+    def test_real_before_object_still_drives_put_carry_forward(
+        self, transport, log_dir
+    ) -> None:
+        """Even though the audit before snapshot is redacted, the actual PUT
+        payload must still carry forward userId/title/pinned/color from the
+        REAL pre-write object -- redaction must never leak into business
+        logic."""
+        route_update_sentinel_note(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        put = [c for c in transport.writes if c.method == "PUT"][0]
+        assert put.json_body["userId"] == SENTINEL_UPDATE_NOTE_BEFORE["userId"]
+        assert put.json_body["title"] == SENTINEL_UPDATE_NOTE_BEFORE["title"]
+        assert put.json_body["pinned"] == SENTINEL_UPDATE_NOTE_BEFORE["pinned"]
+        assert put.json_body["color"] == SENTINEL_UPDATE_NOTE_BEFORE["color"]
+
+    def test_redaction_does_not_affect_the_object_returned_to_the_caller(
+        self, transport, log_dir
+    ) -> None:
+        route_update_sentinel_note(transport)
+        updated = client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        assert updated == SENTINEL_UPDATE_NOTE_AFTER
+
+    def test_default_false_preserves_existing_update_note_audit_behavior(
+        self, transport, log_dir
+    ) -> None:
+        """Default (no redact_body_in_audit kwarg) must record the real
+        before/after bodies -- the exact pre-existing update_note behavior
+        this build must not change."""
+        route_update_note_full(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["before"]["body"] == NOTE_BEFORE_FULL["body"]
+        assert outcome["after"]["body"] == NOTE_UPDATED_BODY
+
+    def test_explicit_false_is_the_same_as_omitting_the_kwarg(
+        self, transport, log_dir
+    ) -> None:
+        route_update_note_full(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", NOTE_UPDATED_BODY, trigger=TRIGGER,
+            redact_body_in_audit=False,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["before"]["body"] == NOTE_BEFORE_FULL["body"]
+        assert outcome["after"]["body"] == NOTE_UPDATED_BODY
+
+
+SENTINEL_UPDATE_NOTE_BEFORE_BODYTEXT = {
+    "id": "note-1",
+    "contactId": "g-1",
+    "bodyText": SENTINEL_UPDATE_BEFORE_BODY,
+    "title": "iMessage · Received",
+    "color": "#f2f4f7",
+}
+SENTINEL_UPDATE_NOTE_AFTER_BODYTEXT = {
+    **SENTINEL_UPDATE_NOTE_BEFORE_BODYTEXT, "bodyText": SENTINEL_UPDATE_AFTER_BODY,
+}
+
+
+def route_update_sentinel_note_bodytext(transport: SpyTransport, contact_id: str = "g-1") -> None:
+    """Same native ``bodyText`` read-back shape as
+    route_create_sentinel_note_bodytext(), for update_note()."""
+    in_scope = {**CONTACT_BEFORE, "id": contact_id, "locationId": LOCATION_ID}
+    transport.route("GET", f"/contacts/{contact_id}", {"contact": in_scope})
+    transport.route(
+        "GET", f"/contacts/{contact_id}/notes/note-1",
+        {"note": SENTINEL_UPDATE_NOTE_BEFORE_BODYTEXT}, {"note": SENTINEL_UPDATE_NOTE_AFTER_BODYTEXT},
+    )
+    transport.route(
+        "PUT", f"/contacts/{contact_id}/notes/note-1", {"note": SENTINEL_UPDATE_NOTE_AFTER_BODYTEXT}
+    )
+
+
+class TestUpdateNoteAuditRedactionBodyTextAlias:
+    def test_audit_before_and_after_bodytext_are_the_fixed_marker(
+        self, transport, log_dir
+    ) -> None:
+        route_update_sentinel_note_bodytext(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        outcome = outcome_entry(log_dir)
+        assert outcome["before"]["bodyText"] == REDACTED_NOTE_BODY_MARKER
+        assert outcome["after"]["bodyText"] == REDACTED_NOTE_BODY_MARKER
+
+    def test_native_read_back_keeps_the_exact_bodytext(self, transport, log_dir) -> None:
+        route_update_sentinel_note_bodytext(transport)
+        updated = client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        assert updated["bodyText"] == SENTINEL_UPDATE_AFTER_BODY
+
+    def test_sentinel_never_appears_in_audit_log_bytes(self, transport, log_dir) -> None:
+        route_update_sentinel_note_bodytext(transport)
+        client(transport, log_dir).update_note(
+            "g-1", "note-1", SENTINEL_UPDATE_AFTER_BODY, trigger=TRIGGER,
+            redact_body_in_audit=True,
+        )
+        raw = raw_log_bytes(log_dir)
+        assert raw, "expected audit lines to have been written"
+        assert SENTINEL_UPDATE_BEFORE_BODY.encode("utf-8") not in raw
+        assert SENTINEL_UPDATE_AFTER_BODY.encode("utf-8") not in raw

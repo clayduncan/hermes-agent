@@ -16,7 +16,8 @@ plus the write-audit trigger, never in the visible note body. This module
 writes no event marker, hidden field, zero-width character, HTML comment,
 or encoded identifier into a note -- GHL's notes API exposes no supported
 hidden metadata field, and this module never pretends otherwise by hiding
-one in visible text. Idempotency on retry is anchored purely on the local
+one in visible text, and never scans note bodies to recover from lost
+local state. Idempotency on retry is anchored purely on the local
 note_mirror row: a ``complete`` row's note id is read back and verified
 before this module ever reports "no write needed" and skips create.
 
@@ -29,6 +30,23 @@ creates a second note. This is a structural limit of GHL's note API, not a
 bug here -- recoverability depends entirely on the durability of local
 state, so that state (and its backups) must be protected accordingly.
 
+That said, this is not the retry path an ordinary collector re-run takes.
+The primary retry barrier is one level upstream of this module: a
+newly-admitted ledger event is mirrored only when
+``ledger_result.genuine_insert`` is true (see collectors/
+imessage_collector.py), and ``genuine_insert`` reflects the activity
+ledger's own ``UNIQUE(source, source_event_id)`` insert -- which already
+landed durably before this module's create_note POST was even attempted.
+So a successful GHL POST followed by an interruption before the
+note_mirror write completes still cannot create a second note on an
+ordinary collector retry: the ledger row already exists, the retry's
+insert is a no-op (``genuine_insert=False``), and mirror_message_event is
+never called for it. Only the simultaneous loss of *all* local state --
+both the ledger's row and the note_mirror row (and their backups) -- loses
+this dedupe/provenance guarantee; a lone lost note_mirror row with the
+ledger row intact never causes a second note on retry, since retry never
+reaches this module for that event again.
+
 Note bodies carry exactly one plain line: direction, answered/missed
 status, and duration -- the only call metadata Clay has authorized for
 visible note text. Never a raw phone number, email, Apple handle,
@@ -39,15 +57,14 @@ Every phone-call note this module creates uses the fixed light-green
 CALL_NOTE_COLOR -- Clay requires all call notes, mirrored or pre-existing,
 to be visually distinct by that one color.
 
-OPS-75 iMessage lane (mirror_message_event): unlike the call lane above,
-this lane writes a deterministic, visible marker
-(``imessage_note_marker``) into the note body, derived only from the
-ledger's own non-reversible event_id -- never from a raw handle. This is a
-narrow, additive exception scoped only to mirror_message_event: it exists
-so a lost local note_mirror row can still be recovered by searching GHL
-note bodies for the marker (see mirror_message_event's pre-POST marker
-search) before ever falling back to create -- something the call lane
-above still cannot do, and does not attempt to.
+OPS-75 iMessage lane (mirror_message_event): the note body is the exact
+source message text and nothing else -- no marker, no timestamp, no
+source label (see format_imessage_note_body). The source message's own
+timestamp instead drives the note *title* (format_imessage_note_title),
+converted to America/Chicago with the stdlib zoneinfo module so the
+printed time is correct across both CDT and CST. Sent/Received each use a
+fixed, exact GHL native color (see IMESSAGE_SENT_COLOR/
+IMESSAGE_RECEIVED_COLOR below) instead of the call lane's single green.
 
 Clay approved the message text for the GHL note body only, never for the
 local write-audit log. mirror_message_event's create_note call therefore
@@ -62,8 +79,9 @@ from __future__ import annotations
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
@@ -74,20 +92,34 @@ GHL_APP_BASE_URL = "https://app.gohighlevel.com"
 
 #: Clay requires every phone-call note (mirrored and pre-existing) to use
 #: this fixed light-green GHL note color. This is the only color this
-#: module ever writes.
+#: module ever writes for the call lane.
 CALL_NOTE_COLOR = "#D9EAD3"
 
 _DIRECTION_LABELS = {"inbound": "Incoming", "outbound": "Outgoing"}
 
-#: iMessage lane: title/color pair depends only on direction (is_from_me).
-IMESSAGE_SENT_TITLE = "iMessage · Sent"
-IMESSAGE_RECEIVED_TITLE = "iMessage · Received"
-IMESSAGE_SENT_COLOR = "#007AFF"
-IMESSAGE_RECEIVED_COLOR = "#8E8E93"
+#: iMessage lane: exact live GHL native colors, sourced from Clay's own
+#: hand-edited Note (blue-100, sent) and GHL's published Storybook color
+#: palette (gray-100, received) -- never a substitute gray/blue.
+IMESSAGE_SENT_COLOR = "#d1e9ff"
+IMESSAGE_RECEIVED_COLOR = "#f2f4f7"
+
+#: The source message timestamp is always rendered in this fixed zone,
+#: regardless of host locale/timezone, so DST is correct year-round.
+_IMESSAGE_TITLE_TZ = ZoneInfo("America/Chicago")
+
+#: Fixed English month abbreviations -- never strftime's locale-dependent
+#: %b, so the title text never depends on the host's configured locale.
+_MONTH_ABBREVIATIONS = (
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+)
 
 #: Outcomes that mean "no further action needed this run" -- a note exists
-#: (or now does) for this event. "recovered" is iMessage-lane only: the
-#: call lane's mirror_event() never produces it (see module docstring).
+#: (or now does) for this event. "recovered" is retained only for backward
+#: compatibility with existing callers (the collector, ingestion_runner)
+#: that still check for it; this module never produces it any more -- there
+#: is no marker to recover by (see module docstring), so every call either
+#: takes the local-state fast path, creates, or errors.
 OK_OUTCOMES = frozenset({"created", "already_complete", "recovered"})
 
 
@@ -127,24 +159,39 @@ def format_note_body(
     return f"{direction_label} call · {status_label} · {_format_duration(duration_s)}"
 
 
-def imessage_note_marker(event_id: str) -> str:
-    """A deterministic, visible marker for one ledger event_id, derived only
-    from the ledger's own non-reversible event_id (sha256(source|
-    source_event_id) -- see activity_ledger._event_id) -- never from a raw
-    handle. iMessage lane only; see module docstring."""
-    return f"imsg-evt:{event_id[:16]}"
+def format_imessage_note_body(*, text: str) -> str:
+    """The note body is exactly the source iMessage text, written verbatim
+    -- only a leading/trailing whitespace strip (no truncation, no
+    escaping, no HTML). No timestamp, marker, source label, or any other
+    metadata; see the module docstring for the full contract."""
+    return text.strip()
 
 
-def format_imessage_note_body(*, text: str, occurred_at: datetime, marker: str) -> str:
-    """'{text}\\n\\n{compact_ts} · {marker}'. *text* is the exact original
-    message text, written verbatim (only a leading/trailing whitespace
-    strip -- no truncation, no escaping, no HTML), per the binding
-    contract for this lane. *compact_ts* is *occurred_at* in UTC formatted
-    '%Y-%m-%d %H:%M UTC'."""
-    if occurred_at.tzinfo is not None:
-        occurred_at = occurred_at.astimezone(timezone.utc)
-    compact_ts = occurred_at.strftime("%Y-%m-%d %H:%M UTC")
-    return f"{text.strip()}\n\n{compact_ts} · {marker}"
+def format_imessage_note_title(*, occurred_at: datetime, is_from_me: bool) -> str:
+    """'iMessage · <Sent|Received> · <Mon> <D> <YYYY>, <H>:<MM> <AM|PM>'.
+
+    *occurred_at* is the source message's own timestamp (never Note
+    creation time) and must be timezone-aware; it is converted to
+    America/Chicago with :mod:`zoneinfo` so the result is correct across
+    both CDT and CST. Month is an abbreviated English name, day has no
+    leading zero, hour is 12-hour without a leading zero, minutes are
+    always two digits, and AM/PM is uppercase -- all formatted by hand
+    (never strftime's locale-dependent %b/%I/%p) so the output never
+    depends on the host's locale.
+    """
+    if occurred_at.tzinfo is None:
+        raise ValueError(
+            "format_imessage_note_title() requires a timezone-aware occurred_at."
+        )
+    local = occurred_at.astimezone(_IMESSAGE_TITLE_TZ)
+    hour12 = local.hour % 12 or 12
+    period = "AM" if local.hour < 12 else "PM"
+    direction_label = "Sent" if is_from_me else "Received"
+    month_abbr = _MONTH_ABBREVIATIONS[local.month - 1]
+    return (
+        f"iMessage · {direction_label} · {month_abbr} {local.day} {local.year}, "
+        f"{hour12}:{local.minute:02d} {period}"
+    )
 
 
 @dataclass
@@ -162,13 +209,12 @@ class NoteMirror:
     it never guesses at admission and is never called for a non-admitted
     event.
 
-    Dedupe for mirror_event (the call lane) is anchored entirely on the
-    local note_mirror row keyed by event_id -- that lane never scans GHL
-    note bodies for a marker (it writes none), so there is nothing there to
-    scan for; see the module docstring for the resulting recovery
-    limitation if local state is lost. mirror_message_event (the iMessage
-    lane) is the one exception: it writes a marker and scans for it, so a
-    lost local row is still recoverable there.
+    Dedupe for both mirror_event (the call lane) and mirror_message_event
+    (the iMessage lane) is anchored entirely on the local note_mirror row
+    keyed by event_id -- neither lane scans GHL note bodies for a marker;
+    see the module docstring for the resulting recovery limitation if
+    local state is lost, and why an ordinary collector retry still cannot
+    create a duplicate note.
     """
 
     def __init__(self, ghl_client: Any, state_db: Any) -> None:
@@ -207,65 +253,20 @@ class NoteMirror:
         is_from_me: bool,
         trigger: str,
     ) -> MirrorResult:
-        """OPS-75 iMessage lane. See module docstring for how this differs
-        from mirror_event: a visible marker is written into the body so a
-        lost local note_mirror row can still be recovered by searching GHL
-        before this ever falls back to create."""
+        """OPS-75 iMessage lane. See module docstring for the exact body/
+        title/color contract and why there is no marker-search recovery
+        path here."""
         existing = self._state_db.get_note_mirror(event_id)
         if existing is not None and existing.status == "complete" and existing.note_id:
             return self._verify_existing(existing.note_id, contact_id)
 
-        marker = imessage_note_marker(event_id)
-        recovered = self._recover_by_marker(event_id, contact_id, marker)
-        if recovered is not None:
-            return recovered
-
-        title = IMESSAGE_SENT_TITLE if is_from_me else IMESSAGE_RECEIVED_TITLE
+        title = format_imessage_note_title(occurred_at=occurred_at, is_from_me=is_from_me)
         color = IMESSAGE_SENT_COLOR if is_from_me else IMESSAGE_RECEIVED_COLOR
-        body = format_imessage_note_body(text=text, occurred_at=occurred_at, marker=marker)
+        body = format_imessage_note_body(text=text)
         return self._create_and_verify(
             event_id=event_id, contact_id=contact_id, body=body, trigger=trigger,
             color=color, title=title, redact_body_in_audit=True,
         )
-
-    def _recover_by_marker(
-        self, event_id: str, contact_id: str, marker: str
-    ) -> MirrorResult | None:
-        """Scan existing GHL notes for *marker* before ever creating a new
-        one. Returns ``None`` (proceed to create) iff no matching note was
-        found; otherwise a terminal MirrorResult ('recovered' or 'error')."""
-        try:
-            notes = self._ghl.list_notes(contact_id)
-        except Exception as exc:
-            log.error("note_mirror: marker search failed [%s]", type(exc).__name__)
-            return MirrorResult(outcome="error")
-
-        match_id = None
-        for note in notes:
-            note_body = note.get("body") if isinstance(note, dict) else None
-            if isinstance(note_body, str) and marker in note_body:
-                match_id = note.get("id")
-                break
-        if not match_id:
-            return None
-
-        try:
-            readback = self._ghl.get_note(contact_id, match_id)
-        except Exception as exc:
-            log.error("note_mirror: marker-matched read-back failed [%s]", type(exc).__name__)
-            return MirrorResult(outcome="error", note_id=match_id)
-        if not isinstance(readback, dict) or not readback.get("id"):
-            log.error("note_mirror: marker-matched note no longer resolves")
-            return MirrorResult(outcome="error", note_id=match_id)
-
-        readback_body = readback.get("body")
-        content_hash = hashlib.sha256(
-            (readback_body if isinstance(readback_body, str) else "").encode("utf-8")
-        ).hexdigest()
-        self._state_db.mark_note_mirror_complete(
-            event_id, contact_id=contact_id, note_id=match_id, content_hash=content_hash,
-        )
-        return MirrorResult(outcome="recovered", note_id=match_id)
 
     def _create_and_verify(
         self,
@@ -345,14 +346,12 @@ __all__ = [
     "CALL_NOTE_COLOR",
     "GHL_APP_BASE_URL",
     "IMESSAGE_RECEIVED_COLOR",
-    "IMESSAGE_RECEIVED_TITLE",
     "IMESSAGE_SENT_COLOR",
-    "IMESSAGE_SENT_TITLE",
     "OK_OUTCOMES",
     "MirrorResult",
     "NoteMirror",
     "contact_detail_url",
     "format_imessage_note_body",
+    "format_imessage_note_title",
     "format_note_body",
-    "imessage_note_marker",
 ]
