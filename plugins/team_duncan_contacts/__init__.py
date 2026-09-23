@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 from .ingestion_state_db import SOURCE_DESK_CALL
 
@@ -246,8 +247,18 @@ def _build_plaud_summary_runner_factory(hermes_home: Path, registry, ghl_reader)
     return _factory
 
 
-def register(ctx) -> None:
-    """Plugin entry point: called by the Hermes plugin loader."""
+def build_registry_and_reader(
+    hermes_home: Path,
+) -> tuple[Any, Any, str] | tuple[None, None, None]:
+    """Construct the exact (ContactRegistry, ghl_reader, location_id) triple
+    the interactive plugin registration builds below, so ``register()`` and
+    the OPS-114 automation entry point (``automation_runner.py``, which is
+    never an agent tool and never touches ``ctx.register_tool``) share one
+    construction path instead of two that could drift. Returns
+    ``(None, None, None)`` and logs iff config, startup validation, or the
+    GHL reader build fails -- the same failure semantics ``register()`` has
+    always had.
+    """
     location_id = _load_location_id()
     if not location_id:
         log.warning(
@@ -255,20 +266,10 @@ def register(ctx) -> None:
             "plugins.entries.team_duncan_contacts.settings.location_id. "
             "Plugin tools will not be registered."
         )
-        return
+        return None, None, None
 
-    from hermes_constants import get_hermes_home
     from .registry import ContactRegistry
-    from .tools import (
-        PREPARE_ACTIVATION_SCHEMA,
-        CONFIRM_ACTIVATION_SCHEMA,
-        SET_IMESSAGE_ACTIVATION_SCHEMA,
-        make_prepare_handler,
-        make_confirm_handler,
-        make_set_imessage_activation_handler,
-    )
 
-    hermes_home = get_hermes_home()
     registry = ContactRegistry(hermes_home, team_duncan_location_id=location_id)
 
     try:
@@ -279,7 +280,7 @@ def register(ctx) -> None:
             "Plugin tools will not be registered.",
             type(exc).__name__,
         )
-        return
+        return None, None, None
 
     try:
         ghl_reader = _build_live_ghl_reader(location_id)
@@ -289,7 +290,28 @@ def register(ctx) -> None:
             "Plugin tools will not be registered.",
             type(exc).__name__,
         )
+        return None, None, None
+
+    return registry, ghl_reader, location_id
+
+
+def register(ctx) -> None:
+    """Plugin entry point: called by the Hermes plugin loader."""
+    from hermes_constants import get_hermes_home
+
+    hermes_home = get_hermes_home()
+    registry, ghl_reader, location_id = build_registry_and_reader(hermes_home)
+    if registry is None:
         return
+
+    from .tools import (
+        PREPARE_ACTIVATION_SCHEMA,
+        CONFIRM_ACTIVATION_SCHEMA,
+        SET_IMESSAGE_ACTIVATION_SCHEMA,
+        make_prepare_handler,
+        make_confirm_handler,
+        make_set_imessage_activation_handler,
+    )
 
     from .activity_ledger import ActivityLedger
     import plugins.team_duncan_contacts as _self
@@ -353,8 +375,16 @@ def register(ctx) -> None:
         make_prepare_call_log_ingest_handler,
     )
 
+    from .process_lock import TeamDuncanLock
+
     ingestion_state_db = IngestionStateDb(data_dir / "ingestion_state.db")
     runner_factory = _build_ingestion_runner_factory(hermes_home, registry)
+
+    # OPS-114: the same durable mkdir lock the automation entry point uses,
+    # rooted at this same hermes_home. Every call gets a fresh instance over
+    # the same on-disk lock directory -- acquire()/release() are per-call,
+    # not per-process-lifetime.
+    lock_factory = lambda: TeamDuncanLock(hermes_home=hermes_home)  # noqa: E731
 
     ctx.register_tool(
         name="list_pending_call_reviews",
@@ -376,14 +406,14 @@ def register(ctx) -> None:
         name="confirm_call_log_ingest",
         toolset=_PLUGIN_NAME,
         schema=CONFIRM_CALL_LOG_INGEST_SCHEMA,
-        handler=make_confirm_call_log_ingest_handler(runner_factory),
+        handler=make_confirm_call_log_ingest_handler(runner_factory, lock_factory),
         description=CONFIRM_CALL_LOG_INGEST_SCHEMA["function"]["description"],
     )
     ctx.register_tool(
         name="accept_call_log_ingest_run",
         toolset=_PLUGIN_NAME,
         schema=ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA,
-        handler=make_accept_call_log_ingest_run_handler(ingestion_state_db),
+        handler=make_accept_call_log_ingest_run_handler(ingestion_state_db, lock_factory),
         description=ACCEPT_CALL_LOG_INGEST_RUN_SCHEMA["function"]["description"],
     )
 
@@ -419,7 +449,7 @@ def register(ctx) -> None:
         name="confirm_plaud_summary_run",
         toolset=_PLUGIN_NAME,
         schema=CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA,
-        handler=make_confirm_plaud_summary_run_handler(plaud_summary_runner_factory),
+        handler=make_confirm_plaud_summary_run_handler(plaud_summary_runner_factory, lock_factory),
         description=CONFIRM_PLAUD_SUMMARY_RUN_SCHEMA["function"]["description"],
     )
 

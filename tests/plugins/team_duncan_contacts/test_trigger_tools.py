@@ -22,6 +22,7 @@ from plugins.team_duncan_contacts.ghl_reader import FakeGhlReader
 from plugins.team_duncan_contacts.ingestion_state_db import IngestionStateDb
 from plugins.team_duncan_contacts.plaud_note_writer import PlaudSummaryNoteWriter
 from plugins.team_duncan_contacts.plaud_summary_runner import PlaudSummaryRunner
+from plugins.team_duncan_contacts.process_lock import TeamDuncanLock
 from plugins.team_duncan_contacts.registry import ContactRegistry
 from plugins.team_duncan_contacts.activity_ledger import ActivityLedger
 from plugins.team_duncan_contacts.tools import (
@@ -86,6 +87,19 @@ def _clear_cron_env(monkeypatch):
 @pytest.fixture()
 def clock() -> _Clock:
     return _Clock(datetime(2026, 1, 1, tzinfo=timezone.utc))
+
+
+@pytest.fixture()
+def lock_factory(tmp_path: Path):
+    """Fresh TeamDuncanLock instances over one temp-dir lock directory --
+    never the real ~/.hermes -- shared across a test's handler calls,
+    mirroring the production wiring in __init__.py::register()."""
+    lock_dir = tmp_path / "cron" / "locks" / "team-duncan-automation.lock"
+
+    def _factory() -> TeamDuncanLock:
+        return TeamDuncanLock(lock_dir=lock_dir)
+
+    return _factory
 
 
 @pytest.fixture()
@@ -178,9 +192,9 @@ def test_prepare_reports_only_configured_enabled_sources(state_db) -> None:
     assert "plaud" not in result["sources"]
 
 
-def test_prepare_rejects_when_unaccepted_run_outstanding(state_db, runner_factory) -> None:
+def test_prepare_rejects_when_unaccepted_run_outstanding(state_db, runner_factory, lock_factory) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
 
     prep = json.loads(prepare_handler({}))
     confirm = json.loads(confirm_handler({"token": prep["token"]}))
@@ -194,12 +208,12 @@ def test_prepare_rejects_when_unaccepted_run_outstanding(state_db, runner_factor
 
 # --- confirm_call_log_ingest ---------------------------------------------------
 
-def test_confirm_rejects_cron_context(state_db, runner_factory, monkeypatch) -> None:
+def test_confirm_rejects_cron_context(state_db, runner_factory, lock_factory, monkeypatch) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
     prep = json.loads(prepare_handler({}))
 
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
     result = json.loads(confirm_handler({"token": prep["token"]}))
     assert result["status"] == "rejected"
     assert result["reason"] == "cron_context"
@@ -210,9 +224,9 @@ def test_confirm_rejects_cron_context(state_db, runner_factory, monkeypatch) -> 
     assert result2["status"] == "awaiting_acceptance"
 
 
-def test_confirm_token_single_use_and_expiring(state_db, runner_factory) -> None:
+def test_confirm_token_single_use_and_expiring(state_db, runner_factory, lock_factory) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
 
     prep = json.loads(prepare_handler({}))
     first = json.loads(confirm_handler({"token": prep["token"]}))
@@ -225,16 +239,16 @@ def test_confirm_token_single_use_and_expiring(state_db, runner_factory) -> None
     assert second["reason"] == "token_not_found_or_expired"
 
 
-def test_confirm_rejects_garbage_token(state_db, runner_factory) -> None:
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+def test_confirm_rejects_garbage_token(state_db, runner_factory, lock_factory) -> None:
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
     result = json.loads(confirm_handler({"token": "not-a-real-token"}))
     assert result["status"] == "rejected"
     assert result["reason"] == "token_not_found_or_expired"
 
 
-def test_confirm_valid_token_invokes_desk_exactly_once(state_db, runner_factory) -> None:
+def test_confirm_valid_token_invokes_desk_exactly_once(state_db, runner_factory, lock_factory) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
 
     prep = json.loads(prepare_handler({}))
     result = json.loads(confirm_handler({"token": prep["token"]}))
@@ -243,10 +257,10 @@ def test_confirm_valid_token_invokes_desk_exactly_once(state_db, runner_factory)
 
 
 def test_confirm_invalid_expired_reused_cron_invoke_desk_zero_times(
-    state_db, runner_factory, clock, monkeypatch
+    state_db, runner_factory, lock_factory, clock, monkeypatch
 ) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
     desk_transport = runner_factory.desk_transport
 
     # Invalid (garbage) token.
@@ -284,23 +298,23 @@ def test_confirm_invalid_expired_reused_cron_invoke_desk_zero_times(
 
 # --- accept_call_log_ingest_run -------------------------------------------------
 
-def test_accept_rejects_cron_context(state_db, runner_factory, monkeypatch) -> None:
+def test_accept_rejects_cron_context(state_db, runner_factory, lock_factory, monkeypatch) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
     prep = json.loads(prepare_handler({}))
     confirm = json.loads(confirm_handler({"token": prep["token"]}))
 
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    accept_handler = make_accept_call_log_ingest_run_handler(state_db)
+    accept_handler = make_accept_call_log_ingest_run_handler(state_db, lock_factory)
     result = json.loads(accept_handler({"run_id": confirm["run_id"]}))
     assert result["status"] == "rejected"
     assert result["reason"] == "cron_context"
 
 
-def test_accept_unblocks_next_prepare(state_db, runner_factory) -> None:
+def test_accept_unblocks_next_prepare(state_db, runner_factory, lock_factory) -> None:
     prepare_handler = make_prepare_call_log_ingest_handler(state_db)
-    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory)
-    accept_handler = make_accept_call_log_ingest_run_handler(state_db)
+    confirm_handler = make_confirm_call_log_ingest_handler(runner_factory, lock_factory)
+    accept_handler = make_accept_call_log_ingest_run_handler(state_db, lock_factory)
 
     prep = json.loads(prepare_handler({}))
     confirm = json.loads(confirm_handler({"token": prep["token"]}))
@@ -315,8 +329,8 @@ def test_accept_unblocks_next_prepare(state_db, runner_factory) -> None:
     assert unblocked["status"] == "ready_for_confirmation"
 
 
-def test_accept_rejects_unknown_run_id(state_db) -> None:
-    accept_handler = make_accept_call_log_ingest_run_handler(state_db)
+def test_accept_rejects_unknown_run_id(state_db, lock_factory) -> None:
+    accept_handler = make_accept_call_log_ingest_run_handler(state_db, lock_factory)
     result = json.loads(accept_handler({"run_id": "not-a-real-run"}))
     assert result["status"] == "rejected"
     assert result["reason"] == "run_not_found_or_already_accepted"
@@ -386,12 +400,12 @@ def test_prepare_plaud_summary_run_issues_token(state_db) -> None:
 
 
 def test_confirm_plaud_summary_run_rejects_cron_context(
-    state_db, plaud_runner_factory, monkeypatch
+    state_db, plaud_runner_factory, lock_factory, monkeypatch
 ) -> None:
     prep = json.loads(make_prepare_plaud_summary_run_handler(state_db)({}))
 
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")
-    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory, lock_factory)
     result = json.loads(confirm_handler({"token": prep["token"]}))
     assert result["status"] == "rejected"
     assert result["reason"] == "cron_context"
@@ -403,10 +417,10 @@ def test_confirm_plaud_summary_run_rejects_cron_context(
 
 
 def test_confirm_plaud_summary_run_token_single_use_and_expiring(
-    state_db, plaud_runner_factory, clock
+    state_db, plaud_runner_factory, lock_factory, clock
 ) -> None:
     prepare_handler = make_prepare_plaud_summary_run_handler(state_db)
-    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory, lock_factory)
 
     prep = json.loads(prepare_handler({}))
     first = json.loads(confirm_handler({"token": prep["token"]}))
@@ -426,18 +440,20 @@ def test_confirm_plaud_summary_run_token_single_use_and_expiring(
     assert expired["reason"] == "token_not_found_or_expired"
 
 
-def test_confirm_plaud_summary_run_rejects_garbage_token(state_db, plaud_runner_factory) -> None:
-    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+def test_confirm_plaud_summary_run_rejects_garbage_token(
+    state_db, plaud_runner_factory, lock_factory
+) -> None:
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory, lock_factory)
     result = json.loads(confirm_handler({"token": "not-a-real-token"}))
     assert result["status"] == "rejected"
     assert result["reason"] == "token_not_found_or_expired"
 
 
 def test_confirm_plaud_summary_run_with_zero_records_never_touches_ghl(
-    state_db, plaud_runner_factory
+    state_db, plaud_runner_factory, lock_factory
 ) -> None:
     prep = json.loads(make_prepare_plaud_summary_run_handler(state_db)({}))
-    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory)
+    confirm_handler = make_confirm_plaud_summary_run_handler(plaud_runner_factory, lock_factory)
     result = json.loads(confirm_handler({"token": prep["token"]}))
     assert result["status"] == "completed"
     assert result["errors"] == 0

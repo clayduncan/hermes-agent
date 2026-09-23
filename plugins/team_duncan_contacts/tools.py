@@ -411,10 +411,14 @@ def make_prepare_call_log_ingest_handler(
     return prepare_call_log_ingest
 
 
-def make_confirm_call_log_ingest_handler(runner_factory):
+def make_confirm_call_log_ingest_handler(runner_factory, lock_factory):
     """*runner_factory* returns a fresh IngestionRunner (and its state_db)
     each call, so nothing here holds a live transport reference at plugin
-    load time."""
+    load time. *lock_factory* returns a fresh TeamDuncanLock instance over
+    the same OPS-114 durable lock directory an automated run would use
+    (see process_lock.py): a live-owner collision with an in-progress
+    automated run is a clean rejection, the token is left unconsumed so the
+    caller can retry within its TTL, and Desk is never touched."""
 
     def confirm_call_log_ingest(args: dict[str, Any], **_: Any) -> str:
         if _is_cron_session():
@@ -424,19 +428,34 @@ def make_confirm_call_log_ingest_handler(runner_factory):
             )
         token = str(args.get("token") or "")
         try:
-            runner, state_db = runner_factory()
-            if not state_db.consume_confirmation_token(token):
+            lock = lock_factory()
+            lock_result = lock.acquire(mode="desk-confirm-interactive")
+            if not lock_result.acquired:
                 return json.dumps(
                     {
                         "status": "rejected",
-                        "reason": "token_not_found_or_expired",
-                        "message": "Confirmation token not found, expired, or already used.",
+                        "reason": "automation_lock_active",
+                        "message": (
+                            "An automated ingestion run is in progress. Try again shortly."
+                        ),
                     }
                 )
-            summary = runner.run(token=token)
-            result = summary.to_dict()
-            result["status"] = "awaiting_acceptance"
-            return json.dumps(result, ensure_ascii=False, default=str)
+            try:
+                runner, state_db = runner_factory()
+                if not state_db.consume_confirmation_token(token):
+                    return json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason": "token_not_found_or_expired",
+                            "message": "Confirmation token not found, expired, or already used.",
+                        }
+                    )
+                summary = runner.run(token=token)
+                result = summary.to_dict()
+                result["status"] = "awaiting_acceptance"
+                return json.dumps(result, ensure_ascii=False, default=str)
+            finally:
+                lock.release()
         except Exception as exc:
             log.error("confirm_call_log_ingest internal error [%s]", type(exc).__name__)
             return json.dumps({"status": "error", "message": "An internal error occurred."})
@@ -444,7 +463,7 @@ def make_confirm_call_log_ingest_handler(runner_factory):
     return confirm_call_log_ingest
 
 
-def make_accept_call_log_ingest_run_handler(state_db):
+def make_accept_call_log_ingest_run_handler(state_db, lock_factory):
     def accept_call_log_ingest_run(args: dict[str, Any], **_: Any) -> str:
         if _is_cron_session():
             return json.dumps(
@@ -453,16 +472,31 @@ def make_accept_call_log_ingest_run_handler(state_db):
             )
         run_id = str(args.get("run_id") or "")
         try:
-            accepted = state_db.accept_run(run_id)
-            if not accepted:
+            lock = lock_factory()
+            lock_result = lock.acquire(mode="desk-accept-interactive")
+            if not lock_result.acquired:
                 return json.dumps(
                     {
                         "status": "rejected",
-                        "reason": "run_not_found_or_already_accepted",
-                        "message": "No awaiting-acceptance run matches that run_id.",
+                        "reason": "automation_lock_active",
+                        "message": (
+                            "An automated ingestion run is in progress. Try again shortly."
+                        ),
                     }
                 )
-            return json.dumps({"status": "accepted", "run_id": run_id})
+            try:
+                accepted = state_db.accept_run(run_id)
+                if not accepted:
+                    return json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason": "run_not_found_or_already_accepted",
+                            "message": "No awaiting-acceptance run matches that run_id.",
+                        }
+                    )
+                return json.dumps({"status": "accepted", "run_id": run_id})
+            finally:
+                lock.release()
         except Exception as exc:
             log.error("accept_call_log_ingest_run internal error [%s]", type(exc).__name__)
             return json.dumps({"status": "error", "message": "An internal error occurred."})
@@ -548,10 +582,13 @@ def make_prepare_plaud_summary_run_handler(state_db):
     return prepare_plaud_summary_run
 
 
-def make_confirm_plaud_summary_run_handler(runner_factory):
+def make_confirm_plaud_summary_run_handler(runner_factory, lock_factory):
     """*runner_factory* returns a fresh (PlaudSummaryRunner, state_db) pair
     each call, so nothing here holds a live transport or subprocess
-    reference at plugin load time."""
+    reference at plugin load time. *lock_factory* returns a fresh
+    TeamDuncanLock instance over the same OPS-114 durable lock directory the
+    automated plaud-reconcile/plaud-webhook modes use: a live-owner
+    collision is a clean rejection with the token left unconsumed."""
 
     def confirm_plaud_summary_run(args: dict[str, Any], **_: Any) -> str:
         if _is_cron_session():
@@ -561,19 +598,34 @@ def make_confirm_plaud_summary_run_handler(runner_factory):
             )
         token = str(args.get("token") or "")
         try:
-            runner, state_db = runner_factory()
-            if not state_db.consume_confirmation_token(token):
+            lock = lock_factory()
+            lock_result = lock.acquire(mode="plaud-confirm-interactive")
+            if not lock_result.acquired:
                 return json.dumps(
                     {
                         "status": "rejected",
-                        "reason": "token_not_found_or_expired",
-                        "message": "Confirmation token not found, expired, or already used.",
+                        "reason": "automation_lock_active",
+                        "message": (
+                            "An automated Plaud run is in progress. Try again shortly."
+                        ),
                     }
                 )
-            summary = runner.run(token=token)
-            result = summary.to_dict()
-            result["status"] = "completed"
-            return json.dumps(result, ensure_ascii=False, default=str)
+            try:
+                runner, state_db = runner_factory()
+                if not state_db.consume_confirmation_token(token):
+                    return json.dumps(
+                        {
+                            "status": "rejected",
+                            "reason": "token_not_found_or_expired",
+                            "message": "Confirmation token not found, expired, or already used.",
+                        }
+                    )
+                summary = runner.run(token=token)
+                result = summary.to_dict()
+                result["status"] = "completed"
+                return json.dumps(result, ensure_ascii=False, default=str)
+            finally:
+                lock.release()
         except Exception as exc:
             log.error("confirm_plaud_summary_run internal error [%s]", type(exc).__name__)
             return json.dumps({"status": "error", "message": "An internal error occurred."})

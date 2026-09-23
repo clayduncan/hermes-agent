@@ -778,3 +778,126 @@ class TestVisibleBodyIsClaudesLabeledSummaryLines:
         assert row.error_class is None
         assert row.note_id is not None
 
+
+class TestProcessOneWebhookPath:
+    """OPS-114: process_one is the point-lookup path the Plaud webhook
+    receiver drives. It never touches SOURCE_CURSOR_KEY (the reconciliation
+    scan frontier) and is idempotent via the same plaud_summary_state
+    terminal check `run()` uses."""
+
+    def test_matched_admitted_recording_produces_exactly_one_note(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        contact_id = "c-1"
+        _activate(registry, CANARY_PHONE, contact_id)
+        clock.advance(hours=1)
+
+        zdate = utc_to_apple_epoch(datetime(2026, 9, 17, 20, 24, 30, tzinfo=timezone.utc))
+        desk_rows = [_desk_row(zdate, CANARY_PHONE, zduration=1306)]
+        plaud_records = [_plaud_record("rec-1", start_time="2026-09-17T20:22:59+00:00")]
+        ghl_contacts = [{"id": contact_id, "locationId": TEAM_DUNCAN_LOCATION_ID,
+                          "firstName": "Cory", "lastName": "Vasquez", "type": "other",
+                          "email": CANARY_EMAIL, "phone": CANARY_PHONE}]
+
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=desk_rows, ghl_reader_contacts=ghl_contacts,
+        )
+        summary = runner.process_one("rec-1")
+
+        assert summary.matched == 1
+        assert summary.notes_written == 1
+        assert summary.errors == 0
+        assert ghl_client.create_calls == 1
+
+    def test_unknown_recording_id_is_an_error_not_an_exception(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """A webhook event naming a recording the sealed re-fetch cannot
+        find (e.g. Plaud not yet consistent) is a safe, visible error --
+        never an unhandled exception, never a note write."""
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=[], desk_rows=[],
+        )
+        summary = runner.process_one("does-not-exist")
+
+        assert summary.errors == 1
+        assert summary.matched == 0
+        assert ghl_client.create_calls == 0
+        assert transcript.fetch_calls == []
+
+    def test_replayed_webhook_event_is_idempotent(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """A duplicate webhook delivery for an already-terminal recording
+        must never repeat the transcript fetch, summarizer call, or GHL
+        write."""
+        contact_id = "c-1"
+        _activate(registry, CANARY_PHONE, contact_id)
+        clock.advance(hours=1)
+
+        zdate = utc_to_apple_epoch(datetime(2026, 9, 17, 20, 24, 30, tzinfo=timezone.utc))
+        desk_rows = [_desk_row(zdate, CANARY_PHONE, zduration=1306)]
+        plaud_records = [_plaud_record("rec-1", start_time="2026-09-17T20:22:59+00:00")]
+        ghl_contacts = [{"id": contact_id, "locationId": TEAM_DUNCAN_LOCATION_ID,
+                          "firstName": "Cory", "lastName": "Vasquez", "type": "other",
+                          "email": CANARY_EMAIL, "phone": CANARY_PHONE}]
+
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=desk_rows, ghl_reader_contacts=ghl_contacts,
+        )
+        first = runner.process_one("rec-1")
+        assert first.notes_written == 1
+        assert ghl_client.create_calls == 1
+
+        second = runner.process_one("rec-1")
+        assert second.skipped_already_processed == 1
+        assert second.notes_written == 0
+        assert second.matched == 0
+        assert ghl_client.create_calls == 1  # no repeat write
+        assert len(transcript.fetch_calls) == 1  # no repeat transcript fetch
+
+    def test_unmatched_recording_is_terminal_and_writes_nothing(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        plaud_records = [_plaud_record("rec-1")]
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=[],
+        )
+        summary = runner.process_one("rec-1")
+
+        assert summary.unmatched == 1
+        assert ghl_client.create_calls == 0
+        assert transcript.fetch_calls == []
+
+    def test_process_one_never_advances_the_reconciliation_frontier(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """The webhook point-lookup path must never move
+        SOURCE_CURSOR_KEY -- that frontier belongs exclusively to the
+        reconciliation scan (`run()`)."""
+        from plugins.team_duncan_contacts.plaud_summary_runner import SOURCE_CURSOR_KEY
+
+        contact_id = "c-1"
+        _activate(registry, CANARY_PHONE, contact_id)
+        clock.advance(hours=1)
+
+        zdate = utc_to_apple_epoch(datetime(2026, 9, 17, 20, 24, 30, tzinfo=timezone.utc))
+        desk_rows = [_desk_row(zdate, CANARY_PHONE, zduration=1306)]
+        plaud_records = [_plaud_record("rec-1", start_time="2026-09-17T20:22:59+00:00")]
+        ghl_contacts = [{"id": contact_id, "locationId": TEAM_DUNCAN_LOCATION_ID,
+                          "firstName": "Cory", "lastName": "Vasquez", "type": "other",
+                          "email": CANARY_EMAIL, "phone": CANARY_PHONE}]
+
+        runner, ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            plaud_records=plaud_records, desk_rows=desk_rows, ghl_reader_contacts=ghl_contacts,
+        )
+        assert state_db.get_cursor(SOURCE_CURSOR_KEY) is None
+        summary = runner.process_one("rec-1")
+        assert summary.notes_written == 1
+        assert state_db.get_cursor(SOURCE_CURSOR_KEY) is None
+

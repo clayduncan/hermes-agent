@@ -235,6 +235,47 @@ class PlaudSummaryRunner:
 
         return summary
 
+    def process_one(self, plaud_recording_id: str) -> PlaudSummaryRunSummary:
+        """OPS-114: process exactly one Plaud recording by its immutable ID,
+        for the webhook-triggered path. Never touches ``SOURCE_CURSOR_KEY``
+        (the scan frontier) -- this is a point lookup, not a range scan, so
+        there is no frontier position to advance or hold. Idempotent via the
+        same ``plaud_summary_state`` terminal-state check `run()` uses: a
+        replayed webhook event for an already-terminal recording is a safe,
+        zero-repeat no-op skip. The recording ID is the only thing trusted
+        from the caller -- metadata comes solely from a sealed
+        ``fetch_by_identity`` re-fetch, never from whatever the webhook body
+        claimed."""
+        summary = PlaudSummaryRunSummary()
+
+        existing = self._state_db.get_plaud_summary_state(plaud_recording_id)
+        if _is_terminal(existing):
+            summary.skipped_already_processed += 1
+            return summary
+
+        record = self._plaud.fetch_by_identity(plaud_recording_id)
+        if record is None:
+            log.error("Plaud webhook recording not found on sealed re-fetch.")
+            summary.errors += 1
+            return summary
+
+        now = self._clock()
+        try:
+            desk_records = self._desk.fetch_routine_window(now)
+        except Exception as exc:
+            log.error("Desk fetch failed [%s]; recording not advanced.", type(exc).__name__)
+            summary.errors += 1
+            return summary
+
+        try:
+            self._process_record(record, desk_records, summary)
+        except Exception as exc:
+            log.error(
+                "Error processing webhook Plaud recording [%s].", type(exc).__name__
+            )
+            summary.errors += 1
+        return summary
+
     def _sealed_refetch_desk(self, desk_record: DeskCallRecord) -> DeskCallRecord:
         target_zdate = utc_to_apple_epoch(desk_record.occurred_at)
         zoriginated = 1 if desk_record.direction == "outbound" else 0
