@@ -156,6 +156,45 @@ def _build_note_mirror_ghl_client(hermes_home: Path):
     return scoped_client(TEAM_DUNCAN_ACCOUNT_KEY, TEAM_DUNCAN_LOCATION_ID, hermes_home=hermes_home)
 
 
+def _build_activity_ledger(hermes_home: Path, registry: Any) -> Any:
+    """Construct a fresh ActivityLedger over this plugin's activity.db file.
+
+    The single construction path for both the module-global instance
+    register() sets and any runner factory that needs a ledger of its own,
+    so there is exactly one place that knows the plugin data directory and
+    the ActivityLedger constructor signature.
+    """
+    from .activity_ledger import ActivityLedger
+
+    data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return ActivityLedger(data_dir / "activity.db", registry)
+
+
+def _get_or_build_activity_ledger(hermes_home: Path, registry: Any) -> Any:
+    """Return the module-global activity ledger if register() already set
+    one, else construct a fresh one via `_build_activity_ledger`.
+
+    Standalone automation (automation_runner.py) never calls register(), so
+    the module global stays None there. Without this fallback, both real
+    runner factories below would hand a runner `activity_ledger=None`, and
+    every admit/pre-activation record would raise AttributeError in
+    IngestionRunner._process_record -- the confirmed OPS-114 root cause.
+
+    Checks `isinstance(activity_ledger, ActivityLedger)` rather than merely
+    `is not None`: this module's own global namespace also holds the
+    imported `.activity_ledger` submodule under the same attribute name as
+    soon as anything imports it (Python sets a package's submodule as an
+    attribute of the package on import), so a bare `is not None` check could
+    wrongly treat that submodule object as a ready-to-use ledger.
+    """
+    from .activity_ledger import ActivityLedger
+
+    if isinstance(activity_ledger, ActivityLedger):
+        return activity_ledger
+    return _build_activity_ledger(hermes_home, registry)
+
+
 def _build_ingestion_runner_factory(hermes_home: Path, registry):
     """Return a zero-arg factory producing a fresh (IngestionRunner, state_db)
     pair. Deferred construction keeps plugin load itself free of any DB or
@@ -188,7 +227,7 @@ def _build_ingestion_runner_factory(hermes_home: Path, registry):
 
         runner = IngestionRunner(
             registry=registry,
-            activity_ledger=activity_ledger,
+            activity_ledger=_get_or_build_activity_ledger(hermes_home, registry),
             state_db=state_db,
             plaud_collector=plaud_collector,
             desk_collector=desk_collector,
@@ -233,7 +272,7 @@ def _build_plaud_summary_runner_factory(hermes_home: Path, registry, ghl_reader)
 
         runner = PlaudSummaryRunner(
             registry=registry,
-            activity_ledger=activity_ledger,
+            activity_ledger=_get_or_build_activity_ledger(hermes_home, registry),
             state_db=state_db,
             plaud_collector=plaud_collector,
             transcript_transport=live_plaud,
@@ -313,12 +352,11 @@ def register(ctx) -> None:
         make_set_imessage_activation_handler,
     )
 
-    from .activity_ledger import ActivityLedger
     import plugins.team_duncan_contacts as _self
 
     data_dir = Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
     data_dir.mkdir(parents=True, exist_ok=True)
-    _self.activity_ledger = ActivityLedger(data_dir / "activity.db", registry)
+    _self.activity_ledger = _build_activity_ledger(hermes_home, registry)
     log.info(
         "team_duncan_contacts: activity ledger initialised at %s.",
         data_dir / "activity.db",
