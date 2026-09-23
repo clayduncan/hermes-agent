@@ -152,7 +152,12 @@ def fake_registry_wiring(monkeypatch):
     """Bypasses config/startup validation entirely: build_registry_and_reader
     returns fixed fake objects, and the two runner factories return a
     caller-supplied _FakeRunner. Returns a small namespace test bodies use
-    to inject the runner and inspect calls."""
+    to inject the runner and inspect calls.
+
+    Also defaults ``plaud_webhook_enabled`` to True: every test in this
+    file exercises the pre-OPS-114-flag "existing webhook path" behavior of
+    plaud-webhook mode, not the fail-closed gate itself (that has its own
+    dedicated coverage in test_plaud_webhook_enabled_flag.py)."""
 
     state = {"runner": _FakeRunner(), "registry_ok": True}
 
@@ -176,6 +181,7 @@ def fake_registry_wiring(monkeypatch):
     monkeypatch.setattr(
         team_duncan_contacts, "_build_plaud_summary_runner_factory", _fake_plaud_factory
     )
+    monkeypatch.setattr(team_duncan_contacts, "is_plaud_webhook_enabled", lambda: True)
     return state
 
 

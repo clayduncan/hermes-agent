@@ -33,6 +33,14 @@ single Plaud/Desk run, `IngestionRunner`/`PlaudSummaryRunner` already never
 advance a cursor/frontier past a failed record -- this module changes
 nothing about that discipline, it only decides *whether* to call `run()`
 at all this tick.
+
+OPS-114 no-Zapier architecture: ``plaud-webhook`` mode fails closed (exits
+EXIT_DISABLED, no lock/registry/queue/state work at all) unless
+``plaud_webhook_enabled`` is the literal boolean true in config.yaml --
+see ``is_plaud_webhook_enabled`` in this package's ``__init__.py``. The
+default/current architecture is 15-minute Plaud reconciliation
+(``plaud-reconcile``) only; ``desk`` and ``plaud-reconcile`` are entirely
+unaffected by this flag.
 """
 
 from __future__ import annotations
@@ -49,6 +57,7 @@ log = logging.getLogger(__name__)
 EXIT_COMPLETED = 0
 EXIT_FAILED = 1
 EXIT_SKIPPED_LOCK = 75  # sysexits.h EX_TEMPFAIL: transient, safe to retry next tick
+EXIT_DISABLED = 78  # sysexits.h EX_CONFIG: plaud-webhook mode, not enabled by config
 
 MODE_DESK = "desk"
 MODE_PLAUD_RECONCILE = "plaud-reconcile"
@@ -164,10 +173,26 @@ def run(
     hermes_home: Path | None = None,
 ) -> int:
     """Parse argv, acquire the shared lock, dispatch to the requested mode,
-    and record a heartbeat. Returns the process exit code; never raises."""
+    and record a heartbeat. Returns the process exit code; never raises.
+
+    ``plaud-webhook`` fails closed before lock acquisition, registry/GHL
+    construction, queue access, Plaud MCP connection, transcript fetch, or
+    any state mutation if ``plaud_webhook_enabled`` is not the literal
+    boolean true (see ``is_plaud_webhook_enabled`` in this package's
+    ``__init__.py``); ``desk`` and ``plaud-reconcile`` are unaffected by
+    this setting."""
+    from . import build_registry_and_reader, is_plaud_webhook_enabled
+
+    args = _build_arg_parser().parse_args(argv)
+    mode: str = args.mode
+    marker = _MARKER_FOR_MODE[mode]
+
+    if mode == MODE_PLAUD_WEBHOOK and not is_plaud_webhook_enabled():
+        _emit({"status": "disabled", "mode": mode})
+        return EXIT_DISABLED
+
     from hermes_constants import get_hermes_home
 
-    from . import build_registry_and_reader
     from .heartbeat import (
         OUTCOME_COMPLETED,
         OUTCOME_FAILED,
@@ -175,10 +200,6 @@ def run(
         HeartbeatStore,
     )
     from .process_lock import TeamDuncanLock
-
-    args = _build_arg_parser().parse_args(argv)
-    mode: str = args.mode
-    marker = _MARKER_FOR_MODE[mode]
 
     resolved_home = Path(hermes_home) if hermes_home is not None else Path(get_hermes_home())
     data_dir = resolved_home / "plugin-data" / "team_duncan_contacts"

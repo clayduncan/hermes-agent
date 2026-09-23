@@ -72,6 +72,10 @@ log = logging.getLogger(__name__)
 DEFAULT_PATH = "/webhooks/team_duncan/plaud"
 DEFAULT_MAX_BODY_BYTES = 65536
 
+# sysexits.h EX_CONFIG: this process is fine, a configuration value is
+# just not set to enable it. Distinct from a transient/retryable failure.
+EXIT_DISABLED = 78
+
 
 def _data_dir(hermes_home: Path) -> Path:
     return Path(hermes_home) / "plugin-data" / "team_duncan_contacts"
@@ -272,12 +276,15 @@ def build_server(
 def main(argv: list[str] | None = None) -> int:
     """Standalone entry point. Never invoked by any scheduler or by this
     build; a separate, Clay-controlled activation step starts this
-    process. See the OPS-114 ops doc for host/port/path/secret wiring."""
+    process. See the OPS-114 ops doc for host/port/path/secret wiring.
+
+    Fails closed on ``plaud_webhook_enabled`` (see
+    ``plugins.team_duncan_contacts.is_plaud_webhook_enabled``) before
+    binding a socket, creating/loading the HMAC secret, opening/creating
+    the webhook queue, or draining events: the default/current OPS-114
+    architecture is 15-minute Plaud reconciliation only, and this receiver
+    is dormant unless that setting is the literal boolean true."""
     import argparse
-
-    from hermes_constants import get_hermes_home
-
-    from .webhook_auth import load_or_create_webhook_secret
 
     parser = argparse.ArgumentParser(prog="plaud_webhook_receiver")
     parser.add_argument("--host", default="127.0.0.1")
@@ -286,6 +293,20 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
+
+    from . import is_plaud_webhook_enabled
+
+    if not is_plaud_webhook_enabled():
+        log.info(
+            "[plaud_webhook] disabled (plaud_webhook_enabled is not true); "
+            "exiting before binding a socket or touching any webhook state."
+        )
+        return EXIT_DISABLED
+
+    from hermes_constants import get_hermes_home
+
+    from .webhook_auth import load_or_create_webhook_secret
+
     hermes_home = Path(get_hermes_home())
     data_dir = _data_dir(hermes_home)
     secret = load_or_create_webhook_secret(data_dir)
@@ -322,4 +343,5 @@ __all__ = [
     "main",
     "DEFAULT_PATH",
     "DEFAULT_MAX_BODY_BYTES",
+    "EXIT_DISABLED",
 ]

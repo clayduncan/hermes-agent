@@ -24,6 +24,21 @@ Required config (in config.yaml):
         settings:
           location_id: "<GoHighLevel location ID for Team Duncan>"
 
+Optional config (in config.yaml), OPS-114 webhook activation gate:
+  plugins:
+    entries:
+      team_duncan_contacts:
+        settings:
+          plaud_webhook_enabled: false
+
+Default/current architecture is 15-minute Plaud reconciliation only (see
+the OPS-114 ops doc). plaud_webhook_receiver.main() and automation_runner's
+plaud-webhook mode both fail closed, before any socket bind, secret/queue
+access, lock acquisition, or registry/GHL construction, unless this
+setting is the literal boolean true -- missing, null, false, or any
+non-boolean value (including the string "true") leaves the webhook path
+dormant. See is_plaud_webhook_enabled() below.
+
 OPS-18 note: registering these ingestion tools does not enable live
 ingestion by itself. The Desk production transport (`LiveDeskTransport`) is
 now wired for confirm_call_log_ingest's `desk_call` source: a fixed-path,
@@ -91,6 +106,37 @@ def _load_location_id() -> str:
             "team_duncan_contacts: could not load config [%s]", type(exc).__name__
         )
         return ""
+
+
+def is_plaud_webhook_enabled() -> bool:
+    """Read plugins.entries.team_duncan_contacts.settings.plaud_webhook_enabled
+    from config.yaml via the same canonical loader and path as
+    _load_location_id above.
+
+    Fails closed: only the literal boolean ``True`` enables the webhook
+    path. Missing config, a null value, ``false``, a malformed config file,
+    or any non-boolean value (including the string ``"true"``) all return
+    False. Never reads from environment variables, and never raises --
+    a config load failure is itself a reason to stay disabled.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        plugins_cfg = cfg.get("plugins") if isinstance(cfg, dict) else None
+        entries = plugins_cfg.get("entries") if isinstance(plugins_cfg, dict) else None
+        plugin_cfg = (
+            entries.get("team_duncan_contacts") if isinstance(entries, dict) else None
+        )
+        settings = plugin_cfg.get("settings") if isinstance(plugin_cfg, dict) else None
+        val = settings.get("plaud_webhook_enabled") if isinstance(settings, dict) else None
+        return val is True
+    except Exception as exc:
+        log.debug(
+            "team_duncan_contacts: could not load config for plaud_webhook_enabled [%s]",
+            type(exc).__name__,
+        )
+        return False
 
 
 def _build_live_ghl_reader(location_id: str):

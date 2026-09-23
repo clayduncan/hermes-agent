@@ -43,6 +43,20 @@ def _signed_headers(body: bytes, *, ts: str | None = None) -> dict[str, str]:
     }
 
 
+@pytest.fixture(autouse=True)
+def _webhook_enabled(monkeypatch):
+    """Every test in this file exercises the receiver's existing decision
+    logic and durable-queue machinery (handle_webhook_request,
+    drain_pending_events, build_server) -- not the OPS-114 fail-closed
+    plaud_webhook_enabled gate itself, which has its own dedicated coverage
+    in test_plaud_webhook_enabled_flag.py. A couple of drain tests here
+    dispatch through the real automation_runner.run(), which now also
+    fails closed on that same flag, so default it to enabled here."""
+    import plugins.team_duncan_contacts as team_duncan_contacts
+
+    monkeypatch.setattr(team_duncan_contacts, "is_plaud_webhook_enabled", lambda: True)
+
+
 @pytest.fixture()
 def dispatched() -> list[str]:
     return []

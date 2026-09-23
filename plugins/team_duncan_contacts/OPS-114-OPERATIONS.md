@@ -1,8 +1,16 @@
 # OPS-114: Team Duncan Desk/Plaud Automation (Operations)
 
-Status as of this build: **code and tests only**. Nothing here is scheduled,
-registered, or activated. Every item under "Activation" below is a
-separate, Clay-controlled step.
+Status as of this build (no-Zapier 15-minute architecture): **code and
+tests only**. Nothing here is scheduled, registered, or activated. Every
+item under "Activation" below is a separate, Clay-controlled step.
+
+Final architecture: there is no Zapier integration and no public webhook
+path in active production. Plaud is covered exclusively by a 15-minute
+metadata reconciliation sweep (`plaud-reconcile` mode). The webhook
+receiver and its HMAC/queue machinery remain in source, fully tested, and
+dormant, gated by an explicit default-off config flag
+(`plaud_webhook_enabled: false`). Re-enabling it later is a separate,
+Clay-controlled decision -- see §7.
 
 ## 1. What this build adds
 
@@ -24,7 +32,12 @@ separate, Clay-controlled step.
   (`plaud_webhook_receiver.py`) with real HMAC authentication, no
   insecure bypass mode, and a durable SQLite acceptance queue
   (`webhook_queue.py`, see §5) so an accepted event survives a crash of
-  the receiver process.
+  the receiver process. **Dormant in this architecture** -- see §5a.
+- An explicit, default-off config gate,
+  `plugins.entries.team_duncan_contacts.settings.plaud_webhook_enabled`,
+  that both the receiver's `main()` and `automation_runner`'s
+  `plaud-webhook` mode consult and fail closed on before touching any
+  socket, secret, queue, lock, registry, or GHL state. See §5a.
 - Scripts-repo wrappers (`team_duncan_ops114_report.py`,
   `team_duncan_ops114_desk_cron.sh`, `team_duncan_ops114_plaud_reconcile_cron.sh`)
   that route through the existing `cron_report.py` / `cron_ledger.py`
@@ -72,16 +85,21 @@ aged anything out.
 | Job | Schedule | Script | Absence threshold |
 |---|---|---|---|
 | OPS-114 Team Duncan Desk Ingestion | every 15 min (`*/15 * * * *`) | `team_duncan_ops114_desk_cron.sh` | 45 min |
-| OPS-114 Team Duncan Plaud Reconciliation | every 3 hours (`0 */3 * * *`) | `team_duncan_ops114_plaud_reconcile_cron.sh` | 4 hours |
+| OPS-114 Team Duncan Plaud Reconciliation | every 15 min, offset (`7,22,37,52 * * * *`) | `team_duncan_ops114_plaud_reconcile_cron.sh` | 45 min |
 
 See `scripts/team_duncan_ops114_cron_manifest.json` for the exact
 `hermes cron create ... --no-agent` commands. `--no-agent` means the
 script *is* the job: no LLM involved, matching the "no LLM" requirement
 for these two schedules. This build does not run either command.
 
-45 minutes = three expected 15-minute cadences, chosen to survive one
-overlap skip and one delayed tick. 4 hours = one hour of grace beyond the
-3-hour Plaud cadence.
+Plaud reconciliation runs at :07/:22/:37/:52 -- deliberately offset from
+Desk's :00/:15/:30/:45 ticks by 7 minutes, giving expected latency 7.5
+minutes and maximum latency 15 minutes between a Plaud summary becoming
+ready and the next reconciliation tick picking it up.
+
+45 minutes (both Desk and Plaud reconciliation) = three expected
+15-minute cadences, chosen to survive one overlap skip and one delayed
+tick.
 
 The per-tick wrapper's own process exit code (what the cron scheduler
 sees) is 0 for both a completed run and a skipped-lock run: a clean
@@ -90,23 +108,29 @@ surface as one to Hermes's `--no-agent` cron path (which treats any
 nonzero exit as failure). It is still routed to `cron_report.py` as Green
 either way. Only a crashed or genuinely failed run exits 1.
 
+### Steady-state cost of 15-minute Plaud reconciliation
+
+- 96 reconciliation runs/day.
+- Ordinarily one `list_files` metadata tool call per idle run (no matched
+  recording to process).
+- Measured successful process wall time: 3.46 seconds/run, about 5.54
+  minutes aggregate process wall time/day across all 96 runs.
+- Transcript pagination, summarization, and GHL note work remain
+  event-driven per matched recording and do not multiply with empty
+  sweeps -- an idle tick costs one metadata call, nothing more.
+
 ## 5. Plaud webhook: current truth
 
 There is no proven native signed personal-data webhook from Plaud. The
-supported primary trigger is Plaud's documented Zapier **"Transcript &
-Summary Ready"** trigger, mapped to a normalized custom POST, authenticated
-at `plaud_webhook_receiver.py` with HMAC (the same generic V2 scheme,
-`X-Webhook-Signature-V2` / `X-Webhook-Timestamp`, HMAC-SHA256 over
-`"<timestamp>.<body>"`, 300s replay tolerance, already used by
-`gateway/platforms/webhook.py`, so this receiver's auth is consistent with
-the rest of the fleet even though it is not a route on that adapter). Do
-not claim a native Plaud signature anywhere downstream of this doc.
-
-**Until Clay activates the Zapier mapping and secret (§7), the 3-hour
-Plaud reconciliation job is the only live Plaud path**, and remains
-authoritative recovery even after activation (a missed/failed webhook
-delivery is caught by the next reconciliation tick, which scans by
-frontier position, not by webhook delivery).
+only ever-evaluated primary trigger was Plaud's documented Zapier
+**"Transcript & Summary Ready"** trigger, mapped to a normalized custom
+POST and authenticated at `plaud_webhook_receiver.py` with HMAC (the same
+generic V2 scheme, `X-Webhook-Signature-V2` / `X-Webhook-Timestamp`,
+HMAC-SHA256 over `"<timestamp>.<body>"`, 300s replay tolerance, already
+used by `gateway/platforms/webhook.py`, so this receiver's auth is
+consistent with the rest of the fleet even though it is not a route on
+that adapter). Do not claim a native Plaud signature anywhere downstream
+of this doc.
 
 The receiver trusts only the immutable `plaud_recording_id` from the
 webhook body: title, transcript text, speaker names, and summary are
@@ -116,18 +140,66 @@ re-fetch inside `PlaudSummaryRunner.process_one()`, the same
 never-trust-the-push-payload discipline every other sealed re-fetch in
 this plugin already uses.
 
-Durable acceptance: before the receiver returns HTTP 202, the immutable
-recording ID is committed to a small SQLite queue (`webhook_queue.py`)
-under Team Duncan plugin data, deduped by recording ID. A 202 is a
-crash-survival promise, not just an in-memory one; if the durable write
-itself fails, the receiver returns 503 instead, never 202. Once queued,
-the event is dispatched to `automation_runner.run(["plaud-webhook", ...])`
-on a background thread as a best-effort fast path (sharing the same
-OPS-114 durable lock every automated mode uses) and removed from the queue
-only once that run actually completes. `drain_pending_events()`, called at
-this receiver's own process startup, replays anything still pending from
-before a prior crash of this process, so an event accepted just before a
-crash is never silently lost.
+Durable acceptance (when enabled): before the receiver returns HTTP 202,
+the immutable recording ID is committed to a small SQLite queue
+(`webhook_queue.py`) under Team Duncan plugin data, deduped by recording
+ID. A 202 is a crash-survival promise, not just an in-memory one; if the
+durable write itself fails, the receiver returns 503 instead, never 202.
+Once queued, the event is dispatched to
+`automation_runner.run(["plaud-webhook", ...])` on a background thread as
+a best-effort fast path (sharing the same OPS-114 durable lock every
+automated mode uses) and removed from the queue only once that run
+actually completes. `drain_pending_events()`, called at this receiver's
+own process startup, replays anything still pending from before a prior
+crash of this process, so an event accepted just before a crash is never
+silently lost.
+
+### 5a. No-Zapier 15-minute architecture: the webhook path is dormant
+
+Clay's OPS-114 decision replaces the Zapier/webhook path with the
+15-minute Plaud reconciliation sweep as the sole active Plaud path. There
+is no live Zapier integration, no exposed Funnel route, and no running
+receiver process in this architecture.
+
+The receiver and its HMAC/queue/dispatch machinery are **not deleted**:
+they remain in source, fully tested (see
+`tests/plugins/team_duncan_contacts/test_plaud_webhook_receiver.py` and
+`test_plaud_webhook_enabled_flag.py`), and gated behind one explicit,
+default-off config setting:
+
+```yaml
+plugins:
+  entries:
+    team_duncan_contacts:
+      settings:
+        plaud_webhook_enabled: false
+```
+
+Only the literal boolean `true` enables the webhook path. Missing config,
+`null`, `false`, a malformed config file, or any non-boolean value
+(including the string `"true"`) all leave it disabled -- there is no
+separate environment variable and no second config parser; this reuses
+the same `load_config()` loader and settings path `location_id` already
+reads (see `is_plaud_webhook_enabled()` in `__init__.py`).
+
+With the flag absent or false (the default and current state):
+
+- `plaud_webhook_receiver.main()` returns before binding a socket,
+  loading or creating the HMAC secret, opening the webhook queue, or
+  draining pending events. It logs one content-free line and exits
+  `EXIT_DISABLED` (78).
+- `automation_runner.run(["plaud-webhook", ...])` returns before lock
+  acquisition, registry/GHL construction, queue access, any Plaud MCP
+  connection, transcript fetch, or state mutation. It emits one
+  content-free `{"status": "disabled", "mode": "plaud-webhook"}` line and
+  exits `EXIT_DISABLED` (78).
+- `desk` and `plaud-reconcile` modes are entirely unaffected by this
+  setting.
+
+The 15-minute reconciliation job (§4) is authoritative recovery in this
+architecture, not merely a fallback for a webhook that might later exist:
+it scans by frontier position on every tick regardless of whether a
+webhook was ever configured.
 
 ## 6. The shared lock and operator overrides
 
@@ -144,7 +216,9 @@ whether to steal the lock, because there is nothing left to steal by the
 time a dead owner's flock is gone; a leftover lock file with stale
 metadata on disk never blocks a fresh acquire.
 
-Every automated mode acquires the lock before touching `ingestion_state.db`.
+Every automated mode acquires the lock before touching `ingestion_state.db`
+(the `plaud-webhook` mode only reaches this point at all when
+`plaud_webhook_enabled` is true -- see §5a).
 `confirm_call_log_ingest`, `accept_call_log_ingest_run`, and
 `confirm_plaud_summary_run` now acquire the same lock before their own
 mutation: a live-owner collision (e.g. an automated run in progress) is a
@@ -163,57 +237,74 @@ consume one of those tokens.
 
 ## 7. Activation instructions (Clay-controlled, not part of this build)
 
-1. **Merge** both branches (`ops114-automation` in hermes-agent and in
+1. **Merge** both branches (`ops114-no-zapier` in hermes-agent and in
    scripts) after review.
 2. **Register the two cron jobs** using the exact commands in
    `scripts/team_duncan_ops114_cron_manifest.json`
-   (`hermes cron create ... --no-agent --deliver local`).
+   (`hermes cron create ... --no-agent --deliver local`). This activates
+   Desk ingestion (every 15 minutes) and Plaud reconciliation (every 15
+   minutes, offset at :07/:22/:37/:52) -- the complete, sole live Plaud
+   path in this architecture. No Zapier setup, no Funnel exposure, and no
+   receiver process are part of this activation.
 3. **Restart Gateway** if the hermes-agent branch touched anything the
    running process needs reloaded (plugin code changes typically do).
    This build makes no claim about whether that restart already happened:
    assume it has not.
-4. **Plaud webhook** (optional: reconciliation alone is a complete,
-   working recovery path without this step):
-   a. In Zapier, connect Plaud OAuth and build a Zap on the
-      **"Transcript & Summary Ready"** trigger.
-   b. Map the trigger's recording ID field to `plaud_recording_id` (or
-      `recording_id`) in a custom POST to
-      `plaud_webhook_receiver.py`'s configured host:port/path. No other
-      field needs mapping: the receiver ignores everything else.
-   c. Generate an HMAC secret. `webhook_auth.load_or_create_webhook_secret()`
-      will create and persist one automatically at
-      `<hermes_home>/plugin-data/team_duncan_contacts/plaud_webhook_hmac_secret`
-      (0600) the first time the receiver starts: read that file to get
-      the value Zapier's outgoing request must sign with (generic V2
-      scheme, §5).
-   d. Start `plaud_webhook_receiver.py` under a process supervisor and
-      expose its route (reverse proxy / port-forward) to Zapier. This is a
-      new, standalone process this build does not start.
-5. **Verify** using the ops checks in §8 before trusting the new paths in
-   production.
+
+That is the entire activation for the current architecture. The Plaud
+webhook receiver is not started, and no Zap is created, as part of OPS-114.
+
+### Re-enabling the Plaud webhook later
+
+The webhook path is intentionally out of scope for this activation. Turning
+it on later is a **separate, Clay-controlled decision** requiring all of
+the following, not just flipping the config flag:
+
+1. Explicit fresh authorization for that specific change.
+2. Setting `plugins.entries.team_duncan_contacts.settings.plaud_webhook_enabled`
+   to the literal boolean `true` (see §5a) -- and only after the remaining
+   steps below, not before.
+3. A supervised receiver process (a real process manager, not an ad hoc
+   background shell job) with restart-on-crash and log capture.
+4. An authenticated public route reaching the receiver (reverse proxy or
+   tunnel with its own access control, not a bare open port) -- HMAC
+   verification alone is not a substitute for controlling who can even
+   reach the endpoint.
+5. A security review of the exposed surface (the route, the process
+   supervisor config, and the secret handling) before any real Zapier Zap
+   is pointed at it.
+
+Until all five are done and separately approved, the flag stays false and
+the 15-minute reconciliation sweep remains the sole live Plaud path.
 
 ## 8. Verification after activation
 
 - `cat ~/.hermes/plugin-data/team_duncan_contacts/automation_heartbeats/desk.json`
   should show `last_attempt_at`/`last_success_at` advancing every 15
   minutes, `last_outcome: "completed"`.
-- Same for `plaud_reconcile.json` every 3 hours.
+- Same for `plaud_reconcile.json`, also every 15 minutes (offset ticks).
 - A deliberate lock collision (start an interactive `confirm_call_log_ingest`
   while a scheduled tick is mid-run) should produce
   `automation_lock_active` on whichever side loses the race, with the
   token left unconsumed on the interactive side.
 - Tail `~/.hermes/cron/ledger/<today>.jsonl` for `"OPS-114 Team Duncan
   Desk Ingestion"` / `"... Plaud Reconciliation"` Green/Amber entries.
+- `plaud_webhook.json` should not exist (or should show no recent
+  `last_attempt_at`) as long as `plaud_webhook_enabled` stays false --
+  its presence with a recent timestamp would indicate the flag was
+  turned on somewhere.
 
 ## 9. Rollback
 
 - **Cron jobs**: `hermes cron pause <job_id>` (or delete) for either/both
   jobs registered in step 2 above. The manual interactive tools are
   unaffected and continue to work.
-- **Webhook**: stop the `plaud_webhook_receiver.py` process and/or turn off
-  the Zap. The 3-hour reconciliation job remains authoritative and picks up
-  anything the webhook would have caught, within its own cadence + 4-hour
-  absence threshold.
+- **Webhook**: already the default/current state -- the receiver process
+  is not running and `plaud_webhook_enabled` is false, so there is nothing
+  to roll back on this axis unless a later, separately authorized
+  re-enablement (see §7) is itself being reverted, in which case: stop the
+  receiver process, turn off the Zap, and set `plaud_webhook_enabled` back
+  to `false` (or remove the setting).
 - **Watchdog extension**: revert the appended lines in
   `cron_watchdog_cron.sh` (scripts repo) to stop the OPS-114 absence/
   stuck-owner check; the existing fleet watchdog and healthchecks.io ping
