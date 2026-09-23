@@ -119,8 +119,11 @@ def _run_plaud_reconcile(hermes_home: Path, registry: Any, ghl_reader: Any) -> d
     from . import _build_plaud_summary_runner_factory
 
     runner, _state_db = _build_plaud_summary_runner_factory(hermes_home, registry, ghl_reader)()
-    summary = runner.run(token=None)
-    return summary.to_dict()
+    try:
+        summary = runner.run(token=None)
+        return summary.to_dict()
+    finally:
+        runner.close()
 
 
 def _run_plaud_webhook(
@@ -129,8 +132,11 @@ def _run_plaud_webhook(
     from . import _build_plaud_summary_runner_factory
 
     runner, _state_db = _build_plaud_summary_runner_factory(hermes_home, registry, ghl_reader)()
-    summary = runner.process_one(plaud_recording_id)
-    return summary.to_dict()
+    try:
+        summary = runner.process_one(plaud_recording_id)
+        return summary.to_dict()
+    finally:
+        runner.close()
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

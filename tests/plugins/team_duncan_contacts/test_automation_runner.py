@@ -129,6 +129,7 @@ class _FakeRunner:
         self._raises = raises
         self.run_calls: list[dict[str, Any]] = []
         self.process_one_calls: list[str] = []
+        self.close_calls = 0
 
     def run(self, *, token=None):
         self.run_calls.append({"token": token})
@@ -141,6 +142,9 @@ class _FakeRunner:
         if self._raises is not None:
             raise self._raises
         return self._summary
+
+    def close(self):
+        self.close_calls += 1
 
 
 @pytest.fixture()
@@ -508,3 +512,48 @@ def test_desk_failure_never_touches_plaud_heartbeat_and_vice_versa(
     desk_state_after = store.read("desk")
     assert desk_state_after["last_outcome"] == "failed"
     assert store.read("plaud_reconcile")["last_outcome"] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# OPS-114: standalone Plaud automation must close its owned transport in a
+# finally, on both a clean run and one that raises.
+# ---------------------------------------------------------------------------
+
+
+def test_plaud_reconcile_closes_runner_on_success(tmp_path: Path, fake_registry_wiring) -> None:
+    fake_registry_wiring["runner"] = _FakeRunner(_FakeSummary({"matched": 0, "errors": 0}))
+    exit_code = automation_runner.run(["plaud-reconcile"], hermes_home=tmp_path)
+    assert exit_code == automation_runner.EXIT_COMPLETED
+    assert fake_registry_wiring["runner"].close_calls == 1
+
+
+def test_plaud_reconcile_closes_runner_on_failure(tmp_path: Path, fake_registry_wiring) -> None:
+    fake_registry_wiring["runner"] = _FakeRunner(raises=RuntimeError("plaud boom"))
+    exit_code = automation_runner.run(["plaud-reconcile"], hermes_home=tmp_path)
+    assert exit_code == automation_runner.EXIT_FAILED
+    assert fake_registry_wiring["runner"].close_calls == 1
+
+
+def test_plaud_webhook_closes_runner_on_success(tmp_path: Path, fake_registry_wiring) -> None:
+    exit_code = automation_runner.run(
+        ["plaud-webhook", "--plaud-recording-id", "rec-close-ok"], hermes_home=tmp_path
+    )
+    assert exit_code == automation_runner.EXIT_COMPLETED
+    assert fake_registry_wiring["runner"].close_calls == 1
+
+
+def test_plaud_webhook_closes_runner_on_failure(tmp_path: Path, fake_registry_wiring) -> None:
+    fake_registry_wiring["runner"] = _FakeRunner(raises=RuntimeError("webhook boom"))
+    exit_code = automation_runner.run(
+        ["plaud-webhook", "--plaud-recording-id", "rec-close-fail"], hermes_home=tmp_path
+    )
+    assert exit_code == automation_runner.EXIT_FAILED
+    assert fake_registry_wiring["runner"].close_calls == 1
+
+
+def test_desk_mode_never_calls_close(tmp_path: Path, fake_registry_wiring) -> None:
+    """Desk automation is unchanged by this fix -- it never closes a
+    transport the way the Plaud modes now do."""
+    exit_code = automation_runner.run(["desk"], hermes_home=tmp_path)
+    assert exit_code == automation_runner.EXIT_COMPLETED
+    assert fake_registry_wiring["runner"].close_calls == 0

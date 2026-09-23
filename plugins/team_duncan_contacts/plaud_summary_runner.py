@@ -187,6 +187,15 @@ class PlaudSummaryRunner:
         self._summarizer = summarizer
         self._clock = clock
 
+    def close(self) -> None:
+        """Best-effort shutdown of this runner's transcript transport, if it
+        owns a connection of its own (OPS-114 standalone automation). Safe
+        to call when the injected transport has no `close` -- every test
+        fake and the interactive plugin's transport are unaffected."""
+        close = getattr(self._transcript_transport, "close", None)
+        if callable(close):
+            close()
+
     def run(self, *, token: str | None = None) -> PlaudSummaryRunSummary:
         summary = PlaudSummaryRunSummary()
 

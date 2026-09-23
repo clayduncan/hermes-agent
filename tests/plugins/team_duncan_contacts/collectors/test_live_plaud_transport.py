@@ -83,6 +83,56 @@ def _patch_mcp(monkeypatch: pytest.MonkeyPatch, server: Any) -> None:
     monkeypatch.setattr(mcp_tool_module, "_run_on_mcp_loop", _run_on_loop)
 
 
+class _FakeOwnedServer:
+    """Stands in for the MCPServerTask an owned connection returns."""
+
+    def __init__(self, session) -> None:
+        self.session = session
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+def _patch_empty_registry_with_own_connect(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    mcp_config: dict,
+    server: "_FakeOwnedServer",
+) -> dict[str, list]:
+    """Simulates a standalone process: the shared registry has nothing for
+    any server name, so the transport must fall back to connecting its own
+    session from *mcp_config* and retain *server* as its owned connection.
+    Returns a dict of call logs the test can assert on."""
+    calls: dict[str, list] = {
+        "connect_server": [],
+        "ensure_loop": [],
+        "stop_loop_if_idle": [],
+    }
+
+    monkeypatch.setattr(mcp_tool_module, "_get_connected_server_for_call", lambda name: None)
+    monkeypatch.setattr(mcp_tool_module, "_load_mcp_config", lambda: dict(mcp_config))
+    monkeypatch.setattr(
+        mcp_tool_module, "_ensure_mcp_loop", lambda: calls["ensure_loop"].append(True)
+    )
+    monkeypatch.setattr(
+        mcp_tool_module, "_stop_mcp_loop_if_idle", lambda: calls["stop_loop_if_idle"].append(True)
+    )
+
+    async def _fake_connect_server(name, config):
+        calls["connect_server"].append((name, config))
+        return server
+
+    monkeypatch.setattr(mcp_tool_module, "_connect_server", _fake_connect_server)
+
+    def _run_on_loop(coro_or_factory, timeout=30):
+        coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+        return asyncio.run(coro)
+
+    monkeypatch.setattr(mcp_tool_module, "_run_on_mcp_loop", _run_on_loop)
+    return calls
+
+
 def _file_entry(file_id, start_at, duration_ms, *, name="Call recording") -> dict:
     return {
         "id": file_id,
@@ -98,10 +148,17 @@ class TestStructuralAllowlist:
     def test_disallowed_tool_never_reaches_connected_server_lookup(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _fail_if_called(name):
-            raise AssertionError("must not look up a connected server for a disallowed tool")
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "must not attempt any connection lookup/connect for a disallowed tool"
+            )
 
+        # Neither connection path -- the shared registry lookup nor the
+        # OPS-114 standalone fallback connect -- may be reached.
         monkeypatch.setattr(mcp_tool_module, "_get_connected_server_for_call", _fail_if_called)
+        monkeypatch.setattr(mcp_tool_module, "_load_mcp_config", _fail_if_called)
+        monkeypatch.setattr(mcp_tool_module, "_ensure_mcp_loop", _fail_if_called)
+        monkeypatch.setattr(mcp_tool_module, "_connect_server", _fail_if_called)
         transport = LivePlaudTransport()
         for bad_tool in ("list_recordings", "get_recording", "get_note", "get_summary",
                           "get_mind_map", "ask_plaud"):
@@ -359,7 +416,11 @@ class TestTranscriptMethod:
 
 class TestErrorHandling:
     def test_not_connected_raises_plaud_mcp_tool_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No live registry connection AND no `plaud` entry in MCP config
+        (the standalone fallback's own lookup) -- both connection paths are
+        exhausted, so this must still fail closed with no live round-trip."""
         monkeypatch.setattr(mcp_tool_module, "_get_connected_server_for_call", lambda name: None)
+        monkeypatch.setattr(mcp_tool_module, "_load_mcp_config", lambda: {})
         transport = LivePlaudTransport()
         with pytest.raises(PlaudMcpToolError):
             transport.get_deployment_boundary()
@@ -403,3 +464,172 @@ class TestCoryRecordingFixture:
             "transcript_available": None,
             "summary_available": None,
         }
+
+
+class TestStandaloneOwnedConnection:
+    """OPS-114: a standalone `automation_runner` process starts with an
+    empty `tools.mcp_tool._servers` registry. This transport must fall
+    back to connecting its own short-lived session against the exact
+    `plaud` config entry, reuse it across calls, and close it exactly
+    once -- never touching a registry-owned (Gateway) connection."""
+
+    def test_empty_registry_connects_only_plaud_and_calls_list_files(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = _FakeSession(
+            {TOOL_LIST_FILES: {"type": "list", "data": [], "page": 1, "page_size": LIST_FILES_PAGE_SIZE}}
+        )
+        owned_server = _FakeOwnedServer(session)
+        mcp_config = {
+            "plaud": {"command": "plaud-mcp", "connect_timeout": 5},
+            "other": {"command": "other-mcp"},
+        }
+        calls = _patch_empty_registry_with_own_connect(
+            monkeypatch, mcp_config=mcp_config, server=owned_server
+        )
+
+        transport = LivePlaudTransport()
+        transport.get_deployment_boundary()
+
+        assert len(calls["connect_server"]) == 1
+        connected_name, connected_config = calls["connect_server"][0]
+        assert connected_name == "plaud"
+        assert connected_config == mcp_config["plaud"]
+        assert len(session.calls) == 1
+        assert session.calls[0][0] == TOOL_LIST_FILES
+
+    def test_owned_connection_is_reused_across_calls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = _FakeSession(
+            {TOOL_LIST_FILES: {"type": "list", "data": [], "page": 1, "page_size": LIST_FILES_PAGE_SIZE}}
+        )
+        owned_server = _FakeOwnedServer(session)
+        calls = _patch_empty_registry_with_own_connect(
+            monkeypatch, mcp_config={"plaud": {"command": "plaud-mcp"}}, server=owned_server
+        )
+
+        transport = LivePlaudTransport()
+        transport.get_deployment_boundary()
+        transport.get_deployment_boundary()
+
+        assert len(calls["connect_server"]) == 1, "second call must reuse the owned connection"
+        assert len(session.calls) == 2
+
+    def test_close_shuts_down_owned_connection_exactly_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = _FakeSession(
+            {TOOL_LIST_FILES: {"type": "list", "data": [], "page": 1, "page_size": LIST_FILES_PAGE_SIZE}}
+        )
+        owned_server = _FakeOwnedServer(session)
+        calls = _patch_empty_registry_with_own_connect(
+            monkeypatch, mcp_config={"plaud": {"command": "plaud-mcp"}}, server=owned_server
+        )
+
+        transport = LivePlaudTransport()
+        transport.get_deployment_boundary()
+
+        transport.close()
+        transport.close()  # idempotent -- must not shut down twice
+
+        assert owned_server.shutdown_calls == 1
+        assert len(calls["stop_loop_if_idle"]) == 1
+
+    def test_registry_owned_connection_is_reused_and_never_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = _FakeSession(
+            {TOOL_LIST_FILES: {"type": "list", "data": [], "page": 1, "page_size": LIST_FILES_PAGE_SIZE}}
+        )
+        registry_server = _FakeOwnedServer(session)
+        connect_calls: list = []
+
+        _patch_mcp(monkeypatch, registry_server)
+
+        async def _fail_if_called(name, config):
+            connect_calls.append((name, config))
+            raise AssertionError("must not connect its own server when the registry has one")
+
+        monkeypatch.setattr(mcp_tool_module, "_connect_server", _fail_if_called)
+
+        transport = LivePlaudTransport()
+        transport.get_deployment_boundary()
+        transport.close()
+
+        assert connect_calls == []
+        assert registry_server.shutdown_calls == 0
+
+
+class TestContentBlindJsonParsing:
+    def test_parses_json_wrapped_in_prose_safety_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {"type": "list", "data": [], "page": 1, "page_size": LIST_FILES_PAGE_SIZE}
+        wrapped_text = (
+            "I want to be careful here and note that this data may be "
+            "sensitive before sharing it. " + json.dumps(payload)
+        )
+
+        class _WrappedSession:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict]] = []
+
+            async def call_tool(self, name, arguments):
+                self.calls.append((name, dict(arguments)))
+                return _FakeCallToolResult(content=[_ContentBlock(text=wrapped_text)])
+
+        _patch_mcp(monkeypatch, _FakeServer(_WrappedSession()))
+        transport = LivePlaudTransport()
+        boundary = transport.get_deployment_boundary()
+        assert boundary  # parsed successfully past the prose wrapper
+
+    def test_malformed_output_still_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _NoJsonSession:
+            async def call_tool(self, name, arguments):
+                return _FakeCallToolResult(
+                    content=[_ContentBlock(text="Sorry, I cannot help with that request.")]
+                )
+
+        _patch_mcp(monkeypatch, _FakeServer(_NoJsonSession()))
+        transport = LivePlaudTransport()
+        with pytest.raises(PlaudMcpToolError):
+            transport.get_deployment_boundary()
+
+
+class TestFailClosedContentFree:
+    def test_connect_failure_message_never_carries_exception_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "SECRET_TOKEN=do-not-leak-me"
+
+        async def _raising_connect(name, config):
+            raise RuntimeError(f"401 Unauthorized: {secret}")
+
+        calls = _patch_empty_registry_with_own_connect(
+            monkeypatch, mcp_config={"plaud": {"command": "plaud-mcp"}},
+            server=_FakeOwnedServer(_FakeSession({})),
+        )
+        monkeypatch.setattr(mcp_tool_module, "_connect_server", _raising_connect)
+
+        transport = LivePlaudTransport()
+        with pytest.raises(PlaudMcpToolError) as exc_info:
+            transport.get_deployment_boundary()
+        assert secret not in str(exc_info.value)
+        assert "RuntimeError" in str(exc_info.value)
+
+    def test_tool_call_failure_message_never_carries_exception_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "phone=+15556665555"
+
+        class _RaisingSession:
+            async def call_tool(self, name, arguments):
+                raise RuntimeError(f"transport error touching {secret}")
+
+        _patch_mcp(monkeypatch, _FakeServer(_RaisingSession()))
+        transport = LivePlaudTransport()
+        with pytest.raises(PlaudMcpToolError) as exc_info:
+            transport.get_deployment_boundary()
+        assert secret not in str(exc_info.value)
+        assert "RuntimeError" in str(exc_info.value)

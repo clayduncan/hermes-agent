@@ -5,7 +5,13 @@ not open a second credential store, scrape the Plaud UI, or call Plaud's
 undocumented API directly -- it reuses the same connected-server registry
 and background MCP event loop every other MCP tool call in this repo goes
 through (`tools.mcp_tool`), against the `plaud` connection already
-configured in Hermes' own MCP server config.
+configured in Hermes' own MCP server config. OPS-114: when no such
+connection is already live in the current process (a standalone
+`automation_runner` invocation starts with an empty registry), this module
+connects its own short-lived session through the identical `tools.mcp_tool`
+lifecycle helpers (`_ensure_mcp_loop`, `_connect_server`) and tears it down
+itself via `LivePlaudTransport.close()` -- it never opens a transport of its
+own devising.
 
 Every call this module can ever make is one of exactly two fixed tool
 names -- `list_files` and `get_transcript`, the only tools actually
@@ -141,14 +147,49 @@ def _is_error(result: Any) -> bool:
     return bool(getattr(result, "is_error", None) or getattr(result, "isError", None))
 
 
+def _parse_json_content(text: str) -> Any:
+    """Content-blind JSON extraction for a Plaud MCP tool's text output.
+
+    Tries a direct parse first. Live Plaud output has been observed to
+    prefix the real JSON payload with a prose safety wrapper, so on failure
+    this scans for a `{` or `[` position from which `json.JSONDecoder.
+    raw_decode` produces a dict/list value, and returns the first one found.
+    Never logs or returns any wrapper text -- only the decoded structure (or
+    a content-free error). A string with no such structure fails closed."""
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "{[":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text, index)
+        except ValueError:
+            continue
+        if isinstance(value, (dict, list)):
+            return value
+
+    raise PlaudMcpToolError("Plaud MCP tool returned unparseable output.")
+
+
 class LivePlaudTransport:
     """Production `PlaudTransport` + `PlaudTranscriptTransport`.
 
-    Talks to the `plaud` MCP connection through the existing connected-server
-    registry (`tools.mcp_tool`), never a transport this module opens itself.
-    Nothing in this build's own test suite constructs this against a real
+    Prefers the `plaud` MCP connection already live in the shared
+    connected-server registry (`tools.mcp_tool`) -- the Gateway's own
+    connection, when one exists -- and never shuts that one down. When no
+    such connection exists in the current process (e.g. a standalone
+    `automation_runner` invocation, which starts with an empty registry),
+    this transport connects its own short-lived session through the same
+    `tools.mcp_tool` lifecycle helpers every MCP probe in this repo uses
+    (`_ensure_mcp_loop`, `_connect_server`), retains it for reuse across
+    calls on this instance, and tears it down itself via `close()`. Nothing
+    in this build's own test suite constructs this against a real
     connection -- tests only ever inject a fake transport or monkeypatch the
-    two private helpers this class calls.
+    private `tools.mcp_tool` helpers this class calls.
     """
 
     def __init__(
@@ -156,6 +197,82 @@ class LivePlaudTransport:
     ) -> None:
         self._server_name = server_name
         self._timeout = timeout
+        self._owned_server: Any | None = None
+
+    def _connect_own_server(self) -> Any:
+        """Start a private connection to the exact `plaud` config entry and
+        retain it as this transport's own short-lived connection. Only ever
+        reached when no server for `self._server_name` is already live in
+        the shared registry."""
+        from tools.mcp_tool import (
+            _connect_server,
+            _ensure_mcp_loop,
+            _load_mcp_config,
+            _run_on_mcp_loop,
+        )
+
+        servers = _load_mcp_config()
+        config = servers.get(self._server_name)
+        if not isinstance(config, dict):
+            raise PlaudMcpToolError(
+                f"Plaud MCP server {self._server_name!r} is not connected."
+            )
+
+        raw_timeout = config.get("connect_timeout", 30)
+        try:
+            connect_timeout = max(1.0, float(raw_timeout))
+        except (TypeError, ValueError):
+            connect_timeout = 30.0
+
+        _ensure_mcp_loop()
+
+        async def _connect():
+            return await _connect_server(self._server_name, config)
+
+        try:
+            server = _run_on_mcp_loop(_connect, timeout=connect_timeout + 10)
+        except Exception as exc:
+            raise PlaudMcpToolError(
+                f"Plaud MCP server {self._server_name!r} failed to connect "
+                f"[{type(exc).__name__}]."
+            ) from None
+
+        self._owned_server = server
+        return server
+
+    def _resolve_server(self) -> Any:
+        from tools.mcp_tool import _get_connected_server_for_call
+
+        server = _get_connected_server_for_call(self._server_name)
+        if server is not None and getattr(server, "session", None) is not None:
+            return server
+
+        if self._owned_server is not None and getattr(self._owned_server, "session", None) is not None:
+            return self._owned_server
+
+        return self._connect_own_server()
+
+    def close(self) -> None:
+        """Shut down only a server this transport connected itself, exactly
+        once. A server found live in the shared registry is never touched
+        here -- it belongs to whatever process (e.g. the Gateway) already
+        owns it and outlives this transport."""
+        server = self._owned_server
+        if server is None:
+            return
+        self._owned_server = None
+
+        from tools.mcp_tool import _run_on_mcp_loop, _stop_mcp_loop_if_idle
+
+        async def _shutdown():
+            await server.shutdown()
+
+        try:
+            _run_on_mcp_loop(_shutdown, timeout=self._timeout)
+        except Exception:
+            pass
+        finally:
+            _stop_mcp_loop_if_idle()
 
     def _call(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         if tool_name not in ALLOWED_PLAUD_TOOLS:
@@ -163,13 +280,9 @@ class LivePlaudTransport:
                 f"Refusing to call Plaud MCP tool {tool_name!r}: not in the fixed allowlist."
             )
 
-        from tools.mcp_tool import _get_connected_server_for_call, _run_on_mcp_loop
+        server = self._resolve_server()
 
-        server = _get_connected_server_for_call(self._server_name)
-        if server is None or getattr(server, "session", None) is None:
-            raise PlaudMcpToolError(
-                f"Plaud MCP server {self._server_name!r} is not connected."
-            )
+        from tools.mcp_tool import _run_on_mcp_loop
 
         async def _call_tool():
             return await server.session.call_tool(tool_name, arguments=arguments)
@@ -187,12 +300,7 @@ class LivePlaudTransport:
         text = _extract_text(result)
         if not text:
             return None
-        try:
-            return json.loads(text)
-        except (ValueError, TypeError):
-            raise PlaudMcpToolError(
-                f"Plaud MCP tool {tool_name!r} returned unparseable output."
-            ) from None
+        return _parse_json_content(text)
 
     def _list_files_page(self, page: int) -> list[dict[str, Any]]:
         payload = self._call(

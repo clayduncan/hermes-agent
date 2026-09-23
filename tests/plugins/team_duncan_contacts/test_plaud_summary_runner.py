@@ -901,3 +901,39 @@ class TestProcessOneWebhookPath:
         assert summary.notes_written == 1
         assert state_db.get_cursor(SOURCE_CURSOR_KEY) is None
 
+
+class TestClose:
+    """OPS-114: PlaudSummaryRunner.close() is the narrow seam
+    automation_runner.py uses to shut down a standalone-connected
+    LivePlaudTransport after a plaud-reconcile/plaud-webhook run."""
+
+    def test_close_delegates_to_transport_when_present(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        class _ClosableTranscriptTransport(FakeTranscriptTransport):
+            def __init__(self):
+                super().__init__()
+                self.close_calls = 0
+
+            def close(self):
+                self.close_calls += 1
+
+        transcript = _ClosableTranscriptTransport()
+        runner, _ghl_client, _transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+            transcript_transport=transcript,
+        )
+        runner.close()
+        assert transcript.close_calls == 1
+
+    def test_close_is_a_noop_when_transport_has_no_close(
+        self, registry, activity_ledger, state_db, clock, tmp_path
+    ) -> None:
+        """FakeTranscriptTransport (used throughout this file) has no
+        close() -- close() must not raise for it."""
+        runner, _ghl_client, transcript = _make_runner(
+            registry, activity_ledger, state_db, clock, tmp_path,
+        )
+        assert not hasattr(transcript, "close")
+        runner.close()  # must not raise
+

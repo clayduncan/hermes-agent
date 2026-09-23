@@ -306,6 +306,9 @@ def test_drain_leaves_a_processing_error_result_queued(tmp_path: Path, monkeypat
 
             return PlaudSummaryRunSummary(errors=1)
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(
         team_duncan_contacts, "build_registry_and_reader",
         lambda hermes_home: (object(), object(), "loc-1"),
@@ -331,6 +334,9 @@ def test_drain_removes_a_zero_error_result(tmp_path: Path, monkeypatch) -> None:
             from plugins.team_duncan_contacts.plaud_summary_runner import PlaudSummaryRunSummary
 
             return PlaudSummaryRunSummary(matched=1, errors=0)
+
+        def close(self):
+            pass
 
     monkeypatch.setattr(
         team_duncan_contacts, "build_registry_and_reader",
