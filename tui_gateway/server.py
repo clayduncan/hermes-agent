@@ -1151,9 +1151,21 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         session = None
         with _session_resume_lock:
             current = _sessions.get(sid)
-            if not _ws_session_is_orphaned(current):
+            if (
+                current is not None
+                and current.get("running")
+                and not current.get("_finalized")
+                and current.get("transport") is _detached_ws_transport
+            ):
+                # An accepted turn is still server-owned (zippy-end-detach):
+                # a disconnect-derived reap must never race it closed. Keep
+                # rechecking on the same grace cadence instead of abandoning
+                # this session to the multi-hour idle reaper the moment it
+                # finishes.
+                reschedule = True
+            elif not _ws_session_is_orphaned(current):
                 return
-            if _session_has_active_delegations(sid, current):
+            elif _session_has_active_delegations(sid, current):
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
@@ -1182,13 +1194,21 @@ def _close_sessions_for_transport(
     the single WS-disconnect teardown entry point — there is no second
     independent reap loop in ``handle_ws``.
 
+    A ``close_on_disconnect`` session with an accepted turn in flight
+    (``running``) is server-owned for the life of that turn (zippy-end-detach):
+    disconnect must only drop delivery, never reach into ``AIAgent.close()``
+    and kill the turn's model call, inline tools, or a launched subprocess.
+    Such a session is treated exactly like a regular detached session — parked
+    on the drop sentinel and handed to the same grace-windowed reaper, which
+    itself never tears down a still-running session (see ``_schedule_ws_orphan_reap``).
+
     Returns ``(reaped, detached)`` counts for disconnect-path observability."""
     with _sessions_lock:
         owned = [(sid, s) for sid, s in _sessions.items() if s.get("transport") is transport]
     reaped = 0
     detached = 0
     for sid, session in owned:
-        if session.get("close_on_disconnect"):
+        if session.get("close_on_disconnect") and not session.get("running"):
             _close_session_by_id(sid, end_reason=end_reason)
             reaped += 1
         else:

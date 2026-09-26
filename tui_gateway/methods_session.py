@@ -2925,6 +2925,31 @@ def _(rid, params: dict) -> dict:
     # reaper. Finalization may run arbitrary plugin/agent cleanup and must not
     # keep every unrelated session.resume waiting behind it.
     with _session_resume_lock:
+        current = _sessions.get(sid)
+        if current is not None and current.get("running"):
+            # An accepted turn is server-owned once acknowledged
+            # (zippy-end-detach): closing the client's session — whether from
+            # a "Zippy Voice" End action or any other caller — must detach
+            # delivery only, never reach _teardown_session's agent.close()
+            # and kill the turn's model call, inline tools, or a launched
+            # subprocess. Park it exactly like a WS disconnect; the grace
+            # reaper (which itself never tears down a running session) will
+            # finish the close once the turn actually ends. The only way to
+            # cancel the run itself is an explicit session.interrupt with the
+            # matching turn id.
+            current["transport"] = _detached_ws_transport
+            try:
+                _schedule_ws_orphan_reap(sid)
+            except Exception:
+                pass
+            return _ok(
+                rid,
+                {
+                    "closed": False,
+                    "detached": True,
+                    "turn_id": _current_turn_id(current),
+                },
+            )
         session = _pop_session_by_id(sid)
     closed = _teardown_popped_session(session, end_reason="tui_close")
     return _ok(rid, {"closed": closed})
@@ -3154,6 +3179,26 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    requested_turn_id = params.get("turn_id")
+    if requested_turn_id is not None:
+        # session.interrupt is the ONLY user cancellation path for a
+        # server-owned accepted run (zippy-end-detach), so it must scope to
+        # the exact turn the caller means: a caller that still remembers an
+        # older turn id (e.g. one queued behind a detached reconnect, or a
+        # duplicate/late interrupt for a turn that already finished) must
+        # never cancel whatever the session is running NOW. Omitting turn_id
+        # keeps the historical "interrupt whatever is live" behavior for
+        # older callers.
+        current_turn_id = _current_turn_id(session)
+        if not session.get("running") or current_turn_id != str(requested_turn_id):
+            return _ok(
+                rid,
+                {
+                    "status": "stale_turn_id",
+                    "running": bool(session.get("running")),
+                    "current_turn_id": current_turn_id,
+                },
+            )
     if _session_uses_compute_host(session):
         sid = str(params.get("session_id") or "")
         if session.get("running"):
